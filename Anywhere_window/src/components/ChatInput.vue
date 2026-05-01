@@ -66,6 +66,80 @@ watch(() => props.voiceList, (newVal) => {
     internalVoiceList.value = newVal || [];
 }, { immediate: true });
 
+// EdgeTTS 默认语音列表
+const defaultVoiceList = [
+  { name: 'zh-CN-XiaoxiaoNeural', desc: '标准清晰', emoji: '👩' },
+  { name: 'zh-CN-YunxiNeural', desc: '男性温和', emoji: '👨' },
+  { name: 'zh-CN-YunxiaNeural', desc: '女性温柔', emoji: '👩' },
+  { name: 'zh-CN-YunyangNeural', desc: '男性稳重', emoji: '👨' },
+  { name: 'zh-CN-XiaoyiNeural', desc: '儿童活泼', emoji: '👧' },
+  { name: 'zh-CN-XiaohanNeural', desc: '儿童可爱', emoji: '👧' },
+  { name: 'zh-CN-liaoning-XiaobeiNeural', desc: '东北口音', emoji: '🧑‍🦱' },
+  { name: 'zh-CN-shaanxi-XiaoniNeural', desc: '西北口音', emoji: '🧑‍🦱' },
+  { name: 'zh-CN-henan-YundengNeural', desc: '中原口音', emoji: '🧑‍🦱' },
+  { name: 'zh-CN-sichuan-YunxiNeural', desc: '西南口音', emoji: '🧑‍🦱' },
+  { name: 'zh-TW-HsiaoChenNeural', desc: '台湾标准', emoji: '👩' },
+  { name: 'zh-TW-HsiaoYuNeural', desc: '台湾温柔', emoji: '👩' },
+  { name: 'zh-TW-YunJheNeural', desc: '台湾温和', emoji: '👨' },
+  { name: 'zh-HK-HiuMaanNeural', desc: '香港标准', emoji: '👩' },
+  { name: 'zh-HK-WanLungNeural', desc: '香港温和', emoji: '👨' },
+  { name: 'en-US-AriaNeural', desc: '英文标准', emoji: '👩' },
+  { name: 'en-US-GuyNeural', desc: '英文男性', emoji: '👨' },
+  { name: 'en-US-JennyNeural', desc: '英文女性', emoji: '👩' },
+  { name: 'en-US-TonyNeural', desc: '英文稳重', emoji: '👨' },
+  { name: 'en-GB-SoniaNeural', desc: '英式标准', emoji: '👩' },
+  { name: 'en-GB-RyanNeural', desc: '英式男性', emoji: '👨' },
+  { name: 'en-AU-NatashaNeural', desc: '澳式标准', emoji: '👩' },
+  { name: 'en-AU-WilliamNeural', desc: '澳式男性', emoji: '👨' },
+  { name: 'en-CA-ClaraNeural', desc: '加式标准', emoji: '👩' },
+  { name: 'en-CA-LiamNeural', desc: '加式男性', emoji: '👨' },
+  { name: 'ja-JP-NanamiNeural', desc: '日语标准', emoji: '👩' },
+  { name: 'ko-KR-SunHiNeural', desc: '韩语标准', emoji: '👩' },
+];
+
+// TTS 参数状态
+const ttsRate = ref(1.0);
+const ttsPitch = ref(1.0);
+const ttsVolume = ref(1.0);
+
+// 从配置加载 TTS 参数
+const loadTTSParams = async () => {
+  try {
+    const res = await window.api.getConfig();
+    if (res?.config) {
+      ttsRate.value = res.config.ttsRate || 1.0;
+      ttsPitch.value = res.config.ttsPitch || 1.0;
+      ttsVolume.value = res.config.ttsVolume || 1.0;
+    }
+  } catch (e) {
+    console.error("加载TTS参数失败", e);
+  }
+};
+
+// 保存 TTS 参数到配置
+const saveTTSParams = async () => {
+  try {
+    const res = await window.api.getConfig();
+    if (res?.config) {
+      res.config.ttsRate = ttsRate.value;
+      res.config.ttsPitch = ttsPitch.value;
+      res.config.ttsVolume = ttsVolume.value;
+      await window.api.updateConfig({ config: res.config });
+      console.log('[ChatInput] TTS 参数已保存:', {
+        rate: ttsRate.value,
+        pitch: ttsPitch.value,
+        volume: ttsVolume.value
+      });
+    }
+  } catch (e) {
+    console.error('[ChatInput] 保存 TTS 参数失败:', e);
+  }
+};
+
+onMounted(() => {
+  loadTTSParams();
+});
+
 // --- Computed Properties ---
 const reasoningTooltipContent = computed(() => {
     const map = { default: '默认', none:'关闭', low: '低', medium: '中', high: '高', xhigh: '极深'};
@@ -322,9 +396,25 @@ const toggleVoiceSelector = async () => {
     isVoiceSelectorVisible.value = !isVoiceSelectorVisible.value;
 };
 
-const handleVoiceSelection = (value) => {
+const handleVoiceSelection = async (value) => {
     selectedVoice.value = value;
     isVoiceSelectorVisible.value = false;
+
+    // 保存语音选择到当前快捷助手配置
+    try {
+        const res = await window.api.getConfig();
+        if (res?.config?.prompts) {
+            const prompts = res.config.prompts;
+            const activePromptKey = Object.keys(prompts).find(key => prompts[key].enable);
+            if (activePromptKey) {
+                prompts[activePromptKey].voice = value;
+                await window.api.updateConfig({ config: res.config });
+                console.log('[ChatInput] 语音已保存到配置:', value);
+            }
+        }
+    } catch (e) {
+        console.error('[ChatInput] 保存语音配置失败:', e);
+    }
 };
 
 // --- File Handling ---
@@ -667,7 +757,7 @@ defineExpose({ focus, senderRef });
         <el-row v-if="isVoiceSelectorVisible" class="option-selector-row">
             <el-col :span="0" />
             <el-col :span="24">
-                <el-scrollbar class="option-selector-wrapper" ref="voiceSelectorRef">
+                <el-scrollbar class="option-selector-wrapper" ref="voiceSelectorRef" max-height="400px">
                     <div class="option-selector-content">
                         <el-text tag="b" class="selector-label">选择音色</el-text>
                         <el-divider direction="vertical" />
@@ -675,10 +765,40 @@ defineExpose({ focus, senderRef });
                             round>
                             关闭语音
                         </el-button>
-                        <el-button v-for="voice in internalVoiceList" :key="voice" @click="handleVoiceSelection(voice)"
-                            :type="selectedVoice === voice ? 'primary' : 'default'" round>
-                            {{ voice }}
-                        </el-button>
+                        <el-divider />
+                        <div class="voice-list">
+                            <div
+                                v-for="item in defaultVoiceList"
+                                :key="item.name"
+                                class="voice-item"
+                                :class="{ selected: selectedVoice === item.name }"
+                                @click="handleVoiceSelection(item.name)"
+                            >
+                                <span class="voice-emoji">{{ item.emoji }}</span>
+                                <span class="voice-name">{{ item.name }}</span>
+                                <span class="voice-desc">{{ item.desc }}</span>
+                            </div>
+                        </div>
+
+                        <!-- TTS 参数调节 -->
+                        <div class="tts-params-container">
+                            <el-divider />
+                            <div class="tts-param-row">
+                                <span class="tts-param-label">语速: {{ ttsRate.toFixed(1) }}x</span>
+                                <input type="range" v-model.number="ttsRate" min="0.5" max="2.0" step="0.1"
+                                    class="tts-param-slider" @change="saveTTSParams" />
+                            </div>
+                            <div class="tts-param-row">
+                                <span class="tts-param-label">音调: {{ ttsPitch.toFixed(1) }}x</span>
+                                <input type="range" v-model.number="ttsPitch" min="0.5" max="2.0" step="0.1"
+                                    class="tts-param-slider" @change="saveTTSParams" />
+                            </div>
+                            <div class="tts-param-row">
+                                <span class="tts-param-label">音量: {{ Math.round(ttsVolume * 100) }}%</span>
+                                <input type="range" v-model.number="ttsVolume" min="0.1" max="1.0" step="0.1"
+                                    class="tts-param-slider" @change="saveTTSParams" />
+                            </div>
+                        </div>
                     </div>
                 </el-scrollbar>
             </el-col>

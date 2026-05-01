@@ -4509,11 +4509,11 @@ const askAI = async (forceSend = false) => {
         requestParams.tool_choice = "auto";
       }
 
+      // EdgeTTS: 语音回复不再需要设置 OpenAI audio 参数
+      // 语音合成将在收到文本回复后通过 EdgeTTS 单独生成
       if (isVoiceReply) {
         requestParams.stream = false;
         useStream = false;
-        requestParams.modalities = ["text", "audio"];
-        requestParams.audio = { voice: selectedVoice.value.split('-')[0].trim(), format: "wav" };
       }
 
       const assistantMessageId = messageIdCounter.value++;
@@ -4948,25 +4948,56 @@ const askAI = async (forceSend = false) => {
 
         history.value.push(...toolMessages);
       } else {
-        if (isVoiceReply && responseMessage.audio) {
-          currentBubble.content = currentBubble.content || [];
-
-          if (responseMessage.audio.transcript) {
-            const rawTranscript = responseMessage.audio.transcript;
-            currentBubble.content.push({
-              type: "text",
-              text: `\n\n${rawTranscript}`,
-              isTranscript: true
-            });
-          }
-
-          currentBubble.content.push({
-            type: "input_audio",
-            input_audio: {
-              data: responseMessage.audio.data,
-              format: 'wav'
+        // EdgeTTS: 收到文本回复后，单独调用 EdgeTTS 生成语音
+        if (isVoiceReply && responseMessage.content) {
+          try {
+            // 提取文本内容
+            let textToSpeak = '';
+            if (typeof responseMessage.content === 'string') {
+              textToSpeak = responseMessage.content;
+            } else if (Array.isArray(responseMessage.content)) {
+              textToSpeak = responseMessage.content
+                .filter(item => item.type === 'text')
+                .map(item => item.text)
+                .join('\n');
             }
-          });
+
+            if (textToSpeak && textToSpeak.trim()) {
+              // 获取最新 TTS 参数
+              const latestConfig = await window.api.getConfig();
+              const config = latestConfig?.config || currentConfig.value;
+
+              const voiceName = selectedVoice.value || config.selectedEdgeVoice || 'zh-CN-XiaoxiaoNeural';
+              const rate = config.ttsRate || 1.0;
+              const pitch = config.ttsPitch || 1.0;
+              const volume = config.ttsVolume || 1.0;
+
+              console.log('[App] EdgeTTS 参数:', { voiceName, rate, pitch, volume, textLength: textToSpeak.length });
+
+              const ttsResult = await window.api.textToSpeech(
+                textToSpeak,
+                voiceName,
+                'audio-24khz-96kbitrate-mono-mp3',
+                rate,
+                pitch,
+                volume
+              );
+
+              console.log('[App] EdgeTTS 生成成功:', { audioLength: ttsResult.audio_base64.length, cached: ttsResult.cached });
+
+              currentBubble.content = currentBubble.content || [];
+              currentBubble.content.push({
+                type: "input_audio",
+                input_audio: {
+                  data: ttsResult.audio_base64,
+                  format: 'mp3'
+                }
+              });
+            }
+          } catch (ttsError) {
+            console.error('[App] EdgeTTS 生成失败:', ttsError);
+            // TTS 失败不影响文本回复的显示
+          }
         }
         break;
       }

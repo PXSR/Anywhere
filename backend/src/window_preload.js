@@ -51,6 +51,14 @@ const {
     deleteSkill
 } = require('./skill.js');
 
+// 引入 TTS 模块
+const {
+    getVoices,
+    textToSpeech,
+    clearCache,
+    getCacheStats,
+} = require('./tts.js');
+
 const channel = "window";
 let senderId = null; // [新增] 用于存储当前窗口的唯一ID
 
@@ -389,10 +397,24 @@ window.api = {
             text: result
         }], null, 2);
     },
-    // 暴露 path.join 
+    // 暴露 path.join
     pathJoin: (...args) => require('path').join(...args),
     addTaskHistory: async (taskId, logEntry) => {
         const { addTaskHistory } = require('./data.js');
         return await addTaskHistory(taskId, logEntry);
+    },
+
+    // TTS 相关 API
+    getTTSVoices: async () => {
+        return await getVoices();
+    },
+    textToSpeech: async (text, voice, outputFormat, rate, pitch, volume) => {
+        return await textToSpeech(text, voice, outputFormat, rate, pitch, volume);
+    },
+    clearTTSCache: async () => {
+        return await clearCache();
+    },
+    getTTSCacheStats: async () => {
+        return await getCacheStats();
     },
 };

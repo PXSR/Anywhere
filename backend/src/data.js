@@ -128,6 +128,11 @@ const defaultConfig = {
       "Sadaltager-👨‍🦰博学",
       "Sulafat-👩温暖"
     ],
+    // EdgeTTS 配置
+    selectedEdgeVoice: "zh-CN-XiaoxiaoNeural",
+    ttsRate: 1.0,
+    ttsPitch: 1.0,
+    ttsVolume: 1.0,
   }
 };
 

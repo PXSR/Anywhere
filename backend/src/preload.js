@@ -23,6 +23,14 @@ const {
   resolveDefaultAssistantModel,
 } = require('./data.js');
 
+// 引入 TTS 模块
+const {
+  getVoices,
+  textToSpeech,
+  clearCache,
+  getCacheStats,
+} = require('./tts.js');
+
 const {
   handleFilePath,
   sendfileDirect,
@@ -328,6 +336,20 @@ window.api = {
   },
   exportMemoryData,
   importMemoryData,
+
+  // TTS 相关 API
+  getTTSVoices: async () => {
+    return await getVoices();
+  },
+  textToSpeech: async (text, voice, outputFormat, rate, pitch, volume) => {
+    return await textToSpeech(text, voice, outputFormat, rate, pitch, volume);
+  },
+  clearTTSCache: async () => {
+    return await clearCache();
+  },
+  getTTSCacheStats: async () => {
+    return await getCacheStats();
+  },
 };
 
 const commandHandlers = {

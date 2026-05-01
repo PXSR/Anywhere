@@ -70,6 +70,60 @@ function toggleCard(cardName) {
   }
 }
 
+// --- EdgeTTS 语音管理 ---
+const edgeTTSVoices = ref([]);
+const loadingVoices = ref(false);
+
+// EdgeTTS 预设语音列表
+const edgeTTSVoicePresets = [
+  { Name: 'zh-CN-XiaoxiaoNeural', Locale: 'zh-CN', Gender: 'Female', Description: '标准、清晰' },
+  { Name: 'zh-CN-YunxiNeural', Locale: 'zh-CN', Gender: 'Male', Description: '男性温和' },
+  { Name: 'zh-CN-YunxiaNeural', Locale: 'zh-CN', Gender: 'Female', Description: '女性温柔' },
+  { Name: 'zh-CN-YunyangNeural', Locale: 'zh-CN', Gender: 'Male', Description: '男性稳重' },
+  { Name: 'zh-CN-XiaoyiNeural', Locale: 'zh-CN', Gender: 'Female', Description: '儿童活泼' },
+  { Name: 'zh-CN-XiaohanNeural', Locale: 'zh-CN', Gender: 'Female', Description: '儿童可爱' },
+  { Name: 'zh-CN-liaoning-XiaobeiNeural', Locale: 'zh-CN', Gender: 'Female', Description: '东北口音' },
+  { Name: 'zh-CN-shaanxi-XiaoniNeural', Locale: 'zh-CN', Gender: 'Female', Description: '西北口音' },
+  { Name: 'zh-CN-henan-YundengNeural', Locale: 'zh-CN', Gender: 'Male', Description: '中原口音' },
+  { Name: 'zh-CN-sichuan-YunxiNeural', Locale: 'zh-CN', Gender: 'Male', Description: '西南口音' },
+  { Name: 'zh-TW-HsiaoChenNeural', Locale: 'zh-TW', Gender: 'Female', Description: '台湾标准' },
+  { Name: 'zh-TW-HsiaoYuNeural', Locale: 'zh-TW', Gender: 'Female', Description: '台湾温柔' },
+  { Name: 'zh-TW-YunJheNeural', Locale: 'zh-TW', Gender: 'Male', Description: '台湾温和' },
+  { Name: 'zh-HK-HiuMaanNeural', Locale: 'zh-HK', Gender: 'Female', Description: '香港标准' },
+  { Name: 'zh-HK-WanLungNeural', Locale: 'zh-HK', Gender: 'Male', Description: '香港温和' },
+  { Name: 'en-US-AriaNeural', Locale: 'en-US', Gender: 'Female', Description: '英文标准' },
+  { Name: 'en-US-GuyNeural', Locale: 'en-US', Gender: 'Male', Description: '英文男性' },
+  { Name: 'en-US-JennyNeural', Locale: 'en-US', Gender: 'Female', Description: '英文女性' },
+  { Name: 'en-US-TonyNeural', Locale: 'en-US', Gender: 'Male', Description: '英文稳重' },
+  { Name: 'en-GB-SoniaNeural', Locale: 'en-GB', Gender: 'Female', Description: '英式标准' },
+  { Name: 'en-GB-RyanNeural', Locale: 'en-GB', Gender: 'Male', Description: '英式男性' },
+  { Name: 'en-AU-NatashaNeural', Locale: 'en-AU', Gender: 'Female', Description: '澳式标准' },
+  { Name: 'en-AU-WilliamNeural', Locale: 'en-AU', Gender: 'Male', Description: '澳式男性' },
+  { Name: 'en-CA-ClaraNeural', Locale: 'en-CA', Gender: 'Female', Description: '加式标准' },
+  { Name: 'en-CA-LiamNeural', Locale: 'en-CA', Gender: 'Male', Description: '加式男性' },
+  { Name: 'ja-JP-NanamiNeural', Locale: 'ja-JP', Gender: 'Female', Description: '日语标准' },
+  { Name: 'ko-KR-SunHiNeural', Locale: 'ko-KR', Gender: 'Female', Description: '韩语标准' },
+];
+
+// 加载 EdgeTTS 语音列表
+const loadEdgeTTSVoices = async () => {
+  loadingVoices.value = true;
+  try {
+    const voices = await window.api.getTTSVoices();
+    edgeTTSVoices.value = voices.filter(v => v.Locale.startsWith('zh-') || v.Locale.startsWith('en-'));
+  } catch (error) {
+    console.error('加载 EdgeTTS 语音列表失败:', error);
+    // 使用默认语音列表
+    edgeTTSVoices.value = edgeTTSVoicePresets;
+  } finally {
+    loadingVoices.value = false;
+  }
+};
+
+onMounted(() => {
+  loadEdgeTTSVoices();
+});
+
 const isBackupManagerVisible = ref(false);
 const backupFiles = ref([]);
 const isTableLoading = ref(false);
@@ -729,14 +783,55 @@ async function selectSkillPath() {
                   </div>
 
                   <div v-if="element.id === 'voice'" class="card-body">
+                    <!-- EdgeTTS 语音选择 -->
                     <div class="voice-list-container">
-                      <el-tag v-for="voice in currentConfig.voiceList" :key="voice" closable @click="editVoice(voice)"
-                        @close="deleteVoice(voice)" class="voice-tag" size="large">
-                        {{ voice }}
-                      </el-tag>
-                      <el-button class="add-voice-button" type="primary" plain :icon="Plus" @click="addNewVoice">
-                        {{ t('setting.voice.add') }}
-                      </el-button>
+                      <div v-if="loadingVoices" class="loading-voices">
+                        <el-icon class="is-loading"><Refresh /></el-icon>
+                        <span>加载语音列表中...</span>
+                      </div>
+                      <div v-else class="edge-tts-voices">
+                        <el-select
+                          v-model="currentConfig.selectedEdgeVoice"
+                          placeholder="选择语音"
+                          filterable
+                          @change="saveSingleSetting('selectedEdgeVoice', currentConfig.selectedEdgeVoice)"
+                          style="width: 100%"
+                        >
+                          <el-option
+                            v-for="voice in edgeTTSVoices"
+                            :key="voice.Name"
+                            :label="`${voice.Name} - ${voice.Locale}`"
+                            :value="voice.Name"
+                          >
+                            <div class="voice-option">
+                              <span class="voice-name">{{ voice.Name }}</span>
+                              <span class="voice-locale">{{ voice.Locale }}</span>
+                              <span class="voice-gender">{{ voice.Gender }}</span>
+                              <span class="voice-desc">{{ voice.Description }}</span>
+                            </div>
+                          </el-option>
+                        </el-select>
+                      </div>
+                    </div>
+
+                    <!-- TTS 参数调节 -->
+                    <div class="tts-params-container">
+                      <el-divider />
+                      <div class="tts-param-row">
+                        <span class="tts-param-label">语速: {{ (currentConfig.ttsRate || 1.0).toFixed(1) }}x</span>
+                        <el-slider v-model.number="currentConfig.ttsRate" :min="0.5" :max="2.0" :step="0.1"
+                          @change="(value) => saveSingleSetting('ttsRate', value)" />
+                      </div>
+                      <div class="tts-param-row">
+                        <span class="tts-param-label">音调: {{ (currentConfig.ttsPitch || 1.0).toFixed(1) }}x</span>
+                        <el-slider v-model.number="currentConfig.ttsPitch" :min="0.5" :max="2.0" :step="0.1"
+                          @change="(value) => saveSingleSetting('ttsPitch', value)" />
+                      </div>
+                      <div class="tts-param-row">
+                        <span class="tts-param-label">音量: {{ Math.round((currentConfig.ttsVolume || 1.0) * 100) }}%</span>
+                        <el-slider v-model.number="currentConfig.ttsVolume" :min="0.1" :max="1.0" :step="0.1"
+                          @change="(value) => saveSingleSetting('ttsVolume', value)" />
+                      </div>
                     </div>
                   </div>
 
@@ -1074,50 +1169,78 @@ html.dark .settings-page-container {
 
 .voice-list-container {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 8px;
   padding: 8px 0;
 }
 
-.voice-tag {
-  font-size: 12px;
-  height: 30px;
-  padding: 0 14px;
-  cursor: pointer;
-  border-radius: 15px;
-  border: 1px solid var(--panda-border);
-  background-color: var(--panda-card-bg);
-  color: var(--panda-text-main);
-  font-weight: 500;
-  transition: all 0.2s cubic-bezier(0.25, 0.8, 0.5, 1);
-  display: inline-flex;
+.loading-voices {
+  display: flex;
   align-items: center;
+  justify-content: center;
+  padding: 20px;
+  color: var(--panda-text-sub);
 }
 
-.voice-tag:hover {
-  transform: scale(1.03);
-  border-color: var(--panda-accent);
-  background-color: var(--panda-accent);
-  color: var(--panda-card-bg);
-  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+.loading-voices .el-icon {
+  margin-right: 8px;
 }
 
-.add-voice-button {
-  border: 1px dashed var(--panda-text-sub) !important;
-  color: var(--panda-text-sub) !important;
-  height: 30px;
-  border-radius: 15px;
-  padding: 0 16px;
-  background-color: transparent !important;
-  transition: all 0.2s;
-  font-weight: 600;
+.edge-tts-voices {
+  width: 100%;
+}
+
+.voice-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.voice-name {
+  font-weight: 500;
+  flex: 2;
+}
+
+.voice-locale {
+  color: var(--panda-text-sub);
+  flex: 1;
+}
+
+.voice-gender {
+  color: var(--panda-text-sub);
+  flex: 1;
+}
+
+.voice-desc {
+  color: var(--panda-text-sub);
   font-size: 12px;
+  flex: 2;
 }
 
-.add-voice-button:hover {
-  border-color: var(--panda-accent) !important;
-  color: var(--panda-accent) !important;
-  background-color: var(--panda-hover) !important;
+/* TTS 参数调节样式 */
+.tts-params-container {
+  margin-top: 16px;
+  padding-top: 16px;
+  width: 100%;
+}
+
+.tts-param-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.tts-param-label {
+  font-size: 13px;
+  color: var(--panda-text-sub);
+  min-width: 100px;
+  flex-shrink: 0;
+}
+
+.tts-param-row .el-slider {
+  flex: 1;
+  margin-left: 12px;
 }
 
 .el-switch {
