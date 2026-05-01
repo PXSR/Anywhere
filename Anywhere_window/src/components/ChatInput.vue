@@ -1546,6 +1546,104 @@ html.dark .option-selector-wrapper {
     padding-right: 8px;
 }
 
+/* --- EdgeTTS 语音列表样式 --- */
+.voice-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px;
+    width: 100%;
+}
+
+.voice-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+    background-color: var(--el-fill-color-light);
+}
+
+.voice-item:hover {
+    background-color: var(--el-fill-color);
+}
+
+.voice-item.selected {
+    background-color: var(--el-color-primary-light-9);
+    color: var(--el-color-primary);
+}
+
+.voice-emoji {
+    font-size: 16px;
+    margin-right: 8px;
+    min-width: 20px;
+}
+
+.voice-name {
+    font-size: 13px;
+    font-weight: 500;
+    flex: 2;
+}
+
+.voice-desc {
+    font-size: 11px;
+    color: var(--el-text-color-secondary);
+    flex: 1;
+}
+
+/* TTS 参数调节样式 */
+.tts-params-container {
+    margin-top: 12px;
+    padding-top: 12px;
+    width: 100%;
+}
+
+.tts-param-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.tts-param-label {
+    font-size: 12px;
+    color: var(--el-text-color-regular);
+    min-width: 80px;
+}
+
+.tts-param-slider {
+    flex: 1;
+    margin-left: 8px;
+    height: 4px;
+    background: var(--el-border-color);
+    border-radius: 2px;
+    appearance: none;
+    cursor: pointer;
+}
+
+.tts-param-slider::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--el-color-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    transition: transform 0.2s;
+}
+
+.tts-param-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+}
+
+.tts-param-slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: var(--el-color-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+}
+
 .selector-label {
     font-size: 14px;
     color: var(--el-text-color);

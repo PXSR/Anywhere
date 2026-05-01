@@ -651,11 +651,11 @@
       "selectPlaceholder": "Select Language"
     },
     "voice": {
-      "title": "Voice Settings  (Voice Name - Custom Description)",
-      "description": "Manage the list of voices available for speech synthesis.",
+      "title": "Voice Settings (EdgeTTS)",
+      "description": "Select EdgeTTS voice and adjust rate, pitch, volume parameters.",
       "add": "Add Voice",
       "addPromptTitle": "Add New Voice",
-      "addPromptMessage": "Please enter the voice name (e.g., alloy).",
+      "addPromptMessage": "Please enter the voice name (e.g., zh-CN-XiaoxiaoNeural).",
       "addSuccess": "Voice added successfully.",
       "addFailExists": "Voice already exists.",
       "addFailEmpty": "Voice name cannot be empty.",
