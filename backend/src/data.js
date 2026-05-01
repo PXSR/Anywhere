@@ -953,7 +953,7 @@ function updateConfig(newConfig) {
 }
 
 function getUser() {
-  return utools.getUser();
+  return { avatar: "user.png" };
 }
 
 function getPosition(config, promptCode, msg = null) {
