@@ -59,6 +59,16 @@
 			],
 			"mainHide": true,
 			"icon": "ask.png"
+		},
+		{
+			"code": "Conference Mode",
+			"explain": "多模型会议讨论",
+			"cmds": [
+				"Conference Mode",
+				"会议讨论",
+				"多模型讨论"
+			],
+			"icon": "conference.png"
 		}
 	]
 }
