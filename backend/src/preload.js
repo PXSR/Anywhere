@@ -21,6 +21,7 @@ const {
   exportMemoryData,
   importMemoryData,
   resolveDefaultAssistantModel,
+  openConferenceWindow,
 } = require('./data.js');
 
 // 引入 TTS 模块
@@ -73,6 +74,18 @@ const {
   exportSkillToPackage,
   extractSkillPackage,
 } = require('./skill.js');
+
+// 引入会议讨论模块
+const {
+  createConferenceSession,
+  getConferenceSession,
+  updateConferenceSession,
+  addConferenceMessage,
+  updateConferenceMessage,
+  listConferenceSessions,
+  deleteConferenceSession,
+  exportConferenceToMarkdown,
+} = require('./conference.js');
 
 window.api = {
   getConfig,
@@ -350,6 +363,40 @@ window.api = {
   getTTSCacheStats: async () => {
     return await getCacheStats();
   },
+
+  // 会议讨论相关 API
+  createConferenceSession: async (config) => {
+    try { return createConferenceSession(config); }
+    catch (e) { return { success: false, error: e.message }; }
+  },
+  getConferenceSession: async (sessionId) => {
+    try { return getConferenceSession(sessionId); }
+    catch (e) { return { success: false, error: e.message }; }
+  },
+  updateConferenceSession: async (sessionId, data) => {
+    try { return updateConferenceSession(sessionId, data); }
+    catch (e) { return { success: false, error: e.message }; }
+  },
+  addConferenceMessage: async (sessionId, message) => {
+    try { return addConferenceMessage(sessionId, message); }
+    catch (e) { return { success: false, error: e.message }; }
+  },
+  updateConferenceMessage: async (sessionId, messageId, updates) => {
+    try { return updateConferenceMessage(sessionId, messageId, updates); }
+    catch (e) { return { success: false, error: e.message }; }
+  },
+  listConferenceSessions: async () => {
+    try { return listConferenceSessions(); }
+    catch (e) { return { success: false, error: e.message, sessions: [] }; }
+  },
+  deleteConferenceSession: async (sessionId) => {
+    try { return deleteConferenceSession(sessionId); }
+    catch (e) { return { success: false, error: e.message }; }
+  },
+  exportConferenceToMarkdown: async (sessionId) => {
+    try { return exportConferenceToMarkdown(sessionId); }
+    catch (e) { return { success: false, error: e.message }; }
+  },
 };
 
 const commandHandlers = {
@@ -491,6 +538,15 @@ const commandHandlers = {
     utools.outPlugin();
   },
 
+  // 会议讨论模式
+  'Conference Mode': async () => {
+    utools.hideMainWindow();
+    const configResult = await getConfig();
+    checkConfig(configResult.config);
+    await openConferenceWindow(configResult.config);
+    utools.outPlugin();
+  },
+
   // 直接打开快捷助手
   handleAssistant: async ({ code, type, payload }) => {
     // 避免弹出主窗口
@@ -604,6 +660,8 @@ utools.onPluginEnter(async (action) => {
   // 分发逻辑加入对追加消息的支持
   if (commandHandlers[code]) {
     await commandHandlers[code](action);
+  } else if (code === 'Conference Mode') {
+    await commandHandlers['Conference Mode'](action);
   } else if (code.endsWith(feature_suffix)) { // 打开空白助手
     await commandHandlers.handleAssistant(action);
   } else if (code === 'append_global') {

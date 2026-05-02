@@ -133,6 +133,12 @@ const defaultConfig = {
     ttsRate: 1.0,
     ttsPitch: 1.0,
     ttsVolume: 1.0,
+    // 会议讨论配置
+    conference: {
+      defaultRounds: 3,
+      maxRounds: 20,
+      maxParticipants: 6,
+    },
   }
 };
 
@@ -1281,6 +1287,57 @@ async function openWindow(config, msg) {
   });
 }
 
+/**
+ * 打开会议讨论窗口
+ */
+async function openConferenceWindow(config) {
+  const senderId = crypto.randomUUID();
+  const width = 900;
+  const height = 750;
+  const x = Math.round((utools.getPrimaryDisplay().workArea.width - width) / 2);
+  const y = Math.round((utools.getPrimaryDisplay().workArea.height - height) / 2);
+  const backgroundColor = config.isDarkMode ? 'rgba(33, 33, 33, 1)' : 'rgba(255, 255, 253, 1)';
+
+  const msg = {
+    senderId,
+    isAlwaysOnTop: config.isAlwaysOnTop_global ?? true,
+    isConference: true,
+  };
+
+  const windowOptions = {
+    show: false,
+    backgroundColor,
+    title: "Anywhere Conference",
+    width,
+    height,
+    alwaysOnTop: msg.isAlwaysOnTop,
+    x,
+    y,
+    frame: false,
+    transparent: false,
+    hasShadow: true,
+    webPreferences: {
+      preload: "./window_preload.js",
+      devTools: utools.isDev()
+    },
+  };
+
+  const entryPath = config.isDarkMode ? "./window/conference.html?dark=1" : "./window/conference.html";
+
+  return new Promise((resolve) => {
+    const ubWindow = utools.createBrowserWindow(
+      entryPath,
+      windowOptions,
+      () => {
+        ubWindow.show();
+        ubWindow.webContents.send("window", msg);
+      }
+    );
+    windowMap.set(senderId, ubWindow);
+    resolve(senderId);
+  });
+}
+
 async function coderedirect(label, payload) {
   utools.redirect(label, payload);
 }
@@ -1934,4 +1991,5 @@ module.exports = {
   isValidProviderModelKey,
   getFirstAvailableProviderModel,
   resolveDefaultAssistantModel,
+  openConferenceWindow,
 };

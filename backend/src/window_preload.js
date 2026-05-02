@@ -51,6 +51,18 @@ const {
     deleteSkill
 } = require('./skill.js');
 
+// 引入会议讨论模块
+const {
+    createConferenceSession,
+    getConferenceSession,
+    updateConferenceSession,
+    addConferenceMessage,
+    updateConferenceMessage,
+    listConferenceSessions,
+    deleteConferenceSession,
+    exportConferenceToMarkdown,
+} = require('./conference.js');
+
 // 引入 TTS 模块
 const {
     getVoices,
@@ -416,5 +428,39 @@ window.api = {
     },
     getTTSCacheStats: async () => {
         return await getCacheStats();
+    },
+
+    // 会议讨论相关 API
+    createConferenceSession: async (config) => {
+        try { return createConferenceSession(config); }
+        catch (e) { return { success: false, error: e.message }; }
+    },
+    getConferenceSession: async (sessionId) => {
+        try { return getConferenceSession(sessionId); }
+        catch (e) { return { success: false, error: e.message }; }
+    },
+    updateConferenceSession: async (sessionId, data) => {
+        try { return updateConferenceSession(sessionId, data); }
+        catch (e) { return { success: false, error: e.message }; }
+    },
+    addConferenceMessage: async (sessionId, message) => {
+        try { return addConferenceMessage(sessionId, message); }
+        catch (e) { return { success: false, error: e.message }; }
+    },
+    updateConferenceMessage: async (sessionId, messageId, updates) => {
+        try { return updateConferenceMessage(sessionId, messageId, updates); }
+        catch (e) { return { success: false, error: e.message }; }
+    },
+    listConferenceSessions: async () => {
+        try { return listConferenceSessions(); }
+        catch (e) { return { success: false, error: e.message, sessions: [] }; }
+    },
+    deleteConferenceSession: async (sessionId) => {
+        try { return deleteConferenceSession(sessionId); }
+        catch (e) { return { success: false, error: e.message }; }
+    },
+    exportConferenceToMarkdown: async (sessionId) => {
+        try { return exportConferenceToMarkdown(sessionId); }
+        catch (e) { return { success: false, error: e.message }; }
     },
 };

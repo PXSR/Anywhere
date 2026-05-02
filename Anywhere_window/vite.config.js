@@ -1,4 +1,5 @@
 import { fileURLToPath, URL } from 'node:url'
+import { resolve } from 'node:path'
 
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
@@ -12,7 +13,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
-      'highlight.js': 'highlight.js/lib/common' 
+      'highlight.js': 'highlight.js/lib/common'
     },
   },
   base: './',
@@ -27,6 +28,10 @@ export default defineConfig({
       drop: ['console', 'debugger'],
     },
     rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        conference: resolve(__dirname, 'conference.html'),
+      },
       output: {
         chunkFileNames: 'assets/js/[name]-[hash].js',
         entryFileNames: 'assets/js/[name]-[hash].js',

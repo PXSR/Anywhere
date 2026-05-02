@@ -11,7 +11,7 @@ def moveDist():
         print("未找到版本目录 (vX.X.X)")
         exit(1)
     latest_version_dir = version_dirs[-1]
-    return latest_version_dir
+    return latest_version_dir, version_dirs
 
 # 删除指定目录下的文件夹
 def deleteFiles(dir, delete_dir):
@@ -74,7 +74,7 @@ def smart_copy(src_folder, target_folder):
             print(f"未知类型文件: {src_path}")
 
 if __name__ == "__main__":
-    latest_version_dir = moveDist()
+    latest_version_dir, version_dirs = moveDist()
     print(f"目标版本目录: {latest_version_dir}\n")
 
     # 1. 处理 main (Anywhere_main/dist -> v1.0.0/main)
@@ -91,7 +91,24 @@ if __name__ == "__main__":
     smart_copy(os.path.join("Anywhere_window", "dist"), window_target_dir)
     print("window 文件夹更新完成\n")
 
-    # 3. 处理 preload (backend/public -> v1.0.0/)
+    # 3. 处理 plugin.json 和图标文件（从上一版本目录复制）
+    # 找到倒数第二新的版本目录作为源（如果当前最新没有 plugin.json）
+    src_version_dir = None
+    for d in reversed(version_dirs[:-1]):
+        if os.path.exists(os.path.join(d, 'plugin.json')):
+            src_version_dir = d
+            break
+    if src_version_dir:
+        for item in os.listdir(src_version_dir):
+            if item.endswith('.json') or item.endswith('.png') or item.endswith('.ico'):
+                src_path = os.path.join(src_version_dir, item)
+                dst_path = os.path.join(latest_version_dir, item)
+                if os.path.isfile(src_path):
+                    shutil.copy2(src_path, dst_path)
+                    print(f"  >> 复制 {item} 从 {src_version_dir}")
+        print("plugin.json 及图标文件复制完成\n")
+
+    # 4. 处理 preload (backend/public -> v1.0.0/)
     deleteFile(latest_version_dir, 'preload.js')
     deleteFile(latest_version_dir, 'window_preload.js')
     deleteFile(latest_version_dir, 'fast_window_preload.js')
@@ -99,14 +116,14 @@ if __name__ == "__main__":
     smart_copy(os.path.join("backend", "public"), latest_version_dir)
     print("preload 相关文件更新完成\n")
 
-    # 4. 处理 fast_window (fast_window -> v1.0.0/fast_window)
+    # 5. 处理 fast_window (fast_window -> v1.0.0/fast_window)
     deleteFiles(latest_version_dir, 'fast_window')
     print(f"正在更新 fast_window 文件夹...")
     fast_window_target_dir = os.path.join(latest_version_dir, 'fast_window')
     smart_copy("fast_window", fast_window_target_dir)
     print("fast_window 相关文件更新完成")
 
-    # 5. 在这几个目录下查.gitkeep文件
+    # 6. 在这几个目录下查.gitkeep文件
     for target_dir in [main_target_dir, window_target_dir, fast_window_target_dir]:
         print(f"正在检查目录并添加 .gitkeep: {target_dir}")
         os.makedirs(target_dir, exist_ok=True)
