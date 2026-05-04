@@ -1,7 +1,8 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { ElDialog, ElButton, ElInput, ElSelect, ElOption, ElCheckbox, ElTabs, ElTabPane, ElTag, ElTooltip, ElIcon, ElSlider, ElColorPicker } from 'element-plus'
-import { Plus, Delete, Rank, Microphone } from '@element-plus/icons-vue'
+import { Plus, Delete, Rank, Microphone, Search } from '@element-plus/icons-vue'
+import ModelSelectionDialog from './ModelSelectionDialog.vue'
 
 const props = defineProps({
   modelValue: Boolean,
@@ -20,11 +21,20 @@ const participants = ref([])
 
 // --- 添加参与者 ---
 const selectedProviderModel = ref('')
+const selectedModelLabel = ref('')
 const newRole = ref('')
+const modelDialogVisible = ref(false)
 
 const canAddParticipant = computed(() => {
   return selectedProviderModel.value && newRole.value.trim() && participants.value.length < 6
 })
+
+function handleModelSelected(modelValue) {
+  selectedProviderModel.value = modelValue
+  const item = props.modelList.find(m => m.value === modelValue)
+  selectedModelLabel.value = item ? item.label : modelValue
+  modelDialogVisible.value = false
+}
 
 function addParticipant() {
   if (!canAddParticipant.value) return
@@ -41,6 +51,7 @@ function addParticipant() {
     isModerator: false,
   })
   selectedProviderModel.value = ''
+  selectedModelLabel.value = ''
   newRole.value = ''
 }
 
@@ -127,7 +138,7 @@ function stringToColor(str) {
       <div class="config-section settings-row">
         <div class="setting-item">
           <label class="config-label">讨论轮数</label>
-          <el-slider v-model="rounds" :min="1" :max="10" show-input />
+          <el-slider v-model="rounds" :min="1" :max="100" show-input />
         </div>
         <div class="setting-item checkbox-item">
           <el-checkbox v-model="enableCrossReference" label="允许 AI 互相引用观点" />
@@ -184,14 +195,14 @@ function stringToColor(str) {
 
         <!-- 添加新参与者 -->
         <div class="add-participant" v-if="participants.length < 6">
-          <el-select v-model="selectedProviderModel" placeholder="选择服务商和模型" class="add-select">
-            <el-option
-              v-for="item in modelList"
-              :key="item.value"
-              :label="item.label"
-              :value="item.value"
-            />
-          </el-select>
+          <el-button
+            class="model-select-btn"
+            :class="{ 'model-selected': selectedProviderModel }"
+            @click="modelDialogVisible = true"
+            :icon="Search"
+          >
+            {{ selectedModelLabel || '选择服务商和模型' }}
+          </el-button>
           <el-input v-model="newRole" placeholder="角色名称，如：技术专家" class="add-role" />
           <el-button type="primary" :icon="Plus" @click="addParticipant" :disabled="!canAddParticipant">添加</el-button>
         </div>
@@ -223,6 +234,13 @@ function stringToColor(str) {
       </el-button>
     </template>
   </el-dialog>
+
+  <!-- 模型选择弹窗 -->
+  <ModelSelectionDialog
+    v-model="modelDialogVisible"
+    :modelList="modelList"
+    @select="handleModelSelected"
+  />
 </template>
 
 <style scoped>
@@ -331,8 +349,22 @@ function stringToColor(str) {
   align-items: center;
 }
 
-.add-select {
+.model-select-btn {
   flex: 2;
+  justify-content: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-select-btn :deep(.el-icon) {
+  margin-right: 6px;
+  flex-shrink: 0;
+}
+
+.model-selected {
+  color: var(--el-color-primary);
+  border-color: var(--el-color-primary);
 }
 
 .add-role {

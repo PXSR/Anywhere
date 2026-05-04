@@ -206,42 +206,81 @@ function exportConferenceToMarkdown(sessionId) {
       lines.push(`- ${p.role} (${p.providerId}/${p.model})${moderatorBadge}`);
     });
     lines.push('');
-    lines.push(`**讨论轮数**: ${session.rounds}轮`);
+    const totalRoundCount = Math.max(0, ...session.messages.map(m => m.round || 0)) + 1;
+    lines.push(`**计划轮数**: ${session.rounds}轮`);
+    if (totalRoundCount > session.rounds) {
+      lines.push(`**实际讨论**: ${totalRoundCount}轮（含追加 ${totalRoundCount - session.rounds} 轮）`);
+    }
     lines.push(`**创建时间**: ${new Date(session.createdAt).toLocaleString('zh-CN')}`);
     lines.push('');
     lines.push('---');
     lines.push('');
 
-    // 按轮次分组消息
-    const userMessages = session.messages.filter(m => m.role === 'user');
-    const aiMessages = session.messages.filter(m => m.role === 'ai');
+    // 按时间戳排序所有消息，确保输出顺序与实际讨论顺序一致
+    const sortedMessages = [...session.messages].sort((a, b) => a.timestamp - b.timestamp);
 
-    // 找出最大轮数
-    const maxRound = Math.max(0, ...session.messages.map(m => m.round || 0));
+    const originalRounds = session.rounds || 0;
+    let lastRoundLabel = null;
 
-    for (let round = 0; round <= maxRound; round++) {
-      const roundUserMsg = userMessages.find(m => m.round === round);
-      const roundAiMsgs = aiMessages.filter(m => m.round === round);
+    for (const msg of sortedMessages) {
+      const round = msg.round || 0;
+      const isFollowUp = msg.id && msg.id.includes('_user_extra');
+      const isExtraReply = msg.id && msg.id.includes('_extra');
 
-      if (!roundUserMsg && roundAiMsgs.length === 0) continue;
-
-      lines.push(`## 第${round + 1}轮`);
-      lines.push('');
-
-      if (roundUserMsg) {
-        lines.push(`**用户**: ${roundUserMsg.content}`);
-        lines.push('');
+      // 判断当前消息所属的轮次标签
+      let currentRoundLabel = null;
+      if (msg.role === 'user') {
+        if (isFollowUp) {
+          currentRoundLabel = 'followup';
+        } else {
+          currentRoundLabel = `round_${round}`;
+        }
+      } else if (msg.role === 'ai') {
+        if (isExtraReply) {
+          currentRoundLabel = 'followup';
+        } else {
+          currentRoundLabel = `round_${round}`;
+        }
       }
 
-      roundAiMsgs.forEach(msg => {
-        const role = msg.participantRole || 'AI';
-        lines.push(`**${role}**: ${msg.content}`);
+      // 当轮次变化时，输出新的标题
+      if (currentRoundLabel !== lastRoundLabel) {
+        if (currentRoundLabel === 'followup') {
+          lines.push(`## 📣 用户追问`);
+        } else {
+          const r = parseInt(currentRoundLabel.replace('round_', ''), 10);
+          if (r >= originalRounds) {
+            lines.push(`## 🔄 第${r + 1}轮（追加讨论）`);
+          } else {
+            lines.push(`## 第${r + 1}轮`);
+          }
+        }
         lines.push('');
-      });
+        lastRoundLabel = currentRoundLabel;
+      }
 
-      lines.push('---');
-      lines.push('');
+      // 输出消息内容
+      if (msg.role === 'user') {
+        if (isFollowUp) {
+          lines.push(`> **👤 用户追问：**`);
+          lines.push(`> ${msg.content}`);
+        } else {
+          lines.push(`**用户：** ${msg.content}`);
+        }
+        lines.push('');
+      } else if (msg.role === 'ai') {
+        const role = msg.participantRole || 'AI';
+        lines.push(`> **💬 ${role}：**`);
+        msg.content.split('\n').forEach(cl => {
+          lines.push(`> ${cl}`);
+        });
+        lines.push('');
+      }
     }
+
+    // 末尾加分隔线
+    lines.push('---');
+    lines.push('');
 
     return { success: true, markdown: lines.join('\n') };
   } catch (e) {

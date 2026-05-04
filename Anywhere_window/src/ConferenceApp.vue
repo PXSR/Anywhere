@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch, defineAsyncComponent } from 'vue'
-import { ElButton, ElIcon, ElMessage, ElMessageBox, ElInput } from 'element-plus'
-import { Download, VideoPause, Promotion, CloseBold, Minus, FullScreen, Close } from '@element-plus/icons-vue'
+import { ElButton, ElIcon, ElMessage, ElMessageBox, ElInput, ElInputNumber } from 'element-plus'
+import { Download, VideoPause, Promotion, CloseBold, Minus, FullScreen, Close, Refresh } from '@element-plus/icons-vue'
 
 import TitleBar from './components/TitleBar.vue'
 import ConferenceConfigDialog from './components/ConferenceConfigDialog.vue'
@@ -35,6 +35,8 @@ const statusMap = ref({}) // participantId -> 'idle'|'thinking'|'speaking'|'done
 const abortController = ref(null)
 const inputText = ref('')
 const isFinished = ref(false)
+const extraRounds = ref(1)
+const isExtraRoundRunning = ref(false)
 
 // --- DOM refs ---
 const chatContainerRef = ref(null)
@@ -445,6 +447,14 @@ function handleStop() {
     abortController.value = null
   }
   isRunning.value = false
+  isExtraRoundRunning.value = false
+  currentSpeakingIndex.value = -1
+  // 重置所有状态
+  if (conferenceConfig.value) {
+    const resetMap = {}
+    conferenceConfig.value.participants.forEach(p => { resetMap[p.id] = 'done' })
+    statusMap.value = resetMap
+  }
   ElMessage.warning('讨论已停止')
 }
 
@@ -474,6 +484,328 @@ async function handleSendInput() {
       round: currentRound.value,
     })
   } catch (e) {}
+
+  // 如果会议已结束，让参会模型依次回应用户发言
+  if (isFinished.value && conferenceConfig.value) {
+    await runUserSpeakResponses(text)
+  }
+}
+
+// --- 用户发言后，参会模型依次回应一次 ---
+async function runUserSpeakResponses(userText) {
+  if (!conferenceConfig.value) return
+  const config = conferenceConfig.value
+  const { participants, topic, enableCrossReference, moderatorId } = config
+
+  isExtraRoundRunning.value = true
+  abortController.value = new AbortController()
+
+  for (let i = 0; i < participants.length; i++) {
+    if (abortController.value.signal.aborted) break
+
+    const participant = participants[i]
+    currentSpeakingIndex.value = i
+    statusMap.value[participant.id] = 'thinking'
+
+    const contextMessages = buildContextMessages(
+      participant, currentRound.value, participant.isModerator,
+      topic, enableCrossReference, moderatorId
+    )
+
+    // 追加用户发言到上下文
+    contextMessages.push({ role: 'user', content: userText })
+
+    const placeholderId = `msg_${Date.now()}_${participant.id}_extra`
+    const placeholderMessage = {
+      id: placeholderId,
+      role: 'ai',
+      content: '',
+      round: currentRound.value,
+      status: 'thinking',
+      participantId: participant.id,
+      participantRole: participant.role,
+      participantColor: participant.color,
+      participantModel: participant.model,
+    }
+    messages.value.push(placeholderMessage)
+    const messageIndex = messages.value.length - 1
+
+    try {
+      await window.api.addConferenceMessage(sessionId.value, {
+        id: placeholderId,
+        role: 'ai',
+        content: '',
+        round: currentRound.value,
+        participantId: participant.id,
+        participantRole: participant.role,
+        status: 'thinking',
+      })
+    } catch (e) {}
+
+    await nextTick()
+    if (isAtBottom.value) scrollToBottom('smooth')
+
+    const providerConfig = await getProviderConfig(participant.providerModelKey)
+    if (!providerConfig) {
+      messages.value[messageIndex].status = 'error'
+      messages.value[messageIndex].content = `[错误] 无法找到服务商配置: ${participant.providerModelKey}`
+      statusMap.value[participant.id] = 'error'
+      try {
+        await window.api.updateConferenceMessage(sessionId.value, placeholderId, {
+          content: messages.value[messageIndex].content,
+          status: 'error',
+        })
+      } catch (e) {}
+      continue
+    }
+
+    statusMap.value[participant.id] = 'speaking'
+    let fullContent = ''
+    let lastFlushTime = Date.now()
+
+    try {
+      const requestParams = {
+        baseUrl: providerConfig.url,
+        apiKey: providerConfig.api_key,
+        model: participant.model,
+        apiType: providerConfig.apiType || 'chat_completions',
+        messages: contextMessages,
+        stream: true,
+        signal: abortController.value.signal,
+      }
+
+      const stream = await window.api.createChatCompletion(requestParams)
+
+      for await (const part of stream) {
+        if (abortController.value.signal.aborted) break
+        const delta = part?.choices?.[0]?.delta
+        if (!delta) continue
+        const contentPiece = delta.content || ''
+        if (contentPiece) {
+          fullContent += contentPiece
+          messages.value[messageIndex].content = fullContent
+          messages.value[messageIndex].status = 'streaming'
+          const now = Date.now()
+          if (now - lastFlushTime > 200) {
+            lastFlushTime = now
+            try {
+              await window.api.updateConferenceMessage(sessionId.value, placeholderId, {
+                content: fullContent,
+                status: 'streaming',
+              })
+            } catch (e) {}
+          }
+          if (isAtBottom.value) scrollToBottom('smooth')
+        }
+        if (delta.reasoning_content || delta.reasoning) {
+          messages.value[messageIndex].status = 'thinking'
+        }
+      }
+
+      if (!abortController.value.signal.aborted) {
+        messages.value[messageIndex].status = 'completed'
+        messages.value[messageIndex].content = fullContent || '[无回复]'
+        statusMap.value[participant.id] = 'done'
+      }
+    } catch (error) {
+      if (abortController.value.signal.aborted) break
+      console.error(`Participant ${participant.role} error:`, error)
+      messages.value[messageIndex].status = 'error'
+      messages.value[messageIndex].content = fullContent
+        ? `${fullContent}\n\n[错误: ${error.message || '请求失败'}]`
+        : `[错误: ${error.message || '请求失败'}]`
+      statusMap.value[participant.id] = 'error'
+    }
+
+    try {
+      await window.api.updateConferenceMessage(sessionId.value, placeholderId, {
+        content: messages.value[messageIndex].content,
+        status: messages.value[messageIndex].status,
+      })
+    } catch (e) {}
+  }
+
+  abortController.value = null
+  isExtraRoundRunning.value = false
+  currentSpeakingIndex.value = -1
+  // 重置所有状态为 done
+  const resetMap = {}
+  config.participants.forEach(p => { resetMap[p.id] = 'done' })
+  statusMap.value = resetMap
+}
+
+// --- 追加讨论轮次 ---
+async function handleContinueRounds() {
+  if (!conferenceConfig.value) return
+  const config = conferenceConfig.value
+  const addRounds = extraRounds.value
+
+  if (addRounds < 1) {
+    ElMessage.warning('追加轮数至少为 1')
+    return
+  }
+
+  isFinished.value = false
+  isRunning.value = true
+  abortController.value = new AbortController()
+
+  // 更新状态
+  const participantStatusMap = {}
+  config.participants.forEach(p => { participantStatusMap[p.id] = 'idle' })
+  statusMap.value = participantStatusMap
+  currentSpeakingIndex.value = -1
+
+  // 更新 DB 会话状态
+  try {
+    await window.api.updateConferenceSession(sessionId.value, { status: 'running' })
+  } catch (e) {}
+
+  // 从原始轮次之后继续（避免与已有轮次 round 值重复）
+  const startRound = config.rounds
+  const endRound = startRound + addRounds
+
+  for (let round = startRound; round < endRound; round++) {
+    if (abortController.value.signal.aborted) break
+    currentRound.value = round
+
+    for (let i = 0; i < config.participants.length; i++) {
+      if (abortController.value.signal.aborted) break
+
+      const participant = config.participants[i]
+      const isModerator = participant.isModerator
+      currentSpeakingIndex.value = i
+      statusMap.value[participant.id] = 'thinking'
+
+      const contextMessages = buildContextMessages(
+        participant, round, isModerator,
+        config.topic, config.enableCrossReference, config.moderatorId
+      )
+
+      const placeholderId = `msg_${Date.now()}_${participant.id}`
+      const placeholderMessage = {
+        id: placeholderId,
+        role: 'ai',
+        content: '',
+        round,
+        status: 'thinking',
+        participantId: participant.id,
+        participantRole: participant.role,
+        participantColor: participant.color,
+        participantModel: participant.model,
+      }
+      messages.value.push(placeholderMessage)
+      const messageIndex = messages.value.length - 1
+
+      try {
+        await window.api.addConferenceMessage(sessionId.value, {
+          id: placeholderId,
+          role: 'ai',
+          content: '',
+          round,
+          participantId: participant.id,
+          participantRole: participant.role,
+          status: 'thinking',
+        })
+      } catch (e) {}
+
+      await nextTick()
+      if (isAtBottom.value) scrollToBottom('smooth')
+
+      const providerConfig = await getProviderConfig(participant.providerModelKey)
+      if (!providerConfig) {
+        messages.value[messageIndex].status = 'error'
+        messages.value[messageIndex].content = `[错误] 无法找到服务商配置: ${participant.providerModelKey}`
+        statusMap.value[participant.id] = 'error'
+        try {
+          await window.api.updateConferenceMessage(sessionId.value, placeholderId, {
+            content: messages.value[messageIndex].content,
+            status: 'error',
+          })
+        } catch (e) {}
+        continue
+      }
+
+      statusMap.value[participant.id] = 'speaking'
+      let fullContent = ''
+      let lastFlushTime = Date.now()
+
+      try {
+        const requestParams = {
+          baseUrl: providerConfig.url,
+          apiKey: providerConfig.api_key,
+          model: participant.model,
+          apiType: providerConfig.apiType || 'chat_completions',
+          messages: contextMessages,
+          stream: true,
+          signal: abortController.value.signal,
+        }
+
+        const stream = await window.api.createChatCompletion(requestParams)
+
+        for await (const part of stream) {
+          if (abortController.value.signal.aborted) break
+          const delta = part?.choices?.[0]?.delta
+          if (!delta) continue
+          const contentPiece = delta.content || ''
+          if (contentPiece) {
+            fullContent += contentPiece
+            messages.value[messageIndex].content = fullContent
+            messages.value[messageIndex].status = 'streaming'
+            const now = Date.now()
+            if (now - lastFlushTime > 200) {
+              lastFlushTime = now
+              try {
+                await window.api.updateConferenceMessage(sessionId.value, placeholderId, {
+                  content: fullContent,
+                  status: 'streaming',
+                })
+              } catch (e) {}
+            }
+            if (isAtBottom.value) scrollToBottom('smooth')
+          }
+          if (delta.reasoning_content || delta.reasoning) {
+            messages.value[messageIndex].status = 'thinking'
+          }
+        }
+
+        if (!abortController.value.signal.aborted) {
+          messages.value[messageIndex].status = 'completed'
+          messages.value[messageIndex].content = fullContent || '[无回复]'
+          statusMap.value[participant.id] = 'done'
+        }
+      } catch (error) {
+        if (abortController.value.signal.aborted) break
+        console.error(`Participant ${participant.role} error:`, error)
+        messages.value[messageIndex].status = 'error'
+        messages.value[messageIndex].content = fullContent
+          ? `${fullContent}\n\n[错误: ${error.message || '请求失败'}]`
+          : `[错误: ${error.message || '请求失败'}]`
+        statusMap.value[participant.id] = 'error'
+      }
+
+      try {
+        await window.api.updateConferenceMessage(sessionId.value, placeholderId, {
+          content: messages.value[messageIndex].content,
+          status: messages.value[messageIndex].status,
+        })
+      } catch (e) {}
+    }
+  }
+
+  abortController.value = null
+  isRunning.value = false
+  isFinished.value = true
+  currentSpeakingIndex.value = -1
+
+  const resetMap = {}
+  config.participants.forEach(p => { resetMap[p.id] = 'done' })
+  statusMap.value = resetMap
+
+  try {
+    await window.api.updateConferenceSession(sessionId.value, { status: 'completed' })
+  } catch (e) {}
+
+  ElMessage.success(`已追加 ${addRounds} 轮讨论`)
 }
 
 // --- 导出 Markdown ---
@@ -509,7 +841,7 @@ async function handleExport() {
 
 // --- 重新配置 ---
 function handleReconfigure() {
-  if (isRunning.value) {
+  if (isRunning.value || isExtraRoundRunning.value) {
     handleStop()
   }
   configDialogVisible.value = true
@@ -520,6 +852,8 @@ function handleReconfigure() {
   currentRound.value = 0
   currentSpeakingIndex.value = -1
   isFinished.value = false
+  isExtraRoundRunning.value = false
+  extraRounds.value = 1
   inputText.value = ''
 }
 
@@ -622,15 +956,15 @@ function handleParticipantClick(participant) {
           />
 
           <!-- 正在进行提示 -->
-          <div v-if="isRunning" class="running-indicator">
+          <div v-if="isRunning || isExtraRoundRunning" class="running-indicator">
             <span class="indicator-dot"></span>
-            <span>第 {{ currentRound + 1 }} 轮讨论进行中...</span>
+            <span>{{ isExtraRoundRunning ? '追问回复进行中...' : `第 ${currentRound + 1 } 轮讨论进行中...` }}</span>
           </div>
 
           <!-- 完成提示 -->
-          <div v-if="isFinished" class="finished-indicator">
+          <div v-if="isFinished && !isExtraRoundRunning" class="finished-indicator">
             <span class="check-icon">✓</span>
-            <span>讨论已全部完成</span>
+            <span>讨论已全部完成（可追加轮次或继续追问）</span>
           </div>
 
           <!-- 底部间距 -->
@@ -646,8 +980,8 @@ function handleParticipantClick(participant) {
             v-model="inputText"
             type="textarea"
             :rows="2"
-            placeholder="输入补充说明或追问（按 Enter 发送，Shift+Enter 换行）"
-            :disabled="isRunning"
+            :placeholder="isFinished ? '输入追问，参会模型将依次回应（按 Enter 发送，Shift+Enter 换行）' : '输入补充说明或追问（按 Enter 发送，Shift+Enter 换行）'"
+            :disabled="isRunning || isExtraRoundRunning"
             @keydown.enter.exact.prevent="handleSendInput"
             class="conference-input"
           />
@@ -656,7 +990,7 @@ function handleParticipantClick(participant) {
         <!-- 按钮区域 -->
         <div class="button-area">
           <el-button
-            v-if="!isRunning && !isFinished"
+            v-if="!isRunning && !isFinished && !isExtraRoundRunning"
             type="primary"
             :icon="Promotion"
             @click="handleSendInput"
@@ -666,7 +1000,7 @@ function handleParticipantClick(participant) {
           </el-button>
 
           <el-button
-            v-if="isRunning"
+            v-if="isRunning || isExtraRoundRunning"
             type="warning"
             :icon="VideoPause"
             @click="handleStop"
@@ -674,8 +1008,29 @@ function handleParticipantClick(participant) {
             停止
           </el-button>
 
+          <!-- 追加轮次：仅在讨论完成后显示 -->
+          <div v-if="isFinished && !isRunning" class="extra-rounds-area">
+            <span class="extra-label">追加</span>
+            <el-input-number
+              v-model="extraRounds"
+              :min="1"
+              :max="100"
+              :controls="false"
+              class="extra-rounds-input"
+            />
+            <span class="extra-label">轮</span>
+            <el-button
+              type="success"
+              :icon="Refresh"
+              @click="handleContinueRounds"
+              size="small"
+            >
+              继续讨论
+            </el-button>
+          </div>
+
           <el-button
-            v-if="isFinished || (!isRunning && messages.length > 0)"
+            v-if="(isFinished || (!isRunning && messages.length > 0)) && !isExtraRoundRunning"
             :icon="Download"
             @click="handleExport"
           >
@@ -683,7 +1038,7 @@ function handleParticipantClick(participant) {
           </el-button>
 
           <el-button
-            v-if="!isRunning"
+            v-if="!isRunning && !isExtraRoundRunning"
             @click="handleReconfigure"
           >
             重新配置
@@ -886,6 +1241,34 @@ function handleParticipantClick(participant) {
   gap: 8px;
   max-width: 860px;
   margin: 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.extra-rounds-area {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: auto;
+}
+
+.extra-label {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.extra-rounds-input {
+  width: 56px;
+}
+
+.extra-rounds-input :deep(.el-input__wrapper) {
+  padding: 0 4px;
+}
+
+.extra-rounds-input :deep(.el-input__inner) {
+  text-align: center;
+  padding: 0;
 }
 
 /* === 滚动条样式 === */
