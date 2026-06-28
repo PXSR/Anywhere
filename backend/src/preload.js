@@ -87,6 +87,17 @@ const {
   exportConferenceToMarkdown,
 } = require('./conference.js');
 
+const {
+  readLocalProjects,
+  writeLocalProjects,
+  parseProjectsYaml,
+  serializeProjectsYaml,
+  normalizeProjects,
+  mergeFileAssignment,
+  mergeProjectAssignment,
+  findProjectByBasename,
+} = require('./projects.js');
+
 window.api = {
   getConfig,
   updateConfig,
@@ -109,6 +120,14 @@ window.api = {
   writeLocalFile,
   setFileMtime,
   coderedirect,
+  readLocalProjects,
+  writeLocalProjects,
+  parseProjectsYaml,
+  serializeProjectsYaml,
+  normalizeProjects,
+  mergeFileAssignment,
+  mergeProjectAssignment,
+  findProjectByBasename,
   setZoomFactor,
   defaultConfig,
   savePromptWindowSettings,
@@ -425,6 +444,17 @@ const commandHandlers = {
         return;
       }
 
+      let type_new = type;
+      let payload_new = payload;
+      console.log(type, payload);
+
+      if (type === "files") {
+        if (payload[0].isDirectory){
+          payload_new = "`"+payload[0].path+"`";
+          type_new = "over";
+        } 
+      }
+
       // 如果只有一个窗口，直接跳过选择，智能追加
       if (features.length === 1) {
         const senderId = features[0].code.replace('append_to_', '');
@@ -434,14 +464,17 @@ const commandHandlers = {
           if (!win.isVisible()) win.show();
           win.focus();
           
-          win.webContents.send('window-append-msg', { type, payload });
+          win.webContents.send('window-append-msg', {
+            type: type_new,
+            payload: payload_new
+          });
         }
         utools.outPlugin();
         return;
       }
 
       // 多个窗口时，弹出选择器
-      openAppendSelectorWindow(features, payload, type);
+      openAppendSelectorWindow(features, payload_new, type_new);
       utools.outPlugin();
     }, 10); // 10ms 延迟足以让出渲染线程
   },
@@ -601,6 +634,10 @@ const commandHandlers = {
     }
 
     if (promptConfig.showMode === 'window') {
+      if (type === "files" && payload[0].isDirectory) {
+        payload = "`"+payload[0].path+"`";
+        type = "over";
+      }
       const msg = {
         os: utools.isMacOS() ? "macos" : utools.isWindows() ? "win" : "linux",
         code,
@@ -621,7 +658,14 @@ const commandHandlers = {
       } else if (type === "img") {
         content = [{ type: "image_url", image_url: { url: payload } }];
       } else if (type === "files") {
-        content = await sendfileDirect(payload);
+        const isDirectory = payload[0].isDirectory;
+        if (isDirectory) {
+          content = "`"+payload[0].path+"`";
+          msg.type = "over";
+        }
+        else{
+          content = await sendfileDirect(payload);
+        }
       }
 
       if (content) {

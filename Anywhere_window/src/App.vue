@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, nextTick, watch, h, computed, defineAsyncComponent } from 'vue';
-import { ElContainer, ElMain, ElDialog, ElImageViewer, ElMessage, ElMessageBox, ElInput, ElButton, ElCheckbox, ElButtonGroup, ElTag, ElTooltip, ElIcon, ElAvatar, ElSwitch } from 'element-plus';
+import { ElContainer, ElMain, ElDialog, ElImageViewer, ElMessage, ElMessageBox, ElInput, ElButton, ElCheckbox, ElButtonGroup, ElTag, ElTooltip, ElIcon, ElAvatar, ElSwitch, ElSelect, ElOption } from 'element-plus';
 import { createClient } from "webdav/web";
 import { DocumentCopy, QuestionFilled, Download, Search, Tools, CaretRight, Collection, Warning, Cpu, ArrowUp, ArrowDown, Refresh } from '@element-plus/icons-vue';
 
@@ -9,13 +9,40 @@ import ChatHeader from './components/ChatHeader.vue';
 const ChatMessage = defineAsyncComponent(() => import('./components/ChatMessage.vue'));
 import ChatInput from './components/ChatInput.vue';
 import ModelSelectionDialog from './components/ModelSelectionDialog.vue';
-
-import DOMPurify from 'dompurify';
-import { marked } from 'marked';
-import html2canvas from 'html2canvas';
+import TaskPanel from './components/TaskPanel.vue';
 
 import TextSearchUI from './utils/TextSearchUI.js';
 import { formatTimestamp, sanitizeToolArgs, sanitizeToolFunctionName } from './utils/formatters.js';
+
+let gptTokenizerEncodePromise = null;
+const loadGptTokenizerEncode = () => {
+  if (!gptTokenizerEncodePromise) {
+    gptTokenizerEncodePromise = import('gpt-tokenizer').then(mod => mod.encode || mod.default?.encode);
+  }
+  return gptTokenizerEncodePromise;
+};
+
+let html2canvasPromise = null;
+const loadHtml2Canvas = () => {
+  if (!html2canvasPromise) {
+    html2canvasPromise = import('html2canvas').then(mod => mod.default || mod);
+  }
+  return html2canvasPromise;
+};
+
+let exportHtmlDepsPromise = null;
+const loadExportHtmlDeps = () => {
+  if (!exportHtmlDepsPromise) {
+    exportHtmlDepsPromise = Promise.all([
+      import('dompurify'),
+      import('marked')
+    ]).then(([dompurifyMod, markedMod]) => ({
+      DOMPurify: dompurifyMod.default || dompurifyMod,
+      marked: markedMod.marked || markedMod.default || markedMod
+    }));
+  }
+  return exportHtmlDepsPromise;
+};
 
 const showDismissibleMessage = (options) => {
   const opts = typeof options === 'string' ? { message: options } : options;
@@ -189,6 +216,7 @@ const chat_show = ref([]);
 const loading = ref(false);
 const prompt = ref("");
 const signalController = ref(null);
+const activeAssistantTurnId = ref(0);
 const fileList = ref([]);
 const zoomLevel = ref(1);
 
@@ -328,6 +356,7 @@ const imageViewerInitialIndex = ref(0);
 const currentImageViewerIndex = ref(0);
 
 const toolCallControllers = ref(new Map());
+let activeAssistantTurnMeta = null;
 const tempSessionMcpServerIds = ref([]);
 
 const isAutoApproveTools = ref(true);
@@ -340,14 +369,23 @@ const handleToolApproval = (toolCallId, isApproved) => {
     pendingToolApprovals.value.delete(toolCallId);
   }
 };
+
+const resolvePendingToolApprovals = (isApproved = false) => {
+  pendingToolApprovals.value.forEach((resolve) => {
+    try {
+      resolve(isApproved);
+    } catch {
+      // ignore approval resolve race
+    }
+  });
+  pendingToolApprovals.value.clear();
+};
+
 const handleToggleAutoApprove = (val) => {
   isAutoApproveTools.value = val;
 
   if (val) {
-    pendingToolApprovals.value.forEach((resolve, id) => {
-      resolve(true);
-    });
-    pendingToolApprovals.value.clear();
+    resolvePendingToolApprovals(true);
 
     chat_show.value.forEach(msg => {
       if (msg.tool_calls) {
@@ -361,6 +399,289 @@ const handleToggleAutoApprove = (val) => {
   }
 };
 
+const isAbortError = (error) => {
+  if (!error) return false;
+  return error.name === 'AbortError' || String(error?.message || '').includes('aborted');
+};
+
+const createAbortError = () => {
+  if (typeof DOMException === 'function') {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+  const error = new Error('The operation was aborted.');
+  error.name = 'AbortError';
+  return error;
+};
+
+const normalizeAssistantMessageContent = (content) => {
+  if (Array.isArray(content)) return content.filter(part => part && typeof part === 'object');
+  if (typeof content === 'string') {
+    return content ? [{ type: 'text', text: content }] : [];
+  }
+  return [];
+};
+
+const appendTerminalNoticeToAssistantContent = (content, terminalNotice) => {
+  const normalizedContent = normalizeAssistantMessageContent(content);
+  if (!terminalNotice || !terminalNotice.trim()) {
+    return normalizedContent;
+  }
+  const noticeText = terminalNotice.trim();
+  if (noticeText && normalizedContent.some(part => part?.type === 'text' && typeof part.text === 'string' && part.text.includes(noticeText))) {
+    return normalizedContent;
+  }
+
+  if (normalizedContent.length === 0) {
+    return [{ type: 'text', text: terminalNotice }];
+  }
+
+  const nextContent = normalizedContent.map(part => ({ ...part }));
+  const lastTextIndex = nextContent.map(part => part?.type).lastIndexOf('text');
+  if (lastTextIndex >= 0) {
+    const lastTextPart = nextContent[lastTextIndex];
+    lastTextPart.text = `${lastTextPart.text || ''}${terminalNotice}`;
+    return nextContent;
+  }
+
+  nextContent.push({ type: 'text', text: terminalNotice });
+  return nextContent;
+};
+
+const ASSISTANT_CANCELLED_NOTICE_MARKDOWN = "\n\n> **请求已取消**";
+
+const getAssistantTerminalNoticeMarkdown = (aborted, errorDisplay) => {
+  if (aborted) {
+    return ASSISTANT_CANCELLED_NOTICE_MARKDOWN;
+  }
+  return `\n\n> **错误信息**：${errorDisplay}`;
+};
+
+const getCurrentAssistantDisplayName = () => {
+  return modelMap.value[model.value] || model.value.split('|')[1] || model.value || '';
+};
+
+const findAssistantTurnBubbleIndex = (turnMeta = activeAssistantTurnMeta) => {
+  const assistantMessageId = turnMeta?.assistantMessageId;
+  if (assistantMessageId !== undefined && assistantMessageId !== null) {
+    const index = chat_show.value.findIndex(msg => msg?.role === 'assistant' && msg.id === assistantMessageId);
+    if (index !== -1) return index;
+  }
+
+  for (let index = chat_show.value.length - 1; index >= 0; index -= 1) {
+    const message = chat_show.value[index];
+    if (message?.role === 'assistant' && !message.endTime && !message.completedTimestamp) {
+      return index;
+    }
+  }
+  return -1;
+};
+
+const buildMissingToolAbortMessages = () => {
+  let assistantIndex = -1;
+  for (let index = history.value.length - 1; index >= 0; index -= 1) {
+    const message = history.value[index];
+    if (message?.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      assistantIndex = index;
+      break;
+    }
+    if (message?.role !== 'tool') {
+      break;
+    }
+  }
+
+  if (assistantIndex === -1) return [];
+  const trailingMessages = history.value.slice(assistantIndex + 1);
+  if (trailingMessages.some(message => message?.role !== 'tool')) return [];
+
+  const respondedToolCallIds = new Set(
+    trailingMessages
+      .filter(message => message?.role === 'tool' && message.tool_call_id)
+      .map(message => message.tool_call_id)
+  );
+
+  return history.value[assistantIndex].tool_calls
+    .filter(toolCall => toolCall?.id && !respondedToolCallIds.has(toolCall.id))
+    .map(toolCall => ({
+      tool_call_id: toolCall.id,
+      role: 'tool',
+      name: toolCall.function?.name || toolCall.name || '',
+      content: '[System Note]: Tool call was aborted by user.'
+    }));
+};
+
+const finalizeCancelledAssistantTurn = (turnMeta = activeAssistantTurnMeta) => {
+  let assistantBubbleIndex = findAssistantTurnBubbleIndex(turnMeta);
+  if (assistantBubbleIndex === -1) {
+    chat_show.value.push({
+      id: messageIdCounter.value++,
+      role: 'assistant',
+      content: [],
+      reasoning_content: "",
+      status: "",
+      aiName: getCurrentAssistantDisplayName(),
+      voiceName: selectedVoice.value,
+      tool_calls: [],
+      startTime: Date.now()
+    });
+    assistantBubbleIndex = chat_show.value.length - 1;
+    if (turnMeta) {
+      turnMeta.assistantMessageId = chat_show.value[assistantBubbleIndex].id;
+    }
+  }
+
+  const currentBubble = chat_show.value[assistantBubbleIndex];
+  const finalContent = appendTerminalNoticeToAssistantContent(currentBubble.content, ASSISTANT_CANCELLED_NOTICE_MARKDOWN);
+  const finalReasoningContent = typeof currentBubble.reasoning_content === 'string'
+    ? currentBubble.reasoning_content
+    : (currentBubble.reasoning_content ? String(currentBubble.reasoning_content) : '');
+  const endTime = Date.now();
+
+  currentBubble.content = finalContent;
+  currentBubble.reasoning_content = finalReasoningContent;
+  currentBubble.status = 'cancelled';
+  currentBubble.endTime = endTime;
+  currentBubble.completedTimestamp = new Date().toLocaleString('sv-SE');
+
+  if (turnMeta && !turnMeta.cancellationRecorded) {
+    const missingToolMessages = buildMissingToolAbortMessages();
+    if (missingToolMessages.length > 0) {
+      history.value.push(...missingToolMessages);
+    }
+    history.value.push({
+      role: 'assistant',
+      content: finalContent,
+      reasoning_content: finalReasoningContent || null
+    });
+    turnMeta.cancellationRecorded = true;
+  }
+
+  return assistantBubbleIndex;
+};
+
+// --- Better Work MCP（前端拦截执行：choices 选项卡 / 任务面板） ---
+const pendingChoices = ref(new Map());
+const taskList = ref([]);
+const taskPanelVisible = ref(false);
+const pendingAppendBuffer = ref([]);
+const BETTERWORK_FRONTEND_TOOLS = new Set(['ask_user_choice', 'task_write', 'task_read']);
+
+const resolvePendingChoices = (payload = null) => {
+  pendingChoices.value.forEach((resolve) => {
+    try { resolve(payload); } catch { /* ignore choice resolve race */ }
+  });
+  pendingChoices.value.clear();
+};
+
+const handleChoiceSubmit = (toolCallId, payload) => {
+  const resolver = pendingChoices.value.get(toolCallId);
+  if (resolver) {
+    resolver(payload);
+    pendingChoices.value.delete(toolCallId);
+  }
+};
+
+const buildChoiceResultText = (questions, answer) => {
+  if (!answer || !Array.isArray(answer.responses)) {
+    return 'The user cancelled the selection (the request was interrupted).';
+  }
+  const lines = answer.responses.map((r, i) => {
+    const q = questions[r.questionIndex] || questions[i] || {};
+    const qText = q.question || r.question || `Question ${i + 1}`;
+    if (r.type === 'discuss') {
+      return `Q: ${qText}\nA: The user wants to discuss this question further. Proactively ask clarifying follow-up questions before proceeding.`;
+    }
+    if (r.type === 'custom') {
+      return `Q: ${qText}\nA (user's own input): ${r.customText || ''}`;
+    }
+    const selected = Array.isArray(r.selected) ? r.selected.join('; ') : '';
+    return `Q: ${qText}\nA: ${selected}`;
+  });
+  return lines.join('\n\n');
+};
+
+const normalizeTaskStatus = (status) => {
+  const s = String(status || '').toLowerCase();
+  if (s === 'in_progress' || s === 'doing' || s === 'active' || s === 'running') return 'in_progress';
+  if (s === 'completed' || s === 'done' || s === 'finished') return 'completed';
+  return 'pending';
+};
+
+const normalizeTaskList = (tasks) => {
+  if (!Array.isArray(tasks)) return [];
+  return tasks
+    .filter(t => t && typeof t.content === 'string')
+    .map((t, i) => ({
+      id: i,
+      content: t.content,
+      status: normalizeTaskStatus(t.status),
+      steps: Array.isArray(t.steps)
+        ? t.steps
+            .filter(s => s && typeof s.content === 'string')
+            .map(s => ({ content: s.content, status: normalizeTaskStatus(s.status) }))
+        : []
+    }));
+};
+
+const applyTaskList = (tasks) => {
+  taskList.value = normalizeTaskList(tasks);
+  if (taskList.value.length > 0) {
+    taskPanelVisible.value = true;
+  }
+};
+
+const serializeTaskListForModel = (tasks) => {
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return 'The task list is currently empty.';
+  }
+  const lines = tasks.map((t, i) => {
+    let block = `${i + 1}. [${t.status}] ${t.content}`;
+    if (Array.isArray(t.steps) && t.steps.length > 0) {
+      block += '\n' + t.steps.map(s => `   - [${s.status}] ${s.content}`).join('\n');
+    }
+    return block;
+  });
+  return 'Current task list:\n' + lines.join('\n');
+};
+
+const handleBetterWorkTool = async (toolCall, args, uiToolCall) => {
+  if (toolCall.function.name === 'ask_user_choice') {
+    const questions = Array.isArray(args?.questions) ? args.questions : [];
+    if (questions.length === 0) {
+      if (uiToolCall) { uiToolCall.approvalStatus = 'finished'; uiToolCall.result = 'No questions were provided.'; }
+      return 'No questions were provided.';
+    }
+    if (uiToolCall) {
+      uiToolCall.choiceData = { questions };
+      uiToolCall.approvalStatus = 'choosing';
+      uiToolCall.result = '等待用户选择...';
+    }
+    const answer = await new Promise((resolve) => {
+      pendingChoices.value.set(toolCall.id, resolve);
+    });
+    const resultText = buildChoiceResultText(questions, answer);
+    if (uiToolCall) {
+      uiToolCall.approvalStatus = answer ? 'finished' : 'rejected';
+      uiToolCall.result = resultText;
+    }
+    return resultText;
+  }
+  if (toolCall.function.name === 'task_write') {
+    const tasks = Array.isArray(args?.tasks) ? args.tasks : [];
+    applyTaskList(tasks);
+    const total = taskList.value.length;
+    const done = taskList.value.filter(t => t.status === 'completed').length;
+    const ack = `Task list updated: ${total} task(s) total, ${done} completed.`;
+    if (uiToolCall) { uiToolCall.approvalStatus = 'finished'; uiToolCall.result = ack; }
+    return ack;
+  }
+  if (toolCall.function.name === 'task_read') {
+    const text = serializeTaskListForModel(taskList.value);
+    if (uiToolCall) { uiToolCall.approvalStatus = 'finished'; uiToolCall.result = text; }
+    return text;
+  }
+  return '';
+};
+
 const isMcpDialogVisible = ref(false);
 const sessionMcpServerIds = ref([]);
 const openaiFormattedTools = ref([]);
@@ -369,6 +690,21 @@ const isMcpLoading = ref(false);
 const mcpFilter = ref('all');
 const isRefreshingMcp = ref(false);
 const mcpToolCache = ref({});
+
+// Better Work：任务工具是否激活（决定 header 任务按钮是否显示）与任务整体状态（驱动徽章）
+const TASK_MCP_TOOL_NAMES = new Set(['task_write', 'task_read']);
+const hasTaskMcpTool = computed(() => {
+  return openaiFormattedTools.value.some(tool => TASK_MCP_TOOL_NAMES.has(tool?.function?.name));
+});
+const taskOverallStatus = computed(() => {
+  const tasks = taskList.value;
+  if (!Array.isArray(tasks) || tasks.length === 0) return '';
+  const isActive = (t) => t.status === 'in_progress'
+    || (Array.isArray(t.steps) && t.steps.some(s => s.status === 'in_progress'));
+  if (tasks.some(isActive)) return 'in_progress';
+  if (tasks.every(t => t.status === 'completed')) return 'completed';
+  return 'pending';
+});
 const expandedMcpServers = ref(new Set());
 
 const lastAppliedMcpConfigFingerprint = ref('');
@@ -1094,7 +1430,14 @@ const onAvatarClick = async (role, event) => {
   }, roleMessageIndices.includes(chat_show.value.length - 1));
 };
 
-const handleSubmit = () => askAI(false);
+const handleSubmit = () => {
+  // 生成中（或正在准备发送）时，把消息暂存进缓冲区，本轮结束后自动发送
+  if (loading.value || isPreparingSend.value) {
+    enqueueInputToBuffer();
+    return;
+  }
+  askAI(false);
+};
 const handleCancel = () => cancelAskAI();
 const handleClearHistory = () => clearHistory();
 const handleRemoveFile = (index) => fileList.value.splice(index, 1);
@@ -1928,6 +2271,7 @@ onMounted(async () => {
 const AUTO_NAMING_TIMEOUT_MS = 30000;
 const AUTO_NAMING_MAX_TEXT_CHARS = 1000;
 const AUTO_NAMING_MAX_IMAGES = 3;
+const AUTO_NAMING_MAX_TITLE_TOKENS = 40;
 const buildAutoNamingSystemPrompt = () => {
   const locale = currentConfig.value?.language === 'en'
     ? 'English'
@@ -1942,7 +2286,7 @@ Rules:
 2. Do not use punctuation, separators, quotes, emoji, or other special symbols.
 3. Reply directly with the title only.
 4. If the user's primary language is unclear, summarize using ${locale}.
-5. Keep the title brief and natural for mixed-language display. Prefer a short title that fits within about 16 display-width units (for example, around 8 Chinese/Japanese characters or around 16 ASCII letters, with mixed-language text balanced naturally).`;
+5. Keep the title natural and concise. Titles within about ${AUTO_NAMING_MAX_TITLE_TOKENS} tokenizer tokens are acceptable; do not intentionally shorten a clear normal-length mixed-language title.`;
 };
 
 const sanitizeConversationTitlePart = (value, maxLength = 30) => {
@@ -1958,38 +2302,43 @@ const sanitizeConversationTitlePart = (value, maxLength = 30) => {
 };
 
 
-const computeConversationTitleDisplayWidth = (value = '') => {
-  return Array.from(String(value || '')).reduce((total, char) => {
-    if (/\s/u.test(char)) return total + 0.5;
-    if (/^[\u0000-\u00ff]$/u.test(char)) return total + 1;
-    return total + 2;
-  }, 0);
+const countConversationTitleTokens = async (value = '') => {
+  try {
+    const encodeGptTokens = await loadGptTokenizerEncode();
+    if (typeof encodeGptTokens !== 'function') {
+      throw new Error('gpt-tokenizer encode export is unavailable');
+    }
+    return encodeGptTokens(String(value || '')).length;
+  } catch {
+    return Array.from(String(value || '')).length;
+  }
 };
 
-const truncateConversationTitleByDisplayWidth = (value, maxDisplayWidth = 16) => {
-  const normalized = typeof value === 'string' ? value : String(value ?? '');
-  let result = '';
-  let usedWidth = 0;
+const truncateConversationTitleByTokens = async (value, maxTokens = AUTO_NAMING_MAX_TITLE_TOKENS) => {
+  const normalized = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+  if (!normalized) return '';
 
+  if (await countConversationTitleTokens(normalized) <= maxTokens) {
+    return normalized;
+  }
+
+  let result = '';
   for (const char of Array.from(normalized)) {
-    const charWidth = /\s/u.test(char)
-      ? 0.5
-      : (/^[\u0000-\u00ff]$/u.test(char) ? 1 : 2);
-    if (usedWidth + charWidth > maxDisplayWidth) break;
-    result += char;
-    usedWidth += charWidth;
+    const next = result + char;
+    if (await countConversationTitleTokens(next) > maxTokens) break;
+    result = next;
   }
 
   return result.trim();
 };
 
-const sanitizeAutoNamingTitlePart = (value) => {
-  const normalized = sanitizeConversationTitlePart(value, 60)
+const sanitizeAutoNamingTitlePart = async (value) => {
+  const normalized = sanitizeConversationTitlePart(value, 1000)
     .replace(/[^\p{L}\p{N}\s]/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
 
-  return truncateConversationTitleByDisplayWidth(normalized, 16);
+  return truncateConversationTitleByTokens(normalized, AUTO_NAMING_MAX_TITLE_TOKENS);
 };
 
 const buildConversationTimestampSuffix = (date = new Date()) => {
@@ -2254,7 +2603,7 @@ const extractAutoNamingResponseText = async (response, apiType = 'chat_completio
     return extractAssistantTextFromContent(message?.content);
   }
 
-  if (apiType === 'responses') {
+  if (apiType === 'responses' || apiType === 'codex') {
     if (typeof response.output_text === 'string' && response.output_text.trim()) {
       return response.output_text;
     }
@@ -2298,6 +2647,7 @@ const generateConversationNamePrefixWithFastModel = async (firstUserMsg, signal 
       apiKey: provider.api_key,
       model: modelName,
       apiType,
+      headers: JSON.parse(JSON.stringify(provider?.headers || {})),
       messages: [
         { role: 'system', content: buildAutoNamingSystemPrompt() },
         { role: 'user', content: userContent }
@@ -2312,7 +2662,7 @@ const generateConversationNamePrefixWithFastModel = async (firstUserMsg, signal 
     }
 
     const rawTitle = await extractAutoNamingResponseText(response, apiType);
-    return sanitizeAutoNamingTitlePart(rawTitle);
+    return await sanitizeAutoNamingTitlePart(rawTitle);
   } catch (error) {
     if (error?.name === 'AbortError') {
       throw error;
@@ -2618,9 +2968,127 @@ const getSessionDataAsObject = () => {
     currentPromptConfig: currentPromptConfig, history: history.value, chat_show: chat_show.value, selectedVoice: selectedVoice.value,
     activeMcpServerIds: sessionMcpServerIds.value || [],
     activeSkillIds: sessionSkillIds.value || [],
-    isAutoApproveTools: isAutoApproveTools.value
+    isAutoApproveTools: isAutoApproveTools.value,
+    taskList: taskList.value
   };
 }
+// --- 项目（目录）归属：窗口端 helper ---
+const stripJsonName = (value) => {
+  const name = String(value || '').trim();
+  return name.toLowerCase().endsWith('.json') ? name.slice(0, -5) : name;
+};
+
+const normalizeWindowProjects = (data) => {
+  const projects = Array.isArray(data?.projects) ? data.projects : [];
+  return {
+    version: Number(data?.version) || 1,
+    projects: projects
+      .filter((p) => p && typeof p === 'object')
+      .map((p) => ({
+        id: String(p.id || '').trim(),
+        name: String(p.name || '').trim() || String(p.id || '').trim(),
+        files: Array.isArray(p.files) ? p.files.map((f) => String(f || '').trim()).filter(Boolean) : []
+      }))
+      .filter((p) => p.id)
+  };
+};
+
+const loadProjectsForScope = async (scope) => {
+  try {
+    if (scope === 'cloud') {
+      const { url, username, password, data_path } = currentConfig.value?.webdav || {};
+      if (!url || !data_path) return { version: 1, projects: [] };
+      const client = createClient(url, { username, password });
+      const remoteDir = data_path.endsWith('/') ? data_path.slice(0, -1) : data_path;
+      const remotePath = `${remoteDir}/projects.yaml`;
+      if (!(await client.exists(remotePath))) return { version: 1, projects: [] };
+      const text = await client.getFileContents(remotePath, { format: 'text' });
+      return normalizeWindowProjects(await window.api.parseProjectsYaml(typeof text === 'string' ? text : String(text)));
+    }
+    const localPath = currentConfig.value?.webdav?.localChatPath || '';
+    if (!localPath) return { version: 1, projects: [] };
+    return normalizeWindowProjects(await window.api.readLocalProjects(localPath));
+  } catch (error) {
+    console.warn('[projects] load for scope failed:', error);
+    return { version: 1, projects: [] };
+  }
+};
+
+const findProjectIdByFilename = (projectsData, filename) => {
+  const stripped = stripJsonName(filename);
+  const project = (projectsData?.projects || []).find((p) =>
+    (p.files || []).some((f) => stripJsonName(f) === stripped)
+  );
+  return project?.id || '';
+};
+
+const renderProjectSelectRow = ({ projects, selectedProjectId }) => h(
+  'div',
+  { class: 'filename-project-row' },
+  [
+    h('span', { class: 'filename-project-label' }, '项目'),
+    h(ElSelect, {
+      modelValue: selectedProjectId.value,
+      'onUpdate:modelValue': (val) => { selectedProjectId.value = val; },
+      placeholder: '未分组',
+      clearable: true,
+      class: 'filename-project-select',
+      popperClass: 'filename-project-popper',
+      teleported: true,
+      placement: 'bottom-start'
+    }, () => [
+      h(ElOption, { label: '未分组', value: '' }),
+      ...projects.map((p) => h(ElOption, { key: p.id, label: p.name, value: p.id }))
+    ])
+  ]
+);
+
+// 本地项目归属重写：移除旧名 + 当前名，按需加入目标项目（projectId 为空=未分组）。
+const reassignLocalProject = async ({ projectId, projectName, addFilename, removeFilenames = [] }) => {
+  const localPath = currentConfig.value?.webdav?.localChatPath || '';
+  if (!localPath) return;
+  const data = normalizeWindowProjects(await window.api.readLocalProjects(localPath));
+  const removeSet = new Set([addFilename, ...removeFilenames].map((n) => stripJsonName(n)).filter(Boolean));
+  let projects = data.projects.map((p) => ({
+    ...p,
+    files: (p.files || []).filter((f) => !removeSet.has(stripJsonName(f)))
+  }));
+  if (projectId && addFilename) {
+    if (!projects.some((p) => p.id === projectId)) {
+      projects.push({ id: projectId, name: projectName || projectId, files: [] });
+    }
+    projects = projects.map((p) =>
+      p.id === projectId ? { ...p, files: [...p.files, addFilename] } : p
+    );
+  }
+  await window.api.writeLocalProjects(localPath, { version: data.version || 1, projects });
+};
+
+// 云端项目归属：读取云端 projects.yaml → 单文件归属合并 → 写回（webdav 在渲染层）。
+const assignCloudProject = async ({ projectId, projectName, basename }) => {
+  const { url, username, password, data_path } = currentConfig.value?.webdav || {};
+  if (!url || !data_path) return;
+  const client = createClient(url, { username, password });
+  const remoteDir = data_path.endsWith('/') ? data_path.slice(0, -1) : data_path;
+  const remotePath = `${remoteDir}/projects.yaml`;
+  let current = { version: 1, projects: [] };
+  try {
+    if (await client.exists(remotePath)) {
+      const text = await client.getFileContents(remotePath, { format: 'text' });
+      current = await window.api.parseProjectsYaml(typeof text === 'string' ? text : String(text));
+    }
+  } catch {
+    current = { version: 1, projects: [] };
+  }
+  const merged = await window.api.mergeFileAssignment(current, {
+    basename,
+    projectId: projectId || '',
+    projectName: projectName || ''
+  });
+  const content = await window.api.serializeProjectsYaml(merged);
+  await client.putFileContents(remotePath, content, { overwrite: true });
+};
+
 const saveSessionToCloud = async () => {
   const defaultBasename = defaultConversationName.value || buildConversationTimestampedBasename(CODE.value || 'AI', { force: false, includeCode: false });
   const inputValue = ref(defaultBasename);
@@ -2632,6 +3100,8 @@ const saveSessionToCloud = async () => {
     uniqueDirPath: currentConfig.value?.webdav?.localChatPath || '',
     fallbackBasename: defaultBasename
   });
+  const projectsData = await loadProjectsForScope('cloud');
+  const selectedProjectId = ref(findProjectIdByFilename(projectsData, `${defaultBasename}.json`));
   try {
     await ElMessageBox({
       title: '保存到云端',
@@ -2658,7 +3128,8 @@ const saveSessionToCloud = async () => {
             }
           }
         },
-          { append: () => h('div', { class: 'input-suffix-display' }, '.json') })]),
+          { append: () => h('div', { class: 'input-suffix-display' }, '.json') }),
+        renderProjectSelectRow({ projects: projectsData.projects, selectedProjectId })]),
       showCancelButton: true, confirmButtonText: '确认', cancelButtonText: '取消', customClass: 'filename-prompt-dialog',
       beforeClose: async (action, instance, done) => {
         if (action === 'confirm') {
@@ -2678,6 +3149,12 @@ const saveSessionToCloud = async () => {
             if (!(await client.exists(remoteDir))) await client.createDirectory(remoteDir, { recursive: true });
             await client.putFileContents(remoteFilePath, jsonString, { overwrite: true });
             defaultConversationName.value = finalBasename;
+            try {
+              const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
+              await assignCloudProject({ projectId: selectedProjectId.value, projectName, basename: filename });
+            } catch (projectError) {
+              console.warn('[projects] 更新云端项目归属失败:', projectError);
+            }
             showDismissibleMessage.success('会话已成功保存到云端！');
             done();
           } catch (error) {
@@ -2815,7 +3292,8 @@ const saveSessionAsHtml = async () => {
 
   const defaultAiSvg = `<svg width="200" height="200" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="50" fill="#FDA5A5" /><g stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" fill="none"><rect x="25" y="32" width="50" height="42" rx="8" /><line x1="40" y1="63" x2="60" y2="63" /><line x1="35" y1="32" x2="32" y2="22" /><line x1="65" y1="32" x2="68" y2="22" /></g><g fill="white" stroke="none"><circle cx="40" cy="48" r="3.5" /><circle cx="60" cy="48" r="3.5" /><circle cx="32" cy="20" r="3" /><circle cx="68" cy="20" r="3" /></g></svg>`;
 
-  const generateHtmlContent = () => {
+  const generateHtmlContent = async () => {
+    const { DOMPurify, marked } = await loadExportHtmlDeps();
     let bodyContent = '';
     let tocContent = '';
 
@@ -3180,7 +3658,7 @@ const saveSessionAsHtml = async () => {
           const finalFilename = finalBasename + '.html';
           instance.confirmButtonLoading = true;
           try {
-            const htmlContent = generateHtmlContent();
+            const htmlContent = await generateHtmlContent();
             await window.api.saveFile({ title: '保存为 HTML', defaultPath: finalFilename, buttonLabel: '保存', filters: [{ name: 'HTML 文件', extensions: ['html'] }, { name: '所有文件', extensions: ['*'] }], fileContent: htmlContent });
             showDismissibleMessage.success('HTML 文件已成功导出！');
             done();
@@ -3225,6 +3703,8 @@ const saveSessionAsJson = async () => {
     uniqueDirPath: currentConfig.value?.webdav?.localChatPath || '',
     fallbackBasename: defaultBasename
   });
+  const projectsData = await loadProjectsForScope('local');
+  const selectedProjectId = ref(findProjectIdByFilename(projectsData, `${defaultBasename}.json`));
   try {
     await ElMessageBox({
       title: '保存为 JSON',
@@ -3251,7 +3731,8 @@ const saveSessionAsJson = async () => {
             }
           }
         },
-          { append: () => h('div', { class: 'input-suffix-display' }, '.json') })]),
+          { append: () => h('div', { class: 'input-suffix-display' }, '.json') }),
+        renderProjectSelectRow({ projects: projectsData.projects, selectedProjectId })]),
       showCancelButton: true, confirmButtonText: '保存', cancelButtonText: '取消', customClass: 'filename-prompt-dialog',
       beforeClose: async (action, instance, done) => {
         if (action === 'confirm') {
@@ -3266,6 +3747,20 @@ const saveSessionAsJson = async () => {
             // 优化逻辑：如果有本地路径，直接写入；否则弹出保存框
             if (localChatPath) {
               await persistSessionToLocalJsonFile(finalBasename);
+              // 更新项目归属（仅在已配置本地路径时维护 projects.yaml）
+              try {
+                const oldFilename = defaultConversationName.value ? `${defaultConversationName.value}.json` : '';
+                const removeFilenames = oldFilename && oldFilename !== finalFilename ? [oldFilename] : [];
+                const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
+                await reassignLocalProject({
+                  projectId: selectedProjectId.value,
+                  projectName,
+                  addFilename: finalFilename,
+                  removeFilenames
+                });
+              } catch (projectError) {
+                console.warn('[projects] 更新本地项目归属失败:', projectError);
+              }
             } else {
               // 未配置路径，弹出系统选择框
               await window.api.saveFile({
@@ -3343,70 +3838,150 @@ const handleRenameSession = async () => {
   const oldFilename = `${oldBaseName}.json`;
   // 简单拼接路径，electron/node 环境下通常能正确处理
   const oldFilePath = `${localPath}/${oldFilename}`;
+  const inputValue = ref(oldBaseName);
+  const projectsData = await loadProjectsForScope('local');
+  const originalProjectId = findProjectIdByFilename(projectsData, oldFilename);
+  const selectedProjectId = ref(originalProjectId);
 
   try {
-    const { value: userInput } = await ElMessageBox.prompt(
-      '请输入新的会话名称',
-      '重命名对话',
-      {
-        inputValue: oldBaseName,
-        confirmButtonText: '确认',
-        cancelButtonText: '取消',
-        inputValidator: (val) => {
-          if (!val || !val.trim()) return '名称不能为空';
-          if (/[\\/:*?"<>|]/.test(val)) return '文件名包含非法字符';
-          return true;
-        },
-        customClass: 'filename-prompt-dialog', // 复用已有的弹窗样式
-      }
-    );
-
-    let newBaseName = (userInput || "").trim();
-    if (newBaseName.toLowerCase().endsWith('.json')) newBaseName = newBaseName.slice(0, -5);
-
-    if (newBaseName === oldBaseName) return;
-
-    const newFilename = `${newBaseName}.json`;
-    const newFilePath = `${localPath}/${newFilename}`;
-
-    // 检查本地是否存在同名文件
-    const files = await window.api.listJsonFiles(localPath);
-    if (files.some(f => f.basename === newFilename)) {
-      showDismissibleMessage.error(`文件名 "${newFilename}" 已存在，操作取消`);
-      return;
-    }
-
-    // 执行本地重命名
-    await window.api.renameLocalFile(oldFilePath, newFilePath);
-    defaultConversationName.value = newBaseName;
-    showDismissibleMessage.success('本地重命名成功');
-
-    // 尝试同步重命名云端文件
-    const { url, username, password, data_path } = currentConfig.value.webdav || {};
-    if (url && data_path) {
-      try {
-        const client = createClient(url, { username, password });
-        const remoteDir = data_path.endsWith('/') ? data_path.slice(0, -1) : data_path;
-        const oldRemotePath = `${remoteDir}/${oldFilename}`;
-        const newRemotePath = `${remoteDir}/${newFilename}`;
-
-        // 检查云端是否存在该文件
-        if (await client.exists(oldRemotePath)) {
-          await ElMessageBox.confirm(
-            '云端也存在同名文件，是否同步重命名？',
-            '同步操作提示',
-            { confirmButtonText: '是', cancelButtonText: '否', type: 'info' }
-          );
-          await renameRemoteSessionFileWithMetadata(client, remoteDir, oldFilename, newFilename);
-          showDismissibleMessage.success('云端同步重命名成功');
+    await ElMessageBox({
+      title: '重命名对话',
+      message: () => h('div', null, [
+        renderFilenamePromptTitleRow({
+          text: '请输入新的会话名称',
+          canUseAutoNaming: false,
+          isAutoNaming: null,
+          onClick: null
+        }),
+        h(ElInput, {
+          modelValue: inputValue.value,
+          'onUpdate:modelValue': (val) => { inputValue.value = val; },
+          placeholder: '会话名称',
+          ref: (elInputInstance) => {
+            if (elInputInstance) {
+              setTimeout(() => elInputInstance.focus(), 100);
+            }
+          },
+          onKeydown: (event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              document.querySelector('.filename-prompt-dialog .el-message-box__btns .el-button--primary')?.click();
+            }
+          }
+        }),
+        renderProjectSelectRow({ projects: projectsData.projects, selectedProjectId })
+      ]),
+      showCancelButton: true,
+      confirmButtonText: '确认',
+      cancelButtonText: '取消',
+      customClass: 'filename-prompt-dialog',
+      beforeClose: async (action, instance, done) => {
+        if (action !== 'confirm') {
+          done();
+          return;
         }
-      } catch (e) {
-        if (e !== 'cancel' && e !== 'close') {
-          console.warn('Cloud rename skipped:', e);
+
+        let newBaseName = (inputValue.value || '').trim();
+        if (!newBaseName) {
+          showDismissibleMessage.error('名称不能为空');
+          return;
+        }
+        if (/[\\/:*?"<>|]/.test(newBaseName)) {
+          showDismissibleMessage.error('文件名包含非法字符');
+          return;
+        }
+        if (newBaseName.toLowerCase().endsWith('.json')) newBaseName = newBaseName.slice(0, -5);
+        if (!newBaseName) {
+          showDismissibleMessage.error('名称不能为空');
+          return;
+        }
+
+        const projectChanged = selectedProjectId.value !== originalProjectId;
+        if (newBaseName === oldBaseName) {
+          // 名称未变，仅在项目归属变化时更新 projects.yaml
+          if (projectChanged) {
+            instance.confirmButtonLoading = true;
+            try {
+              const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
+              await reassignLocalProject({
+                projectId: selectedProjectId.value,
+                projectName,
+                addFilename: oldFilename,
+                removeFilenames: []
+              });
+              showDismissibleMessage.success('项目归属已更新');
+            } catch (projectError) {
+              console.warn('[projects] 更新本地项目归属失败:', projectError);
+              showDismissibleMessage.error('更新项目归属失败');
+            } finally {
+              instance.confirmButtonLoading = false;
+            }
+          }
+          done();
+          return;
+        }
+
+        const newFilename = `${newBaseName}.json`;
+        const newFilePath = `${localPath}/${newFilename}`;
+
+        // 检查本地是否存在同名文件
+        const files = await window.api.listJsonFiles(localPath);
+        if (files.some(f => f.basename === newFilename)) {
+          showDismissibleMessage.error(`文件名 "${newFilename}" 已存在，操作取消`);
+          return;
+        }
+
+        instance.confirmButtonLoading = true;
+        try {
+          // 执行本地重命名
+          await window.api.renameLocalFile(oldFilePath, newFilePath);
+          defaultConversationName.value = newBaseName;
+          // 同步更新项目归属：移除旧名，新名按所选项目归属
+          try {
+            const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
+            await reassignLocalProject({
+              projectId: selectedProjectId.value,
+              projectName,
+              addFilename: newFilename,
+              removeFilenames: [oldFilename]
+            });
+          } catch (projectError) {
+            console.warn('[projects] 重命名后更新本地项目归属失败:', projectError);
+          }
+          showDismissibleMessage.success('本地重命名成功');
+          done();
+
+          // 尝试同步重命名云端文件
+          const { url, username, password, data_path } = currentConfig.value.webdav || {};
+          if (url && data_path) {
+            try {
+              const client = createClient(url, { username, password });
+              const remoteDir = data_path.endsWith('/') ? data_path.slice(0, -1) : data_path;
+              const oldRemotePath = `${remoteDir}/${oldFilename}`;
+
+              // 检查云端是否存在该文件
+              if (await client.exists(oldRemotePath)) {
+                await ElMessageBox.confirm(
+                  '云端也存在同名文件，是否同步重命名？',
+                  '同步操作提示',
+                  { confirmButtonText: '是', cancelButtonText: '否', type: 'info' }
+                );
+                await renameRemoteSessionFileWithMetadata(client, remoteDir, oldFilename, newFilename);
+                showDismissibleMessage.success('云端同步重命名成功');
+              }
+            } catch (e) {
+              if (e !== 'cancel' && e !== 'close') {
+                console.warn('Cloud rename skipped:', e);
+              }
+            }
+          }
+        } catch (error) {
+          showDismissibleMessage.error(`操作失败: ${error.message}`);
+        } finally {
+          instance.confirmButtonLoading = false;
         }
       }
-    }
-
+    });
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') {
       showDismissibleMessage.error(`操作失败: ${error.message}`);
@@ -3455,6 +4030,8 @@ const saveSessionAsImage = async () => {
 
           try {
             const chatMain = chatContainerRef.value.$el;
+
+            const html2canvas = await loadHtml2Canvas();
             const messageNodes = Array.from(chatMain.querySelectorAll('.chat-message'));
 
             const computedStyle = getComputedStyle(document.documentElement);
@@ -3754,6 +4331,9 @@ const loadSession = async (jsonData) => {
     selectedVoice.value = jsonData.selectedVoice || '';
     tempReasoningEffort.value = jsonData.currentPromptConfig?.reasoning_effort || 'default';
     isAutoApproveTools.value = jsonData.isAutoApproveTools || true;
+    taskList.value = Array.isArray(jsonData.taskList) ? normalizeTaskList(jsonData.taskList) : [];
+    taskPanelVisible.value = false;
+    pendingAppendBuffer.value = [];
 
     const configData = await window.api.getConfig();
     currentConfig.value = configData.config;
@@ -4328,6 +4908,87 @@ const applyTokenUsageToAssistantMessage = (chatShowIndex, tokenUsage) => {
 };
 
 
+// --- 追加消息缓冲区：loading 期间发送的消息暂存于此，本轮结束后自动追加并续请求 ---
+const enqueueInputToBuffer = () => {
+  const text = prompt.value.trim();
+  const files = Array.isArray(fileList.value) ? fileList.value.slice() : [];
+  if (!text && files.length === 0) return;
+  pendingAppendBuffer.value.push({
+    kind: 'input',
+    text,
+    files,
+    preview: text || `[${files.length} 个文件]`
+  });
+  prompt.value = "";
+  fileList.value = [];
+  showDismissibleMessage.info('正在生成，消息已加入缓冲区，将在本轮结束后自动发送');
+};
+
+const removeBufferedMessage = (index) => {
+  if (index >= 0 && index < pendingAppendBuffer.value.length) {
+    pendingAppendBuffer.value.splice(index, 1);
+  }
+};
+
+// 把当前输入框内容（prompt + fileList）构造为一条 user 消息追加进历史（不发起请求），返回是否追加成功
+const appendCurrentInputToHistory = async () => {
+  const file_content = await sendFile();
+  const promptText = prompt.value.trim();
+  if (!((file_content && file_content.length > 0) || promptText)) return false;
+  const userContentList = [];
+  if (promptText) userContentList.push({ type: "text", text: promptText });
+  if (file_content && file_content.length > 0) userContentList.push(...file_content);
+  if (userContentList.length === 0) return false;
+  const userTimestamp = new Date().toLocaleString('sv-SE');
+  const contentForHistory = userContentList.length === 1 && userContentList[0].type === 'text'
+    ? userContentList[0].text
+    : userContentList;
+  history.value.push({ role: "user", content: contentForHistory });
+  chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: userContentList, timestamp: userTimestamp });
+  scheduleAutoSave({ reason: 'user-message', immediate: true });
+  prompt.value = "";
+  return true;
+};
+
+const drainBufferIntoHistory = async () => {
+  if (pendingAppendBuffer.value.length === 0) return false;
+  const items = pendingAppendBuffer.value.splice(0, pendingAppendBuffer.value.length);
+  // 还原用户在缓冲期间可能输入但尚未发送的内容
+  const savedPrompt = prompt.value;
+  const savedFiles = Array.isArray(fileList.value) ? fileList.value.slice() : [];
+  let appendedAny = false;
+  for (const item of items) {
+    if (item.kind === 'input') {
+      prompt.value = item.text || '';
+      fileList.value = Array.isArray(item.files) ? item.files : [];
+      isPreparingSend.value = true;
+      try {
+        const added = await appendCurrentInputToHistory();
+        if (added) appendedAny = true;
+      } finally {
+        isPreparingSend.value = false;
+      }
+    }
+  }
+  prompt.value = savedPrompt;
+  fileList.value = savedFiles;
+  return appendedAny;
+};
+
+const flushAppendBuffer = async () => {
+  if (loading.value || isPreparingSend.value) return;
+  const appendedAny = await drainBufferIntoHistory();
+  if (appendedAny) {
+    await askAI(true);
+  }
+};
+
+watch(loading, (now, prev) => {
+  if (prev && !now) {
+    nextTick(() => { flushAppendBuffer(); });
+  }
+});
+
 const askAI = async (forceSend = false) => {
   if (loading.value || isPreparingSend.value) return;
   if (isMcpLoading.value) {
@@ -4339,25 +5000,8 @@ const askAI = async (forceSend = false) => {
   if (!forceSend) {
     isPreparingSend.value = true;
     try {
-      let file_content = await sendFile();
-      const promptText = prompt.value.trim();
-      if ((file_content && file_content.length > 0) || promptText) {
-        const userContentList = [];
-        if (promptText) userContentList.push({ type: "text", text: promptText });
-        if (file_content && file_content.length > 0) userContentList.push(...file_content);
-        const userTimestamp = new Date().toLocaleString('sv-SE');
-        if (userContentList.length > 0) {
-          const contentForHistory = userContentList.length === 1 && userContentList[0].type === 'text'
-            ? userContentList[0].text
-            : userContentList;
-          history.value.push({ role: "user", content: contentForHistory });
-          chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: userContentList, timestamp: userTimestamp });
-
-          scheduleAutoSave({ reason: 'user-message', immediate: true });
-
-        } else return;
-      } else return;
-      prompt.value = "";
+      const added = await appendCurrentInputToHistory();
+      if (!added) return;
     } finally {
       isPreparingSend.value = false;
     }
@@ -4366,8 +5010,26 @@ const askAI = async (forceSend = false) => {
   // --- 2. 初始化 AI 回合 ---
   loading.value = true;
   syncAutoCloseOnBlurListener();
+  const turnId = activeAssistantTurnId.value + 1;
+  activeAssistantTurnId.value = turnId;
   signalController.value = new AbortController();
-  const requestSignal = signalController.value.signal;
+  const requestAbortController = signalController.value;
+  const requestSignal = requestAbortController.signal;
+  const turnMeta = {
+    id: turnId,
+    controller: requestAbortController,
+    assistantMessageId: null,
+    cancellationRecorded: false,
+    cancelledByUser: false
+  };
+  activeAssistantTurnMeta = turnMeta;
+  const isCurrentAssistantTurn = () => activeAssistantTurnId.value === turnId && activeAssistantTurnMeta === turnMeta;
+  const isTurnAborted = () => requestSignal.aborted || !isCurrentAssistantTurn();
+  const throwIfTurnAborted = () => {
+    if (isTurnAborted()) {
+      throw createAbortError();
+    }
+  };
 
   const shouldTriggerAutoNaming = !defaultConversationName.value && chat_show.value.filter(msg => msg.role === 'user').length === 1;
   if (shouldTriggerAutoNaming) {
@@ -4379,6 +5041,7 @@ const askAI = async (forceSend = false) => {
   }
 
   await nextTick();
+  if (isTurnAborted()) return;
 
   if (isAtBottom.value) {
     isSticky.value = true;
@@ -4398,7 +5061,7 @@ const askAI = async (forceSend = false) => {
 
   try {
     // --- 3. 开始工具调用循环 ---
-    while (!signalController.value.signal.aborted) {
+    while (!isTurnAborted()) {
       // chatInputRef.value?.focus({ cursor: 'end' });
 
       // --- 为本次请求创建临时消息列表 ---
@@ -4477,9 +5140,10 @@ const askAI = async (forceSend = false) => {
         apiKey: api_key.value,
         model: model.value.split("|")[1],
         apiType: apiType,
+        headers: JSON.parse(JSON.stringify(currentProviderConfig?.headers || {})),
         messages: messagesForThisRequest,
         stream: useStream,
-        signal: signalController.value.signal
+        signal: requestSignal
       };
 
       if (currentPromptConfig?.isTemperature) requestParams.temperature = currentPromptConfig.temperature;
@@ -4490,7 +5154,9 @@ const askAI = async (forceSend = false) => {
 
       if (sessionSkillIds.value.length > 0 && currentConfig.value.skillPath) {
         try {
+          throwIfTurnAborted();
           const skillToolDef = await window.api.getSkillToolDefinition(currentConfig.value.skillPath, sessionSkillIds.value);
+          throwIfTurnAborted();
           if (skillToolDef) {
             activeTools.push(skillToolDef);
           }
@@ -4511,6 +5177,7 @@ const askAI = async (forceSend = false) => {
         useStream = false;
       }
 
+      throwIfTurnAborted();
       const assistantMessageId = messageIdCounter.value++;
       chat_show.value.push({
         id: assistantMessageId,
@@ -4519,6 +5186,7 @@ const askAI = async (forceSend = false) => {
         voiceName: selectedVoice.value, tool_calls: [],
         startTime: Date.now()
       });
+      turnMeta.assistantMessageId = assistantMessageId;
       currentAssistantChatShowIndex = chat_show.value.length - 1;
 
       if (isAtBottom.value) scrollToBottom('auto');
@@ -4529,6 +5197,7 @@ const askAI = async (forceSend = false) => {
       if (useStream) {
         // --- 流式处理 ---
         const stream = await window.api.createChatCompletion(requestParams);
+        throwIfTurnAborted();
 
         let aggregatedReasoningContent = "";
         let aggregatedContent = "";
@@ -4540,7 +5209,10 @@ const askAI = async (forceSend = false) => {
 
         const responsesItemIdToIndexMap = new Map();
 
-        const flushStreamingDisplay = () => {
+        const flushStreamingDisplay = (force = false) => {
+          if ((!force && isTurnAborted()) || currentAssistantChatShowIndex < 0 || !chat_show.value[currentAssistantChatShowIndex]) {
+            return;
+          }
           const currentDisplayContent = [];
           if (aggregatedContent) currentDisplayContent.push({ type: 'text', text: aggregatedContent });
           if (aggregatedMedia.length > 0) currentDisplayContent.push(...aggregatedMedia);
@@ -4555,11 +5227,14 @@ const askAI = async (forceSend = false) => {
 
 
         for await (const part of stream) {
+          if (isTurnAborted()) {
+            break;
+          }
           // console.log(part);
           if (part?.usage) {
             aggregatedUsage = part.usage;
           }
-          if (apiType === 'responses') {
+          if (apiType === 'responses' || apiType === 'codex') {
             if (part.type === 'response.completed' && part.response?.usage) {
               aggregatedUsage = part.response.usage;
             }
@@ -4653,12 +5328,22 @@ const askAI = async (forceSend = false) => {
           if (currentTotalLength > 4000) throttleDelay = 250;
           if (currentTotalLength > 8000) throttleDelay = 400;
 
+          if (isTurnAborted()) {
+            break;
+          }
+
           if (Date.now() - lastUpdateTime > throttleDelay) {
             flushStreamingDisplay();
           }
         }
 
-        flushStreamingDisplay();
+        if (isTurnAborted()) {
+          if (isCurrentAssistantTurn()) {
+            flushStreamingDisplay(true);
+          }
+          throw createAbortError();
+        }
+        flushStreamingDisplay(true);
 
         let finalContentForHistory = null;
         if (aggregatedMedia.length > 0) {
@@ -4685,8 +5370,9 @@ const askAI = async (forceSend = false) => {
       } else {
         // --- 非流式处理 ---
         const response = await window.api.createChatCompletion(requestParams);
+        throwIfTurnAborted();
 
-        if (apiType === 'responses') {
+        if (apiType === 'responses' || apiType === 'codex') {
           let contentText = "";
           let toolCalls = [];
           let reasoningText = "";
@@ -4734,6 +5420,7 @@ const askAI = async (forceSend = false) => {
         } else {
           if (isAsyncIterableResponse(response)) {
             responseMessage = await collectChatCompletionStreamToMessage(response);
+            throwIfTurnAborted();
           } else if (response && response.choices && response.choices.length > 0) {
             responseMessage = response.choices[0].message;
             responseMessage.tokenUsage = normalizeAssistantTokenUsage(response.usage);
@@ -4742,6 +5429,8 @@ const askAI = async (forceSend = false) => {
           }
         }
       }
+
+      throwIfTurnAborted();
 
       if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
         responseMessage.tool_calls.forEach(tc => {
@@ -4757,6 +5446,7 @@ const askAI = async (forceSend = false) => {
       }
 
       history.value.push(responseMessage);
+      throwIfTurnAborted();
 
       // --- 更新 UI 气泡 ---
       const currentBubble = chat_show.value[currentAssistantChatShowIndex];
@@ -4789,12 +5479,29 @@ const askAI = async (forceSend = false) => {
         }));
 
         await nextTick();
+        throwIfTurnAborted();
 
         // 工具调用执行逻辑
         const toolMessages = await Promise.all(
           responseMessage.tool_calls.map(async (toolCall) => {
             const uiToolCall = currentBubble.tool_calls.find(t => t.id === toolCall.id);
             let toolContent;
+
+            // Better Work 交互工具：前端拦截，不走审批 / invokeMcpTool
+            if (BETTERWORK_FRONTEND_TOOLS.has(toolCall.function.name)) {
+              try {
+                const bwArgs = JSON.parse(toolCall.function.arguments || '{}');
+                toolContent = await handleBetterWorkTool(toolCall, bwArgs, uiToolCall);
+                throwIfTurnAborted();
+              } catch (e) {
+                if (isTurnAborted()) {
+                  throw createAbortError();
+                }
+                toolContent = `{'result':'Better Work tool error: ${e.message}'}`;
+                if (uiToolCall) { uiToolCall.approvalStatus = 'finished'; uiToolCall.result = toolContent; }
+              }
+              return { tool_call_id: toolCall.id, role: "tool", name: toolCall.function.name, content: toolContent };
+            }
 
             if (!isAutoApproveTools.value) {
               try {
@@ -4805,18 +5512,20 @@ const askAI = async (forceSend = false) => {
                 if (!isApproved) {
                   if (uiToolCall) {
                     uiToolCall.approvalStatus = 'rejected';
-                    uiToolCall.result = '用户已取消执行';
+                    uiToolCall.result = requestSignal.aborted ? '[System Note]: Tool call was aborted by user.' : '用户已取消执行';
                   }
                   return {
                     tool_call_id: toolCall.id,
                     role: "tool",
                     name: toolCall.function.name,
-                    content: "User denied this tool execution."
+                    content: requestSignal.aborted ? '[System Note]: Tool call was aborted by user.' : 'User denied this tool execution.'
                   };
                 }
               } catch (e) {
               }
             }
+
+            throwIfTurnAborted();
 
             if (uiToolCall) {
               uiToolCall.approvalStatus = 'executing';
@@ -4826,6 +5535,10 @@ const askAI = async (forceSend = false) => {
             toolCallControllers.value.set(toolCall.id, controller);
 
             try {
+              if (requestSignal.aborted) {
+                throw createAbortError();
+              }
+
               const toolArgs = JSON.parse(toolCall.function.arguments);
 
               if (toolCall.function.name === 'Skill') {
@@ -4837,7 +5550,7 @@ const askAI = async (forceSend = false) => {
                 const currentModelName = model.value.split('|')[1] || model.value;
 
                 const onUpdateCallback = (logContent) => {
-                  if (uiToolCall) {
+                  if (!isTurnAborted() && uiToolCall) {
                     uiToolCall.result = logContent + "\n\n[Skill (Sub-Agent) Running...]";
                   }
                 };
@@ -4857,8 +5570,10 @@ const askAI = async (forceSend = false) => {
                   toolArgs.skill,
                   toolArgs,
                   executionContext,
-                  toolCallControllers.value.get(toolCall.id)?.signal || signalController.value.signal
+                  toolCallControllers.value.get(toolCall.id)?.signal || requestSignal
                 );
+
+                throwIfTurnAborted();
 
                 if (uiToolCall) {
                   if (toolContent.includes("[Sub-Agent]")) {
@@ -4884,7 +5599,7 @@ const askAI = async (forceSend = false) => {
                   const toolsContext = activeTools.filter(t => t.function.name !== 'sub_agent');
 
                   const onUpdateCallback = (logContent) => {
-                    if (uiToolCall) {
+                    if (!isTurnAborted() && uiToolCall) {
                       uiToolCall.result = logContent + "\n\n[Sub-Agent 执行中...]";
                     }
                   };
@@ -4903,11 +5618,12 @@ const askAI = async (forceSend = false) => {
                 const result = await window.api.invokeMcpTool(
                   toolCall.function.name,
                   toolArgs,
-                  toolCallControllers.value.get(toolCall.id)?.signal || signalController.value.signal,
+                  toolCallControllers.value.get(toolCall.id)?.signal || requestSignal,
                   executionContext
                 );
 
                 toolContent = Array.isArray(result) ? result.filter(item => item?.type === 'text' && typeof item.text === 'string').map(item => item.text).join('\n\n') : String(result);
+                throwIfTurnAborted();
 
                 if (uiToolCall) {
                   if (toolCall.function.name === 'sub_agent') {
@@ -4923,17 +5639,17 @@ const askAI = async (forceSend = false) => {
                 }
               }
 
-              if (uiToolCall) uiToolCall.approvalStatus = 'finished';
+              if (!isTurnAborted() && uiToolCall) uiToolCall.approvalStatus = 'finished';
 
             } catch (e) {
               if (e.name === 'AbortError') {
-                toolContent = "Error: Tool call was canceled by the user.";
+                toolContent = "[System Note]: Tool call was aborted by user.";
                 if (uiToolCall) uiToolCall.approvalStatus = 'rejected';
               } else {
                 toolContent = `{'result':'工具执行或参数解析错误: ${e.message}'}`;
-                if (uiToolCall) uiToolCall.approvalStatus = 'finished';
+                if (!isTurnAborted() && uiToolCall) uiToolCall.approvalStatus = 'finished';
               }
-              if (uiToolCall) uiToolCall.result = toolContent;
+              if (!isTurnAborted() && uiToolCall) uiToolCall.result = toolContent;
             } finally {
               toolCallControllers.value.delete(toolCall.id);
             }
@@ -4941,7 +5657,14 @@ const askAI = async (forceSend = false) => {
           })
         );
 
+        throwIfTurnAborted();
         history.value.push(...toolMessages);
+        // 工具调用完成本质也会向 AI 续发请求，此处保存一次
+        scheduleAutoSave({ reason: 'tool-calls-completed', immediate: true });
+        // 工具调用完成后，把缓冲区消息插入历史，使下一轮请求即可纳入
+        throwIfTurnAborted();
+        await drainBufferIntoHistory();
+        throwIfTurnAborted();
       } else {
         // EdgeTTS: 收到文本回复后，单独调用 EdgeTTS 生成语音
         if (isVoiceReply && responseMessage.content) {
@@ -4998,8 +5721,19 @@ const askAI = async (forceSend = false) => {
       }
     }
   } catch (error) {
+    const aborted = isAbortError(error);
+    const staleTurn = !isCurrentAssistantTurn();
+    if (staleTurn) {
+      if (!aborted) {
+        console.warn('[askAI] Ignored stale assistant turn error:', error);
+      }
+      return;
+    }
+    if (aborted && turnMeta.cancellationRecorded) {
+      return;
+    }
     let errorDisplay = `发生错误: ${error.message || '未知错误'}`;
-    if (error.name === 'AbortError') errorDisplay = "请求已取消";
+    if (aborted) errorDisplay = "请求已取消";
 
     const errorBubbleIndex = currentAssistantChatShowIndex > -1 ? currentAssistantChatShowIndex : chat_show.value.length;
     if (currentAssistantChatShowIndex === -1) {
@@ -5009,42 +5743,39 @@ const askAI = async (forceSend = false) => {
       });
     }
     const currentBubble = chat_show.value[errorBubbleIndex];
-    if (chat_show.value[errorBubbleIndex].reasoning_content && currentBubble.status === 'thinking') {
-      chat_show.value[errorBubbleIndex].status = "error";
-    }
 
-    let existingText = "";
-    if (currentBubble.content && Array.isArray(currentBubble.content)) {
-      existingText = currentBubble.content
-        .filter(part => part.type === 'text')
-        .map(part => part.text)
-        .join('');
-    } else if (typeof currentBubble.content === 'string') {
-      existingText = currentBubble.content;
-    }
-
-    if (existingText && existingText.trim().length > 0) {
-      const combinedText = `${existingText}\n\n> **Error**: ${errorDisplay}`;
-      currentBubble.content = [{ type: "text", text: combinedText }];
-      history.value.push({
-        role: 'assistant',
-        content: combinedText,
-        reasoning_content: currentBubble.reasoning_content || null
-      });
+    if (aborted) {
+      finalizeCancelledAssistantTurn(turnMeta);
     } else {
-      currentBubble.content = [{ type: "text", text: `${errorDisplay}` }];
+      const terminalNotice = getAssistantTerminalNoticeMarkdown(aborted, errorDisplay);
+      const finalContent = appendTerminalNoticeToAssistantContent(currentBubble.content, terminalNotice);
+      const finalReasoningContent = typeof currentBubble.reasoning_content === 'string'
+        ? currentBubble.reasoning_content
+        : (currentBubble.reasoning_content ? String(currentBubble.reasoning_content) : '');
+
+      currentBubble.content = finalContent;
+      currentBubble.reasoning_content = finalReasoningContent;
+      currentBubble.status = 'error';
+
       history.value.push({
         role: 'assistant',
-        content: `${errorDisplay}`,
-        reasoning_content: currentBubble.reasoning_content || null
+        content: finalContent,
+        reasoning_content: finalReasoningContent || null
       });
     }
+    scheduleAutoSave({ reason: aborted ? 'assistant-cancelled-error' : 'assistant-error', immediate: true });
 
   } finally {
-    loading.value = false;
-    syncAutoCloseOnBlurListener();
-    signalController.value = null;
-    if (currentAssistantChatShowIndex > -1) {
+    const stillOwnsTurn = activeAssistantTurnMeta === turnMeta;
+    const stillOwnsSignal = signalController.value === requestAbortController;
+    if (stillOwnsTurn || stillOwnsSignal) {
+      loading.value = false;
+      syncAutoCloseOnBlurListener();
+    }
+    if (stillOwnsSignal) {
+      signalController.value = null;
+    }
+    if (currentAssistantChatShowIndex > -1 && !turnMeta.cancellationRecorded) {
       const endTime = Date.now();
       chat_show.value[currentAssistantChatShowIndex].endTime = endTime;
       chat_show.value[currentAssistantChatShowIndex].completedTimestamp = new Date().toLocaleString('sv-SE');
@@ -5094,15 +5825,65 @@ const askAI = async (forceSend = false) => {
     } else {
       scheduleAutoSave({ reason: 'assistant-turn-finalized', immediate: true }); // 普通对话的自动保存
     }
+    if (stillOwnsTurn) {
+      activeAssistantTurnMeta = null;
+    }
   }
 };
 
 const cancelAskAI = () => {
-  if (loading.value && signalController.value) {
-    signalController.value.abort();
-    cancelAutoNamingRequest();
-    chatInputRef.value?.focus();
+  if (!loading.value) {
+    return;
   }
+
+  const turnMeta = activeAssistantTurnMeta;
+  const requestAbortController = signalController.value;
+  if (turnMeta) {
+    turnMeta.cancelledByUser = true;
+  }
+
+  if (requestAbortController) {
+    requestAbortController.abort();
+  }
+  cancelAutoNamingRequest();
+
+  resolvePendingToolApprovals(false);
+  resolvePendingChoices(null);
+  toolCallControllers.value.forEach((controller) => {
+    try {
+      controller.abort();
+    } catch {
+      // ignore abort race
+    }
+  });
+
+  chat_show.value.forEach(msg => {
+    if (!Array.isArray(msg.tool_calls)) return;
+    msg.tool_calls.forEach(tc => {
+      if (tc.approvalStatus === 'waiting' || tc.approvalStatus === 'executing') {
+        tc.approvalStatus = 'rejected';
+        tc.result = '[System Note]: Tool call was aborted by user.';
+      }
+    });
+  });
+
+  finalizeCancelledAssistantTurn(turnMeta);
+  if (turnMeta) {
+    activeAssistantTurnId.value = Math.max(activeAssistantTurnId.value, turnMeta.id) + 1;
+    if (activeAssistantTurnMeta === turnMeta) {
+      activeAssistantTurnMeta = null;
+    }
+  } else {
+    activeAssistantTurnId.value += 1;
+  }
+  toolCallControllers.value.clear();
+  if (signalController.value === requestAbortController) {
+    signalController.value = null;
+  }
+  loading.value = false;
+  syncAutoCloseOnBlurListener();
+  scheduleAutoSave({ reason: 'assistant-cancelled', immediate: true });
+  chatInputRef.value?.focus();
 };
 const copyText = async (content, index) => { if (loading.value && index === chat_show.value.length - 1) return; await window.api.copyText(content); };
 const reaskAI = async () => {
@@ -5232,6 +6013,9 @@ const clearHistory = () => {
   focusedMessageIndex.value = null;
   cancelAutoNamingRequest();
   defaultConversationName.value = "";
+  taskList.value = [];
+  taskPanelVisible.value = false;
+  pendingAppendBuffer.value = [];
   chatInputRef.value?.focus({ cursor: 'end' });
   showDismissibleMessage.success('历史记录已清除');
 };
@@ -5373,7 +6157,14 @@ const handleGlobalKeyDown = (event) => {
     return;
   }
 
-  // 2. 缩放快捷键控制
+  // 2. 任务进度面板开关 (Ctrl + T)
+  if (isCtrl && event.key.toLowerCase() === 't') {
+    event.preventDefault();
+    taskPanelVisible.value = !taskPanelVisible.value;
+    return;
+  }
+
+  // 3. 缩放快捷键控制
   if (isCtrl) {
     // 重置缩放 (Ctrl + 0)
     if (event.key === '0') {
@@ -5403,12 +6194,6 @@ const handleGlobalKeyDown = (event) => {
       showDismissibleMessage.info(`缩放: ${Math.round(zoomLevel.value * 100)}%`);
       return;
     }
-  }
-};
-
-const handleOpenSearch = () => {
-  if (textSearchInstance) {
-    textSearchInstance.show();
   }
 };
 
@@ -5487,8 +6272,11 @@ const scrollToMessageByIndex = (index) => {
         @toggle-pin="handleTogglePin" @toggle-always-on-top="handleToggleAlwaysOnTop" @minimize="handleMinimize"
         @maximize="handleMaximize" @close="handleCloseWindow" />
       <ChatHeader :modelMap="modelMap" :model="model" :is-mcp-loading="isMcpLoading" :systemPrompt="currentSystemPrompt"
+        :has-task-tool="hasTaskMcpTool" :task-panel-visible="taskPanelVisible" :task-status="taskOverallStatus"
         @open-model-dialog="handleOpenModelDialog" @show-system-prompt="handleShowSystemPrompt"
-        @open-search="handleOpenSearch" />
+        @toggle-task-panel="taskPanelVisible = !taskPanelVisible" />
+
+      <TaskPanel :tasks="taskList" :visible="taskPanelVisible" @close="taskPanelVisible = false" />
 
       <div class="main-area-wrapper">
         <el-main ref="chatContainerRef" class="chat-main custom-scrollbar" @click="handleMainClick"
@@ -5501,7 +6289,7 @@ const scrollToMessageByIndex = (index) => {
             :is-dark-mode="currentConfig.isDarkMode" @delete-message="handleDeleteMessage" @copy-text="handleCopyText"
             @re-ask="handleReAsk" @toggle-collapse="handleToggleCollapse" @show-system-prompt="handleShowSystemPrompt"
             @avatar-click="onAvatarClick" @edit-message-requested="handleEditStart" @edit-finished="handleEditEnd"
-            @edit-message="handleEditMessage" @cancel-tool-call="handleCancelToolCall" />
+            @edit-message="handleEditMessage" @cancel-tool-call="handleCancelToolCall" @submit-choice="handleChoiceSubmit" />
         </el-main>
 
         <div class="unified-nav-sidebar" v-if="chat_show.length > 0">
@@ -5575,11 +6363,11 @@ const scrollToMessageByIndex = (index) => {
           v-model:selectedVoice="selectedVoice" v-model:tempReasoningEffort="tempReasoningEffort" :loading="loading"
           :ctrlEnterToSend="currentConfig.CtrlEnterToSend" :layout="inputLayout" :voiceList="currentConfig.voiceList"
           :is-mcp-active="isMcpActive" :all-mcp-servers="availableMcpServers" :active-mcp-ids="sessionMcpServerIds"
-          :active-skill-ids="sessionSkillIds" :all-skills="allSkillsList" @submit="handleSubmit" @cancel="handleCancel"
+          :active-skill-ids="sessionSkillIds" :all-skills="allSkillsList" :append-buffer="pendingAppendBuffer" @submit="handleSubmit" @cancel="handleCancel"
           @clear-history="handleClearHistory" @remove-file="handleRemoveFile" @upload="handleUpload"
           @send-audio="handleSendAudio" @open-mcp-dialog="handleOpenMcpDialog" @pick-file-start="handlePickFileStart"
           @toggle-mcp="handleQuickMcpToggle" @toggle-skill="handleQuickSkillToggle"
-          @open-skill-dialog="toggleSkillDialog" />
+          @open-skill-dialog="toggleSkillDialog" @cancel-buffer="removeBufferedMessage" />
       </div>
     </el-container>
   </main>
@@ -6124,6 +6912,26 @@ html.dark .filename-prompt-dialog .el-input-group__append {
   background-color: var(--el-bg-color);
   color: var(--el-text-color-placeholder);
   border-color: var(--el-border-color);
+}
+
+.filename-project-row {
+  width: 100%;
+  max-width: 520px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.filename-project-label {
+  flex-shrink: 0;
+  font-size: 14px;
+  color: var(--el-text-color-regular);
+}
+
+.filename-project-select {
+  flex: 1;
+  min-width: 0;
 }
 
 /* Custom Viewer Actions */

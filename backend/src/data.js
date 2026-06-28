@@ -1,14 +1,21 @@
 const { webFrame, nativeImage } = require('electron');
 const crypto = require('crypto');
 
-const { createChatCompletion, getRandomItem } = require('./chat.js'); 
-
 const windowMap = new Map();
 const feature_suffix = "anywhere助手^_^"
 
-const { 
-  getBuiltinServers
-} = require('./mcp_builtin.js');
+function getLazyRuntime() {
+  const runtimePath = './' + 'lazy_runtime.js';
+  return require(runtimePath);
+}
+
+function getChatModule() {
+  return getLazyRuntime();
+}
+
+function getBuiltinServers() {
+  return require('./mcp_servers_manifest.js').getBuiltinServers();
+}
 
 // 默认配置 (保持不变)
 const defaultConfig = {
@@ -23,6 +30,7 @@ const defaultConfig = {
         url: "https://api.openai.com/v1",
         api_key: "",
         apiType: "chat_completions",
+        headers: {},
         modelList: [],
         enable: true,
       },
@@ -402,7 +410,7 @@ async function getConfig() {
 
 function checkConfig(config) {
   let flag = false;
-  const CURRENT_VERSION = "2.6.10";
+  const CURRENT_VERSION = "2.8.8";
 
   // --- 1. 版本检查与旧数据迁移 ---
   if (config.version !== CURRENT_VERSION) {
@@ -544,11 +552,18 @@ function checkConfig(config) {
     for (const key of Object.keys(config.prompts)) {
       const p = config.prompts[key];
 
-      // 4.1 结构有效性检查 (你要求的逻辑)
-      if (!p || typeof p !== 'object' || '0' in p || !p.type || p.prompt === undefined || p.model === undefined) {
+      // 4.1 结构有效性检查
+      // model 允许为空：表示快捷助手不绑定专属模型，运行时走默认模型/首个可用模型兜底。
+      // 注意：前端清空 el-select 时可能得到 undefined，完整配置保存经过 JSON.stringify 后会丢失该字段；
+      // 这里必须归一化而不是删除整个快捷助手，避免重启插件后快捷助手消失。
+      if (!p || typeof p !== 'object' || '0' in p || !p.type || p.prompt === undefined) {
         delete config.prompts[key];
         flag = true;
         continue;
+      }
+      if (typeof p.model !== 'string') {
+        p.model = '';
+        flag = true;
       }
 
       // 4.2 字段迁移与清理
@@ -571,13 +586,13 @@ function checkConfig(config) {
       if (p.voice === null) { p.voice = ''; flag = true; }
       if (typeof p.autoSaveChat !== 'boolean') { p.autoSaveChat = false; flag = true; }
 
-      // 4.4 模型自动修复
-      const resolvedPromptModel = isValidProviderModelKey(config, p.model)
-        ? p.model
-        : resolveDefaultAssistantModel(config);
-      if (p.model !== resolvedPromptModel) {
-        p.model = resolvedPromptModel;
-        flag = true;
+      // 4.4 模型自动修复：仅修复“非空但已失效”的旧模型；空模型表示不绑定专属模型。
+      if (p.model && !isValidProviderModelKey(config, p.model)) {
+        const resolvedPromptModel = resolveDefaultAssistantModel(config);
+        if (p.model !== resolvedPromptModel) {
+          p.model = resolvedPromptModel;
+          flag = true;
+        }
       }
     }
   }
@@ -613,6 +628,7 @@ function checkConfig(config) {
       if (prov.enable === undefined) { prov.enable = true; flag = true; }
       if (prov.folderId === undefined) { prov.folderId = ""; flag = true; }
       if (prov.apiType === undefined) { prov.apiType = "chat_completions"; flag = true; }
+      if (!prov.headers || typeof prov.headers !== 'object' || Array.isArray(prov.headers)) { prov.headers = {}; flag = true; }
     }
   }
 
@@ -897,9 +913,9 @@ function updateConfig(newConfig) {
       if (prompt.type === "general") {
         expectedMatchFeature.cmds.push({ type: "over", label: key, "maxLength": 99999999999 });
         expectedMatchFeature.cmds.push({ type: "img", label: key });
-        expectedMatchFeature.cmds.push({ type: "files", label: key, fileType: "file" });
+        expectedMatchFeature.cmds.push({ type: "files", label: key});
       } else if (prompt.type === "files") {
-        expectedMatchFeature.cmds.push({ type: "files", label: key, fileType: "file" });
+        expectedMatchFeature.cmds.push({ type: "files", label: key});
       } else if (prompt.type === "img") {
         expectedMatchFeature.cmds.push({ type: "img", label: key });
       } else if (prompt.type === "over") {
@@ -912,6 +928,7 @@ function updateConfig(newConfig) {
           });
         } else {
           expectedMatchFeature.cmds.push({ type: "over", label: key, "maxLength": 99999999999 });
+          expectedMatchFeature.cmds.push({ type: "files", label: key, fileType: "directory" });
         }
       }
       utools.setFeature(expectedMatchFeature);
@@ -1219,7 +1236,7 @@ async function openWindow(config, msg) {
         cmds: [
           { type: "over", label: displayName, maxLength: 99999999999 },
           { type: "img", label: displayName },
-          { type: "files", label: displayName, fileType: "file" }
+          { type: "files", label: displayName},
         ]
       });
     } catch (e) {
@@ -1423,19 +1440,25 @@ async function openFastInputWindow(config, msg) {
   const code = msg.code;
   const promptConfig = config.prompts[code];
   
-  // 解析模型配置
+  // 解析模型配置：快捷助手 model 允许为空，空值回退到默认助手模型/首个可用模型。
   let apiUrl = config.providers["0"]?.url; // 默认 fallback
   let apiKey = config.providers["0"]?.api_key;
   let apiType = config.providers["0"]?.apiType || 'chat_completions'; // 默认 API 类型
+  let providerHeaders = config.providers["0"]?.headers || {};
   let modelName = "";
 
-  if (promptConfig && promptConfig.model) {
-      const [providerId, mName] = promptConfig.model.split("|");
+  const promptModelKey = isValidProviderModelKey(config, promptConfig?.model)
+      ? promptConfig.model
+      : resolveDefaultAssistantModel(config);
+  if (promptModelKey) {
+      const [providerId, ...modelParts] = promptModelKey.split("|");
+      const mName = modelParts.join("|");
       const provider = config.providers[providerId];
       if (provider) {
           apiUrl = provider.url;
           apiKey = provider.api_key;
           apiType = provider.apiType || 'chat_completions';
+          providerHeaders = provider.headers || {};
           modelName = mName;
       }
   }
@@ -1457,12 +1480,14 @@ async function openFastInputWindow(config, msg) {
 
   const isStream = promptConfig.stream ?? true;
 
-  // 2. 发起请求 (使用 chat.js)
+  // 2. 发起请求 (使用 chat.js，按需加载避免拖慢窗口 preload 初始化)
+  const { createChatCompletion } = getChatModule();
   createChatCompletion({
       baseUrl: apiUrl,
       apiKey: apiKey,
       model: modelName,
       apiType: apiType, // 传递 API 类型
+      headers: providerHeaders,
       messages: [
           { role: "system", content: promptConfig.prompt },
           { role: "user", content: content }

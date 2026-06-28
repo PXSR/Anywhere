@@ -16,10 +16,32 @@ let bashCwd = os.homedir();
 const backgroundShells = new Map();
 const MAX_BG_LOG_SIZE = 1024 * 1024; // 1MB 日志上限
 
+const COLORLESS_COMMAND_ENV = {
+    NO_COLOR: '1',
+    FORCE_COLOR: '0',
+    CLICOLOR: '0',
+    npm_config_color: 'false',
+    PNPM_COLOR: 'never',
+    YARN_ENABLE_COLORS: '0'
+};
+
+const stripTerminalControlSequences = (text = '') => {
+    if (typeof text !== 'string' || text.length === 0) return '';
+    return text
+        .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, '')
+        .replace(/\x1B[PX^_][\s\S]*?\x1B\\/g, '')
+        .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+        .replace(/\u009B[0-?]*[ -/]*[@-~]/g, '')
+        .replace(/\x1B[@-Z\\-_]/g, '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/\u0008/g, '');
+};
+
 function appendBgLog(id, text) {
     const proc = backgroundShells.get(id);
     if (!proc) return;
-    proc.logs += text;
+    proc.logs += stripTerminalControlSequences(text);
     if (proc.logs.length > MAX_BG_LOG_SIZE) {
         proc.logs = "[...Logs Truncated...]\n" + proc.logs.slice(proc.logs.length - (MAX_BG_LOG_SIZE / 2));
     }
@@ -127,7 +149,8 @@ function resolveProviderConfigByModel(fullConfig = {}, modelValue = '') {
         provider,
         apiType: provider?.apiType || 'chat_completions',
         baseUrl: provider?.url || '',
-        apiKey: provider?.api_key || ''
+        apiKey: provider?.api_key || '',
+        headers: provider?.headers || {}
     };
 }
 
@@ -470,6 +493,16 @@ const BUILTIN_SERVERS = {
         tags: ["memory", "storage", "sync"],
         logoUrl: "https://api.iconify.design/lucide:brain.svg"
     },
+    "builtin_betterwork": {
+        id: "builtin_betterwork",
+        name: "Better Work",
+        description: "主动向用户发起选择题确认（多问题多选项），并维护当前对话的临时任务清单与进度展示。",
+        type: "builtin",
+        isActive: true,
+        isPersistent: false,
+        tags: ["interactive", "task", "confirm"],
+        logoUrl: "https://api.iconify.design/lucide:list-checks.svg"
+    },
 };
 
 const BUILTIN_TOOLS = {
@@ -533,7 +566,11 @@ const BUILTIN_TOOLS = {
                         enum: ["content", "files_with_matches", "count"],
                         description: "Output mode: 'content' (lines), 'files_with_matches' (paths only), 'count'."
                     },
-                    multiline: { type: "boolean", description: "Enable multiline matching. When true, enables 'm' and 's' (dotAll) regex flags so '.' matches newlines." }
+                    multiline: { type: "boolean", description: "Enable multiline matching. When true, enables 'm' and 's' (dotAll) regex flags so '.' matches newlines." },
+                    max_results: { type: "integer", description: "Optional. Maximum result blocks to return for content/files modes. Defaults to 20, max 100." },
+                    context_lines: { type: "integer", description: "Optional. Number of lines before and after each content match. Defaults to 2, max 10." },
+                    max_output_chars: { type: "integer", description: "Optional. Maximum total characters returned. Defaults to 20000, max 80000." },
+                    max_line_length: { type: "integer", description: "Optional. Maximum characters per context line before truncation. Defaults to 500, max 2000." }
                 },
                 required: ["pattern", "path"]
             }
@@ -556,7 +593,7 @@ const BUILTIN_TOOLS = {
         },
         {
             name: "write_file",
-            description: "Create a new file or completely overwrite an existing file. CAUTION: This tool is ONLY for TEXT-BASED files (code, txt, md, json, etc.). DO NOT use this for binary or Office files (e.g., .docx, .xlsx, .pdf, .png) as it will corrupt them.",
+            description: "Create a new file or completely overwrite an existing file. CAUTION: This tool is ONLY for TEXT-BASED files (code, txt, md, json, etc.). DO NOT use this for binary or Office files (e.g., .docx, .xlsx, .pdf, .png) as it will corrupt them. BEST PRACTICE: Before overwriting an EXISTING file, call 'read_file' first to confirm its current content and avoid accidental data loss.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -568,7 +605,7 @@ const BUILTIN_TOOLS = {
         },
         {
             name: "edit_file",
-            description: "EXACT literal string replacement for modifying files. Safer than regex for code containing special characters (like LaTeX or C++). YOU MUST READ THE FILE FIRST to ensure you have the exact 'old_string'.",
+            description: "EXACT literal string replacement for modifying files. Safer than regex for code containing special characters (like LaTeX or C++). YOU MUST READ THE FILE FIRST to ensure you have the exact 'old_string'. NOTE: read_file shows a `NNNN | ` line-number prefix for display only — never include that prefix in 'old_string'; use the raw file text.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -582,7 +619,7 @@ const BUILTIN_TOOLS = {
         },
         {
             name: "replace_pattern",
-            description: "Efficiently replace text in a file using JavaScript RegExp. Supports capture groups ($1, $2).\nCRITICAL WARNING FOR LATEX/CODE: The 'replacement' string is inserted literally. DO NOT double-escape backslashes in 'replacement' unless you actually want two backslashes. For example, to insert '\\begin', pass '\\begin' in JSON",
+            description: "Efficiently replace text in a file using JavaScript RegExp. Supports capture groups ($1, $2). You SHOULD call 'read_file' to read the file first so your pattern matches the real content. The `NNNN | ` line numbers shown by read_file are display-only; never put them in 'pattern'.\nCRITICAL WARNING FOR LATEX/CODE: The 'replacement' string is inserted literally. DO NOT double-escape backslashes in 'replacement' unless you actually want two backslashes. For example, to insert '\\begin', pass '\\begin' in JSON",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -596,7 +633,7 @@ const BUILTIN_TOOLS = {
         },
         {
             name: "insert_content",
-            description: "Efficient insert content into a file. Supports two modes: 1. By 'anchor_pattern' (Recommended, safer). 2. By 'line_number' (Use ONLY if you have verified the exact line number via grep_search).",
+            description: "Efficient insert content into a file. It is recommended to call 'read_file' first to confirm the insertion point. (read_file's `NNNN | ` line numbers are display-only; do not include them in 'anchor_pattern'.) Supports two modes: 1. By 'anchor_pattern' (Recommended, safer). 2. By 'line_number' (Use ONLY if you have verified the exact line number via grep_search).",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -1047,6 +1084,81 @@ IMPORTANT:
             }
         }
     ],
+    "builtin_betterwork": [
+        {
+            name: "ask_user_choice",
+            description: "Proactively ask the user one or more single-choice questions to confirm a decision, resolve ambiguity, or let the user pick between approaches before you proceed. Use this whenever a plan branches or you need the user to make a call. Options render as clickable buttons inside the chat bubble and the user picks exactly ONE option per question. IMPORTANT: Do NOT add your own 'type your own answer' or 'discuss this' options, and do NOT ask the user to multi-select — the UI automatically appends a free-text input (for any other idea) and a 'discuss this' option to every question. Keep each option 'label' short; put rationale in 'description'.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    questions: {
+                        type: "array",
+                        description: "One or more questions to present to the user.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                question: { type: "string", description: "The full question text." },
+                                header: { type: "string", description: "Optional very short label (<= 12 chars) shown as a tag/chip." },
+                                options: {
+                                    type: "array",
+                                    description: "The selectable options. Do NOT include a free-text or 'discuss' option here.",
+                                    items: {
+                                        type: "object",
+                                        properties: {
+                                            label: { type: "string", description: "Short option text the user sees." },
+                                            description: { type: "string", description: "Optional explanation or trade-off for this option." }
+                                        },
+                                        required: ["label"]
+                                    }
+                                }
+                            },
+                            required: ["question", "options"]
+                        }
+                    }
+                },
+                required: ["questions"]
+            }
+        },
+        {
+            name: "task_write",
+            description: "Create or update the temporary task list for the CURRENT conversation, shown in a floating panel so the user can watch your progress in real time (a live to-do checklist). This is NOT a scheduled/cron task. WORKFLOW: (1) ALWAYS call task_read FIRST to fetch the latest list before writing, so you never drop existing tasks or steps; (2) pass the FULL list every time (full snapshot / overwrite) — include every task with its current status; (3) the MOMENT you finish a task or step, immediately call task_write again to mark it 'completed' and set the next item to 'in_progress', so the user can track up-to-date progress at all times. Break the work into a few tasks, each optionally with sub-steps.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    tasks: {
+                        type: "array",
+                        description: "The complete task list (full snapshot; overwrites the previous list).",
+                        items: {
+                            type: "object",
+                            properties: {
+                                content: { type: "string", description: "Task title / what needs to be done." },
+                                status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "Current status of the task." },
+                                steps: {
+                                    type: "array",
+                                    description: "Optional sub-steps of this task.",
+                                    items: {
+                                        type: "object",
+                                        properties: {
+                                            content: { type: "string", description: "Step description." },
+                                            status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "Step status." }
+                                        },
+                                        required: ["content", "status"]
+                                    }
+                                }
+                            },
+                            required: ["content", "status"]
+                        }
+                    }
+                },
+                required: ["tasks"]
+            }
+        },
+        {
+            name: "task_read",
+            description: "Read back the current task list for this conversation (the same list maintained via task_write and shown in the task panel). Use this to re-orient yourself on progress — for example after a long conversation or a context compaction — so you do not lose track of what is done and what remains, and ALWAYS call it right before task_write to fetch the latest state. Returns every task with its status and steps.",
+            inputSchema: { type: "object", properties: {} }
+        }
+    ],
 };
 
 // --- Helpers ---
@@ -1117,6 +1229,58 @@ const globToRegex = (glob) => {
 
 // 路径标准化 (统一使用 /)
 const normalizePath = (p) => p.split(path.sep).join('/');
+
+// 生成编辑后改动区域的带行号片段（展示用，输入为 LF 归一化内容）
+function buildEditSnippet(content, insertedText, contextLines = 3) {
+    if (!insertedText) return '';
+    const idx = content.indexOf(insertedText);
+    if (idx === -1) return '';
+    const startLine = content.slice(0, idx).split('\n').length; // 1-based
+    const endLine = startLine + insertedText.split('\n').length - 1;
+    const lines = content.split('\n');
+    const from = Math.max(1, startLine - contextLines);
+    const to = Math.min(lines.length, endLine + contextLines);
+    const out = [];
+    for (let i = from; i <= to; i++) {
+        out.push(`${String(i).padStart(4)} | ${lines[i - 1]}`);
+    }
+    return out.join('\n');
+}
+
+// 行号前缀匹配（read_file 的显示格式：可选前导空白 + 数字 + " | "）
+const LINE_NUMBER_PREFIX_RE = /^\s*\d+\s*\|\s?/;
+
+// 安全剥离 old_string 里误带的 "NNNN | " 行号前缀：仅当每个非空行都符合行号格式才剥离，否则返回 null
+function stripLineNumberPrefix(text) {
+    if (typeof text !== 'string' || !text.includes('|')) return null;
+    const lines = text.split('\n');
+    const nonEmpty = lines.filter(l => l.trim() !== '');
+    if (nonEmpty.length === 0) return null;
+    if (!nonEmpty.every(l => LINE_NUMBER_PREFIX_RE.test(l))) return null;
+    return lines.map(l => l.replace(LINE_NUMBER_PREFIX_RE, '')).join('\n');
+}
+
+// edit_file 精确匹配失败时的诊断信息（提示行号前缀 / 空白差异，并给出文件中最相近的一行）
+function buildEditNotFoundDiagnostic(content, targetOld) {
+    let msg = `Error: 'old_string' not found in file. Matching is EXACT (whitespace/indentation sensitive). Please read_file again and copy the exact text.`;
+    if (LINE_NUMBER_PREFIX_RE.test(targetOld)) {
+        msg += `\nHint: 'old_string' looks like it still contains read_file's "NNNN | " line-number prefix — remove the prefix and use the raw file text only.`;
+    }
+    const firstLine = (targetOld.split('\n').find(l => l.trim() !== '') || '')
+        .replace(LINE_NUMBER_PREFIX_RE, '')
+        .trim();
+    if (firstLine) {
+        const fileLines = content.split('\n');
+        const hit = fileLines.findIndex(l => l.includes(firstLine));
+        if (hit !== -1) {
+            msg += `\nClosest match in file at line ${hit + 1}:\n${String(hit + 1).padStart(4)} | ${fileLines[hit]}`;
+            msg += `\nTip: copy the exact text (including leading/trailing whitespace and tabs) from that region.`;
+        } else {
+            msg += `\nHint: also check for trailing spaces, tabs vs spaces, or that you are editing the latest version of the file.`;
+        }
+    }
+    return msg;
+}
 
 // 递归文件遍历器
 async function* walkDir(dir, maxDepth = 20, currentDepth = 0, signal = null) {
@@ -1284,6 +1448,7 @@ async function runSubAgent(args, globalContext, signal) {
     const baseUrl = providerInfo.baseUrl;
     const apiKey = providerInfo.apiKey;
     const apiType = providerInfo.apiType;
+    const providerHeaders = providerInfo.headers || {};
     const requestModelName = providerInfo.modelName || '';
 
     if (!baseUrl || !apiKey || !requestModelName) {
@@ -1356,6 +1521,7 @@ ${userContext || 'No additional context provided.'}
                 apiKey: apiKey,
                 model: requestModelName,
                 apiType: currentApiType,
+                headers: providerHeaders,
                 messages: messages,
                 tools: availableTools.length > 0 ? availableTools : undefined,
                 tool_choice: availableTools.length > 0 ? "auto" : undefined,
@@ -1485,6 +1651,7 @@ ${userContext || 'No additional context provided.'}
             apiKey: apiKey,
             model: requestModelName,
             apiType: currentApiType,
+            headers: providerHeaders,
             messages: messages,
             tools: availableTools.length > 0 ? availableTools : undefined,
             tool_choice: availableTools.length > 0 ? "auto" : undefined,
@@ -1518,6 +1685,18 @@ ${userContext || 'No additional context provided.'}
 
 // --- Execution Handlers ---
 const handlers = {
+    // Better Work (interactive: actually handled in the chat window UI; these are graceful fallbacks for non-UI contexts such as sub-agents)
+    ask_user_choice: async ({ questions } = {}) => {
+        const count = Array.isArray(questions) ? questions.length : 0;
+        return `[Better Work] ask_user_choice must be answered by the user in the interactive chat window. The current execution context (e.g. a sub-agent with no UI) cannot collect a user selection, so ask the user directly in your message text instead. (questions: ${count})`;
+    },
+    task_write: async ({ tasks } = {}) => {
+        const count = Array.isArray(tasks) ? tasks.length : 0;
+        return `[Better Work] Received the task list (${count} item(s)). The task progress panel is only shown in the interactive chat window.`;
+    },
+    task_read: async () => {
+        return `[Better Work] task_read returns the current task list, which is only available in the interactive chat window.`;
+    },
     // Python
     list_python_interpreters: async () => {
         const paths = await findAllPythonPaths();
@@ -1643,7 +1822,17 @@ const handlers = {
     },
 
     // 2. Grep Search
-    grep_search: async ({ pattern, path: searchPath, glob, output_mode = 'content', multiline = false }, context, signal) => {
+    grep_search: async ({
+        pattern,
+        path: searchPath,
+        glob,
+        output_mode = 'content',
+        multiline = false,
+        max_results,
+        context_lines,
+        max_output_chars,
+        max_line_length
+    }, context, signal) => {
         try {
             if (!searchPath) {
                 return "Error: You MUST provide a 'path' argument to specify the directory.";
@@ -1686,19 +1875,62 @@ const handlers = {
             const globRegex = glob ? globToRegex(glob) : null;
             const normalizedRoot = normalizePath(isSingleFile ? path.dirname(targetPath) : targetPath);
 
+            const clampInteger = (value, fallback, min, max) => {
+                const numeric = Number(value);
+                if (!Number.isFinite(numeric)) return fallback;
+                return Math.max(min, Math.min(max, Math.floor(numeric)));
+            };
+
+            const effectiveMaxResults = clampInteger(max_results, 20, 1, 100);
+            const effectiveContextLines = clampInteger(context_lines, 2, 0, 10);
+            const effectiveMaxOutputChars = clampInteger(max_output_chars, 20000, 1000, 80000);
+            const effectiveMaxLineLength = clampInteger(max_line_length, 500, 80, 2000);
+            const outputBudgetApplies = output_mode !== 'count';
+
             const results = [];
+            let outputChars = 0;
+            let outputTruncated = false;
             let matchCount = 0;
             const MAX_SCANNED = 5000;
-            const MAX_RESULTS_BLOCKS = 100;
             let scanned = 0;
             const filesToSearch = isSingleFile ? [targetPath] : walkDir(targetPath, 20, 0, signal);
+
+            const truncateLine = (line = '') => {
+                const text = String(line ?? '');
+                if (text.length <= effectiveMaxLineLength) return text;
+                return `${text.slice(0, effectiveMaxLineLength)}... [line truncated, ${text.length - effectiveMaxLineLength} chars omitted]`;
+            };
+
+            const pushResult = (block, { force = false } = {}) => {
+                const text = String(block ?? '');
+                if (!outputBudgetApplies) {
+                    results.push(text);
+                    return true;
+                }
+
+                if (!force && outputChars + text.length > effectiveMaxOutputChars) {
+                    const remaining = Math.max(0, effectiveMaxOutputChars - outputChars);
+                    if (remaining > 200) {
+                        results.push(`${text.slice(0, remaining)}\n[System Warning] Current result block truncated by max_output_chars=${effectiveMaxOutputChars}.`);
+                        outputChars = effectiveMaxOutputChars;
+                    }
+                    outputTruncated = true;
+                    return false;
+                }
+
+                results.push(text);
+                outputChars += text.length + 1;
+                return true;
+            };
 
             for await (const filePath of filesToSearch) {
                 if (signal && signal.aborted) throw new Error("Operation aborted by user.");
                 if (scanned++ > MAX_SCANNED) {
-                    results.push(`\n[System] Scan limit reached (${MAX_SCANNED} files). Please narrow down your search path or use a glob filter.`);
+                    pushResult(`\n[System] Scan limit reached (${MAX_SCANNED} files). Please narrow down your search path or use a glob filter.`, { force: true });
                     break;
                 }
+
+                if (outputTruncated) break;
 
                 if (globRegex) {
                     const normalizedFilePath = normalizePath(filePath);
@@ -1718,9 +1950,9 @@ const handlers = {
 
                     if (output_mode === 'files_with_matches') {
                         if (searchRegex.test(content)) {
-                            results.push(filePath);
                             searchRegex.lastIndex = 0;
-                            if (results.length >= MAX_RESULTS_BLOCKS) break;
+                            if (!pushResult(filePath)) break;
+                            if (results.length >= effectiveMaxResults) break;
                         }
                     } else {
                         const matches = [...content.matchAll(searchRegex)];
@@ -1731,7 +1963,8 @@ const handlers = {
                             const lines = content.split(/\r?\n/);
 
                             for (const m of matches) {
-                                if (results.length >= MAX_RESULTS_BLOCKS) break;
+                                if (results.length >= effectiveMaxResults) break;
+                                if (outputTruncated) break;
 
                                 const offset = m.index;
                                 const lineNum = content.substring(0, offset).split(/\r?\n/).length;
@@ -1744,14 +1977,13 @@ const handlers = {
                                 const newLinesInMatch = (matchText.match(/\n/g) || []).length;
                                 const endLineNum = lineNum + newLinesInMatch;
 
-                                const contextLines = 10;
-                                const startLineIdx = Math.max(0, lineNum - 1 - contextLines);
-                                const endLineIdx = Math.min(lines.length, endLineNum - 1 + 1 + contextLines);
+                                const startLineIdx = Math.max(0, lineNum - 1 - effectiveContextLines);
+                                const endLineIdx = Math.min(lines.length, endLineNum - 1 + 1 + effectiveContextLines);
 
                                 let contextBlock = "";
                                 for (let i = startLineIdx; i < endLineIdx; i++) {
                                     const currentLineNum = i + 1;
-                                    const lineContent = lines[i];
+                                    const lineContent = truncateLine(lines[i]);
                                     const isMatch = (currentLineNum >= lineNum && currentLineNum <= endLineNum);
                                     const marker = isMatch ? "=>" : "  ";
                                     contextBlock += `${marker} ${String(currentLineNum).padStart(4)} | ${lineContent}\n`;
@@ -1762,21 +1994,24 @@ Location: Line ${lineNum}, Col ${colNum} (Start Offset: ${offset})
 Context:
 ${contextBlock}
 --------------------------------------------------`;
-                                results.push(block);
+                                if (!pushResult(block)) break;
                             }
                         }
                     }
                 } catch (readErr) { /* ignore */ }
 
-                if (output_mode !== 'count' && results.length >= MAX_RESULTS_BLOCKS) {
-                    results.push(`\n[System Warning] Output truncated. Reached maximum of ${MAX_RESULTS_BLOCKS} result blocks. Please use a more specific pattern.`);
+                if (output_mode !== 'count' && results.length >= effectiveMaxResults) {
+                    pushResult(`\n[System Warning] Output truncated. Reached maximum of ${effectiveMaxResults} result blocks. Use a more specific pattern, output_mode='files_with_matches', or increase max_results.`, { force: true });
                     break;
                 }
             }
 
             if (output_mode === 'count') return `Total matches: ${matchCount}`;
             if (results.length === 0) return "No matches found.";
-            return results.join('\n');
+            const suffix = outputTruncated
+                ? `\n[System Warning] Output truncated. Reached max_output_chars=${effectiveMaxOutputChars}. Use a narrower path/glob/pattern, output_mode='files_with_matches', or increase max_output_chars.`
+                : '';
+            return results.join('\n') + suffix;
         } catch (e) {
             return `Grep error: ${e.message}`;
         }
@@ -1972,27 +2207,38 @@ ${contextBlock}
             const targetOld = typeof old_string === 'string' ? old_string.replace(/\r\n/g, '\n') : old_string;
             const targetNew = typeof new_string === 'string' ? new_string.replace(/\r\n/g, '\n') : new_string;
 
-            // 检查 old_string 是否存在
-            if (!content.includes(targetOld)) {
-                return `Error: 'old_string' not found in file. Please ensure you read the file first and use the exact string.`;
+            // 精确匹配 old_string；失败时做安全兜底恢复
+            let effectiveOld = targetOld;
+            let recoveryNote = '';
+            if (!content.includes(effectiveOld)) {
+                // 兜底（原因①）：old_string 可能误含 read_file 的 "NNNN | " 行号前缀，尝试剥离后重试
+                const stripped = stripLineNumberPrefix(targetOld);
+                if (stripped && stripped !== targetOld && content.includes(stripped)) {
+                    effectiveOld = stripped;
+                    recoveryNote = ' [auto-removed line-number prefixes from old_string]';
+                } else {
+                    // 仍未命中：返回带诊断的错误（原因①④）
+                    return buildEditNotFoundDiagnostic(content, targetOld);
+                }
             }
 
             // 检查唯一性
-            if (!replace_all) {
-                const count = content.split(targetOld).length - 1;
-                if (count > 1) {
-                    return `Error: 'old_string' occurs ${count} times. Please set 'replace_all' to true if you intend to replace all, or provide a more unique context string.`;
-                }
+            const occurrences = content.split(effectiveOld).length - 1;
+            if (!replace_all && occurrences > 1) {
+                return `Error: 'old_string' occurs ${occurrences} times. Please set 'replace_all' to true if you intend to replace all, or provide a more unique context string.`;
             }
 
             if (replace_all) {
-                content = content.split(targetOld).join(targetNew);
+                content = content.split(effectiveOld).join(targetNew);
             } else {
-                const index = content.indexOf(targetOld);
+                const index = content.indexOf(effectiveOld);
                 if (index !== -1) {
-                    content = content.substring(0, index) + targetNew + content.substring(index + targetOld.length);
+                    content = content.substring(0, index) + targetNew + content.substring(index + effectiveOld.length);
                 }
             }
+
+            // 在 CRLF 恢复前，用 LF 版内容生成改动片段（展示用）
+            const snippet = buildEditSnippet(content, targetNew);
 
             // 恢复原文件的换行符风格
             if (isCRLF) {
@@ -2000,7 +2246,15 @@ ${contextBlock}
             }
 
             await fs.promises.writeFile(safePath, content, 'utf-8');
-            return `Successfully edited ${path.basename(safePath)}.`;
+
+            const baseName = path.basename(safePath);
+            let resultMsg = replace_all
+                ? `Successfully edited ${baseName} (replaced all ${occurrences} occurrence(s)${occurrences > 1 ? ', showing first below' : ''})${recoveryNote}.`
+                : `Successfully edited ${baseName} (1 occurrence replaced)${recoveryNote}.`;
+            if (snippet) {
+                resultMsg += `\nUpdated section:\n${snippet}`;
+            }
+            return resultMsg;
         } catch (e) {
             return `Edit failed: ${e.message}`;
         } finally {
@@ -2167,6 +2421,13 @@ ${contextBlock}
             const preamble = `
 $OutputEncoding = [System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
 $PSDefaultParameterValues['*:Encoding'] = 'utf8';
+$env:NO_COLOR = '1';
+$env:FORCE_COLOR = '0';
+$env:CLICOLOR = '0';
+$env:npm_config_color = 'false';
+$env:PNPM_COLOR = 'never';
+$env:YARN_ENABLE_COLORS = '0';
+if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputRendering = 'PlainText' }
 `;
             fs.writeFileSync(tempFile, '\uFEFF' + preamble + '\n' + command, { encoding: 'utf8' });
             shellToUse = 'powershell.exe';
@@ -2209,7 +2470,7 @@ $PSDefaultParameterValues['*:Encoding'] = 'utf8';
                 try {
                     const child = require('child_process').spawn(shellToUse, spawnArgs, {
                         cwd: bashCwd,
-                        env: { ...process.env, FORCE_COLOR: '1' },
+                        env: { ...process.env, ...COLORLESS_COMMAND_ENV },
                         detached: !isWin
                     });
                     backgroundShells.set(shellId, {
@@ -2235,7 +2496,7 @@ $PSDefaultParameterValues['*:Encoding'] = 'utf8';
 
             const child = require('child_process').spawn(shellToUse, spawnArgs, {
                 cwd: bashCwd,
-                env: process.env,
+                env: { ...process.env, ...COLORLESS_COMMAND_ENV },
                 detached: !isWin
             });
 
@@ -2305,8 +2566,8 @@ $PSDefaultParameterValues['*:Encoding'] = 'utf8';
                     return str;
                 };
 
-                let result = decode(outChunks);
-                const errorStr = decode(errChunks);
+                let result = stripTerminalControlSequences(decode(outChunks));
+                const errorStr = stripTerminalControlSequences(decode(errChunks));
                 if (errorStr) result += `\n[Stderr]:\n${errorStr}`;
 
                 if (!result.trim()) result = "Command executed successfully.";
@@ -2351,8 +2612,9 @@ $PSDefaultParameterValues['*:Encoding'] = 'utf8';
         const safeOffset = Math.max(0, offset);
         const safeLength = Math.min(length, MAX_READ);
 
-        const chunk = fullLogs.substring(safeOffset, safeOffset + safeLength);
-        const nextOffset = safeOffset + chunk.length;
+        const rawChunk = fullLogs.substring(safeOffset, safeOffset + safeLength);
+        const chunk = stripTerminalControlSequences(rawChunk);
+        const nextOffset = safeOffset + rawChunk.length;
 
         let statusInfo = `[Process State: ${proc.active ? 'Running' : 'Exited'}]`;
         let footer = "";

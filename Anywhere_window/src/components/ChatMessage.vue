@@ -5,9 +5,17 @@ import { ElTooltip, ElButton, ElInput, ElCollapse, ElCollapseItem, ElIcon, ElChe
 import { DocumentCopy, Refresh, Delete, Document, CaretTop, CaretBottom, Edit, Check, Close, CloseBold, Picture } from '@element-plus/icons-vue';
 import 'katex/dist/katex.min.css';
 import DOMPurify from 'dompurify';
-import html2canvas from 'html2canvas';
 
 import { formatTimestamp, formatMessageText, sanitizeToolArgs, formatToolResult } from '../utils/formatters.js';
+import ChoiceCard from './ChoiceCard.vue';
+
+let html2canvasPromise = null;
+const loadHtml2Canvas = () => {
+  if (!html2canvasPromise) {
+    html2canvasPromise = import('html2canvas').then(mod => mod.default || mod);
+  }
+  return html2canvasPromise;
+};
 
 const props = defineProps({
   message: Object,
@@ -21,7 +29,7 @@ const props = defineProps({
   isAutoApprove: Boolean,
 });
 
-const emit = defineEmits(['copy-text', 're-ask', 'delete-message', 'toggle-collapse', 'avatar-click', 'edit-message', 'edit-message-requested', 'edit-finished', 'cancel-tool-call', 'confirm-tool', 'reject-tool', 'update-auto-approve']);
+const emit = defineEmits(['copy-text', 're-ask', 'delete-message', 'toggle-collapse', 'avatar-click', 'edit-message', 'edit-message-requested', 'edit-finished', 'cancel-tool-call', 'confirm-tool', 'reject-tool', 'update-auto-approve', 'submit-choice']);
 const editInputRef = ref(null);
 const isEditing = ref(false);
 const editedContent = ref('');
@@ -233,6 +241,7 @@ const onCopyImage = async () => {
       await new Promise(r => requestAnimationFrame(() => setTimeout(r, 200)));
 
       // 5. 截图
+      const html2canvas = await loadHtml2Canvas();
       const canvas = await html2canvas(wrapper, {
         useCORS: true,
         allowTaint: true,
@@ -619,7 +628,7 @@ const truncateFilename = (filename, maxLength = 30) => {
           <div v-if="message.tool_calls && message.tool_calls.length > 0" class="tool-calls-container">
             <div v-for="toolCall in message.tool_calls" :key="toolCall.id" class="single-tool-wrapper">
               <el-collapse class="tool-collapse"
-                :model-value="(!isAutoApprove && (toolCall.approvalStatus === 'waiting' || toolCall.approvalStatus === 'executing')) ? [toolCall.id] : []">
+                :model-value="((!isAutoApprove && (toolCall.approvalStatus === 'waiting' || toolCall.approvalStatus === 'executing')) || toolCall.approvalStatus === 'choosing') ? [toolCall.id] : []">
                 <el-collapse-item :name="toolCall.id">
                   <template #title>
                     <div class="tool-call-title">
@@ -643,6 +652,8 @@ const truncateFilename = (filename, maxLength = 30) => {
                           round>等待批准</el-tag>
                         <el-tag v-else-if="toolCall.approvalStatus === 'executing'" type="primary" size="small"
                           effect="light" round>执行中</el-tag>
+                        <el-tag v-else-if="toolCall.approvalStatus === 'choosing'" type="warning" size="small"
+                          effect="light" round>待选择</el-tag>
                         <el-tag v-else-if="toolCall.approvalStatus === 'rejected'" type="danger" size="small"
                           effect="plain" round>已拒绝</el-tag>
                         <el-tag v-else-if="toolCall.approvalStatus === 'finished'" type="success" size="small"
@@ -662,8 +673,12 @@ const truncateFilename = (filename, maxLength = 30) => {
                       <strong>参数:</strong>
                       <pre><code>{{ formatToolArgs(toolCall.args) }}</code></pre>
                     </div>
+                    <div v-if="toolCall.approvalStatus === 'choosing' && toolCall.choiceData" class="tool-choice-wrapper">
+                      <ChoiceCard :questions="toolCall.choiceData.questions || []"
+                        @submit="(payload) => $emit('submit-choice', toolCall.id, payload)" />
+                    </div>
                     <div class="tool-detail-section"
-                      v-if="toolCall.result && toolCall.result !== '等待批准...' && toolCall.result !== '执行中...'">
+                      v-if="toolCall.result && toolCall.result !== '等待批准...' && toolCall.result !== '执行中...' && toolCall.result !== '等待用户选择...'">
                       <strong>结果:</strong>
                       <div class="tool-result-wrapper">
                         <pre><code>{{ formatToolResult(toolCall.result) }}</code></pre>

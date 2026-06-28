@@ -1,8 +1,7 @@
 const { ipcRenderer } = require('electron');
 const fs = require('fs');
 const path = require('path');
-
-const { createChatCompletion, getRandomItem } = require('./chat.js');
+const { fileURLToPath } = require('url');
 
 const {
     getConfig,
@@ -31,25 +30,66 @@ const {
     listJsonFiles,
 } = require('./file.js');
 
-const { 
-  invokeBuiltinTool,
-} = require('./mcp_builtin.js');
+const BLOCKED_EXTERNAL_PROTOCOLS = new Set(['javascript:', 'data:', 'blob:', 'about:']);
 
-const { 
-  initializeMcpClient, 
-  invokeMcpTool,
-  closeMcpClient,
-  connectAndFetchTools,
-} = require('./mcp.js');
+function isBlockedExternalProtocol(protocol = '') {
+    return BLOCKED_EXTERNAL_PROTOCOLS.has(String(protocol || '').toLowerCase());
+}
 
-const {
-    listSkills,
-    getSkillDetails,
-    generateSkillToolDefinition,
-    resolveSkillInvocation,
-    saveSkill,
-    deleteSkill
-} = require('./skill.js');
+function openLinkWithSystemDefault(rawUrl = '') {
+    const targetUrl = String(rawUrl || '').trim();
+    if (!targetUrl || targetUrl.startsWith('#')) {
+        return { ok: false, reason: 'ignored_anchor' };
+    }
+
+    try {
+        const parsedUrl = new URL(targetUrl);
+        const protocol = parsedUrl.protocol.toLowerCase();
+
+        if (isBlockedExternalProtocol(protocol)) {
+            console.warn('[window_preload] Blocked external url with unsafe protocol:', protocol);
+            return { ok: false, reason: 'blocked_protocol' };
+        }
+
+        if (protocol === 'file:') {
+            const localPath = fileURLToPath(parsedUrl);
+            utools.shellOpenPath(localPath);
+            return { ok: true, type: 'path' };
+        }
+    } catch (error) {
+        console.warn('[window_preload] Failed to parse link url, fallback to shellOpenExternal:', error.message);
+    }
+
+    utools.shellOpenExternal(targetUrl);
+    return { ok: true, type: 'url' };
+}
+
+
+function getLazyRuntime() {
+    const runtimePath = './' + 'lazy_runtime.js';
+    return require(runtimePath);
+}
+
+function getChatModule() {
+    return getLazyRuntime();
+}
+
+function getMcpBuiltinModule() {
+    return getLazyRuntime();
+}
+
+function getMcpModule() {
+    return getLazyRuntime();
+}
+
+function getSkillModule() {
+    return getLazyRuntime();
+}
+
+function getProjectsModule() {
+    const runtimePath = './' + 'projects_runtime.js';
+    return require(runtimePath);
+}
 
 // 引入会议讨论模块
 const {
@@ -101,8 +141,11 @@ window.addEventListener('DOMContentLoaded', () => {
         }
 
         if (target && target.tagName === 'A' && target.href) {
+            const rawHref = String(target.getAttribute('href') || '').trim();
+            if (!rawHref || rawHref.startsWith('#')) return;
+
             event.preventDefault();
-            utools.shellOpenExternal(target.href);
+            openLinkWithSystemDefault(target.href);
         }
     });
 });
@@ -118,8 +161,13 @@ async function handleCodeClick(text) {
   const content = text.trim().replace(/^["']|["']$/g, '');
 
   // 1. 检查是否为 URL
+  if (/^file:\/\//i.test(content)) {
+    const result = openLinkWithSystemDefault(content);
+    return result.type === 'path' ? 'opened-path' : 'opened-url';
+  }
+
   if (/^https?:\/\//i.test(content) || /^mailto:/i.test(content)) {
-    utools.shellOpenExternal(content);
+    openLinkWithSystemDefault(content);
     return 'opened-url';
   }
 
@@ -160,9 +208,9 @@ window.api = {
     updateConfig,
     saveSetting,
     getUser,
-    getRandomItem,
+    getRandomItem: (list) => getChatModule().getRandomItem(list),
     createChatCompletion: async (params) => {
-        return await createChatCompletion(params);
+        return await getChatModule().createChatCompletion(params);
     },
     copyText,
     handleFilePath,
@@ -170,6 +218,12 @@ window.api = {
     renameLocalFile,
     listJsonFiles,
     writeLocalFile,
+    readLocalProjects: (...args) => getProjectsModule().readLocalProjects(...args),
+    writeLocalProjects: (...args) => getProjectsModule().writeLocalProjects(...args),
+    parseProjectsYaml: (...args) => getProjectsModule().parseProjectsYaml(...args),
+    serializeProjectsYaml: (...args) => getProjectsModule().serializeProjectsYaml(...args),
+    mergeFileAssignment: (...args) => getProjectsModule().mergeFileAssignment(...args),
+    findProjectByBasename: (...args) => getProjectsModule().findProjectByBasename(...args),
     handleCodeClick,
     sethotkey,
     setZoomFactor,
@@ -179,6 +233,7 @@ window.api = {
     copyImage: utools.copyImage,
     getMcpToolCache,
     initializeMcpClient: async (activeServerConfigs) => {
+        const { initializeMcpClient } = getMcpModule();
         try {
             const cache = await getMcpToolCache();            
             return await initializeMcpClient(activeServerConfigs, cache, saveMcpToolCache);
@@ -189,6 +244,7 @@ window.api = {
     },
     testMcpConnection: async (serverConfig) => {
         try {
+            const { connectAndFetchTools } = getMcpModule();
             // 连接并获取最新工具
             const rawTools = await connectAndFetchTools(serverConfig.id, {
                 transport: serverConfig.type,
@@ -241,11 +297,14 @@ window.api = {
         }
     },
     invokeMcpTool: async (toolName, toolArgs, signal, context = null) => {
+        const { invokeMcpTool } = getMcpModule();
         const extContext = context ? { ...context, senderId } : { senderId };
         return await invokeMcpTool(toolName, toolArgs, signal, extContext);
     },
     saveMcpToolCache,
-    closeMcpClient,
+    closeMcpClient: async (...args) => {
+        return await getMcpModule().closeMcpClient(...args);
+    },
     isFileTypeSupported,
     parseFileObject,
     shellOpenPath: (fullPath) => {
@@ -286,27 +345,28 @@ window.api = {
     // Skill 相关 API
     listSkills: async (path) => {
         try {
-            return listSkills(path);
+            return getSkillModule().listSkills(path);
         } catch (e) {
             console.error("listSkills error:", e);
             return [];
         }
     },
     getSkillDetails: async (rootPath, id) => {
-        return getSkillDetails(rootPath, id);
+        return getSkillModule().getSkillDetails(rootPath, id);
     },
     saveSkill: async (rootPath, id, content) => {
-        const res = await saveSkill(rootPath, id, content);
+        const res = await getSkillModule().saveSkill(rootPath, id, content);
         broadcastEvent('skills-updated');
         return res;
     },
     deleteSkill: async (rootPath, id) => {
-        const res = await deleteSkill(rootPath, id);
+        const res = await getSkillModule().deleteSkill(rootPath, id);
         broadcastEvent('skills-updated');
         return res;
     },
     toggleSkillForkMode: async (rootPath, skillId, enableFork) => {
         try {
+            const { getSkillDetails, saveSkill } = getSkillModule();
             const details = await getSkillDetails(rootPath, skillId);
             const meta = details.metadata;
             const body = details.content;
@@ -369,6 +429,7 @@ window.api = {
     // 生成 Skill Tool 定义
     getSkillToolDefinition: async (rootPath, enabledSkillNames = []) => {
         try {
+            const { listSkills, generateSkillToolDefinition } = getSkillModule();
             const allSkills = listSkills(rootPath);
             const activeSkills = allSkills.filter(s => enabledSkillNames.includes(s.name));
             if (activeSkills.length === 0) return null;
@@ -379,6 +440,7 @@ window.api = {
     },
     // 执行 Skill
     resolveSkillInvocation: async (rootPath, skillName, toolArgs, globalContext = null, signal = null) => {
+        const { resolveSkillInvocation } = getSkillModule();
         // 1. 获取 Skill 解析结果
         const result = resolveSkillInvocation(rootPath, skillName, toolArgs);
 
@@ -394,7 +456,7 @@ window.api = {
             
             // 3. 自动调用内置的 sub_agent 工具
             // 注意：invokeBuiltinTool 已经修复为返回序列化的 JSON 字符串，直接透传即可
-            return await invokeBuiltinTool(
+            return await getMcpBuiltinModule().invokeBuiltinTool(
                 'sub_agent', 
                 result.subAgentArgs, 
                 signal, 
