@@ -109,6 +109,7 @@ const docLoading = ref(false);
 const currentDocContent = ref('');
 const activeDocIndex = ref('0');
 const docScrollbarRef = ref(null);
+const ABOUT_DOC_FILE = '__about__';
 
 // 文档列表配置，增加 i18nKey 用于动态标题，lastUpdated 动态获取
 const docList = ref([
@@ -118,7 +119,8 @@ const docList = ref([
   { i18nKey: 'doc.titles.mcp', file: 'mcp_doc.md', lastUpdated: null },
   { i18nKey: 'doc.titles.skill', file: 'skill_doc.md', lastUpdated: null },
   { i18nKey: 'doc.titles.provider', file: 'provider_doc.md', lastUpdated: null },
-  { i18nKey: 'doc.titles.setting', file: 'setting_doc.md', lastUpdated: null }
+  { i18nKey: 'doc.titles.setting', file: 'setting_doc.md', lastUpdated: null },
+  { i18nKey: 'doc.titles.about', file: ABOUT_DOC_FILE, lastUpdated: null, isBuiltin: true }
 ]);
 
 // 阅读状态管理
@@ -174,10 +176,33 @@ const fetchWithFallback = async (relativePath) => {
 };
 
 // 预取所有文档的元数据（更新时间）
+const getAboutDocHtml = () => {
+  return `
+    <section style="padding: 8px 4px; line-height: 1.8; color: var(--text-primary);">
+      <h1 style="margin: 0 0 12px;">关于 Anywhere</h1>
+      <div style="display: flex; flex-direction: column; gap: 10px;">
+        <div>- Anywhere 插件：<a href="https://github.com/Komorebi-yaodong/Anywhere" target="_blank" rel="noreferrer">GitHub</a> / <a href="https://gitee.com/Komorebi-yaodong/Anywhere" target="_blank" rel="noreferrer">Gitee</a></div>
+        <div>- Anywhere 客户端：<a href="https://github.com/Komorebi-yaodong/anywheredesktop" target="_blank" rel="noreferrer">GitHub</a> / <a href="https://gitee.com/Komorebi-yaodong/anywheredesktop" target="_blank" rel="noreferrer">Gitee</a></div>
+        <div>- 文档：<a href="https://github.com/Komorebi-yaodong/anywhere_doc" target="_blank" rel="noreferrer">GitHub</a> / <a href="https://gitee.com/Komorebi-yaodong/anywhere_" target="_blank" rel="noreferrer">Gitee</a></div>
+        <div>QQ群：1030363653</div>
+      </div>
+      <div style="margin-top: 16px; padding: 12px 14px; border-radius: 10px; background: var(--bg-tertiary); border: 1px solid var(--border-primary);">
+        <div style="font-weight: 600; margin-bottom: 6px;">作者的话</div>
+        <div>感谢你愿意使用 Anywhere。这个项目会继续围绕“更自由地调用模型、工具与知识”持续打磨，也欢迎你带着建议、反馈和想法来群里一起共建。</div>
+      </div>
+    </section>
+  `;
+};
+
+
 const fetchAllDocsMetadata = async () => {
   const dateRegex = /\*\*文档更新时间：(\d{4})年(\d{1,2})月(\d{1,2})日\*\*/;
 
   const promises = docList.value.map(async (doc) => {
+    if (doc.isBuiltin) {
+      doc.lastUpdated = null;
+      return;
+    }
     try {
       const { text } = await fetchWithFallback(`docs/${doc.file}`);
       
@@ -200,6 +225,17 @@ const fetchAllDocsMetadata = async () => {
 const fetchAndParseDoc = async (filename) => {
   // 标记当前文档为已读
   markDocAsRead(filename);
+
+  if (filename === ABOUT_DOC_FILE) {
+    docLoading.value = false;
+    currentDocContent.value = getAboutDocHtml();
+    nextTick(() => {
+      if (docScrollbarRef.value) {
+        docScrollbarRef.value.setScrollTop(0);
+      }
+    });
+    return;
+  }
 
   docLoading.value = true;
   try {
@@ -471,13 +507,10 @@ watch(locale, () => {
             <el-tooltip :content="t('app.tabs.mcp')" placement="bottom">
               <el-button class="tab-button" text @click="changeTab(3)" :class="{ 'active-tab': tab === 3 }">
                 <el-icon :size="19">
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9"></path>
-                    <path d="m18 15 4-4"></path>
-                    <path
-                      d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5">
-                    </path>
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" fill="none" aria-hidden="true">
+                    <path d="M18 84.8528L85.8822 16.9706C95.2548 7.59798 110.451 7.59798 119.823 16.9706C129.196 26.3431 129.196 41.5391 119.823 50.9117L68.5581 102.177" stroke="currentColor" stroke-width="12" stroke-linecap="round" />
+                    <path d="M69.2652 101.47L119.823 50.9117C129.196 41.5391 144.392 41.5391 153.765 50.9117L154.118 51.2652C163.491 60.6378 163.491 75.8338 154.118 85.2063L92.7248 146.6C89.6006 149.724 89.6006 154.789 92.7248 157.913L105.331 170.52" stroke="currentColor" stroke-width="12" stroke-linecap="round" />
+                    <path d="M102.853 33.9411L52.6482 84.1457C43.2756 93.5183 43.2756 108.714 52.6482 118.087C62.0208 127.459 77.2167 127.459 86.5893 118.087L136.794 67.8822" stroke="currentColor" stroke-width="12" stroke-linecap="round" />
                   </svg>
                 </el-icon>
               </el-button>

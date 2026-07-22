@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const MarkitdownModule = require('markitdown-js');
+const { randomUUID } = require('crypto');
+const { encode: encodeTokens, decode: decodeTokens } = require('gpt-tokenizer');
 const { exec, spawn } = require('child_process');
 const { handleFilePath, parseFileObject } = require('./file.js');
 
@@ -104,6 +106,285 @@ async function callParentShell(action, payload, signal = null) {
 
 const MAX_READ = 128 * 1000; // 128k characters
 
+const subAgentTasks = new Map();
+const MAX_SUBAGENT_TASKS = 100;
+const MAX_SUBAGENT_LOG_CHARS = 1024 * 1024;
+const MAX_SUBAGENT_STATUS_TOKENS = 100000;
+
+function normalizeSubAgentText(value) {
+    if (typeof value === 'string') return value;
+    if (value === undefined || value === null) return '';
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch {
+        return String(value);
+    }
+}
+
+function limitSubAgentLog(text = '') {
+    const normalized = normalizeSubAgentText(text);
+    if (normalized.length <= MAX_SUBAGENT_LOG_CHARS) return normalized;
+    return `[... Sub-Agent log truncated to ${MAX_SUBAGENT_LOG_CHARS} characters ...]\n${normalized.slice(-MAX_SUBAGENT_LOG_CHARS)}`;
+}
+
+function trimSubAgentTasks() {
+    if (subAgentTasks.size <= MAX_SUBAGENT_TASKS) return;
+    const removable = [...subAgentTasks.values()]
+        .filter((item) => item.status !== 'running')
+        .sort((a, b) => (a.finishedAt || a.createdAt) - (b.finishedAt || b.createdAt));
+    while (subAgentTasks.size > MAX_SUBAGENT_TASKS && removable.length > 0) {
+        subAgentTasks.delete(removable.shift().id);
+    }
+}
+
+function resolveSubAgentOwnerId(context = null, args = {}) {
+    const fromContext = typeof context?.conversationOwnerId === 'string' ? context.conversationOwnerId.trim() : '';
+    if (fromContext) return fromContext;
+    const fromArgs = typeof args?.conversation_owner_id === 'string' ? args.conversation_owner_id.trim() : '';
+    return fromArgs || '';
+}
+
+function toSubAgentSnapshot(task, { includeOutput = true } = {}) {
+    if (!task) return null;
+    const snapshot = {
+        subagent_id: task.id,
+        status: task.status,
+        task: task.task,
+        model_route: task.modelRoute,
+        model_name: task.modelName || '',
+        provider_name: task.providerName || '',
+        conversation_owner_id: task.ownerId || '',
+        created_at: task.createdAt,
+        started_at: task.startedAt,
+        finished_at: task.finishedAt || null,
+        updated_at: task.updatedAt,
+        stop_requested_at: task.stopRequestedAt || null
+    };
+    if (includeOutput) {
+        snapshot.latest_log = task.latestLog || '';
+        if (task.result) snapshot.final_result = task.result;
+        if (task.error) snapshot.error = task.error;
+    }
+    return snapshot;
+}
+
+function truncateSubAgentStatusOutput(value, maxTokens = MAX_SUBAGENT_STATUS_TOKENS) {
+    const text = normalizeSubAgentText(value);
+    try {
+        const tokens = encodeTokens(text);
+        if (tokens.length <= maxTokens) return text;
+        const marker = `\n\n--- [SYSTEM NOTE: SUBAGENT STATUS OUTPUT TRUNCATED] ---\nOriginal token count: ${tokens.length}. Returned content is limited to ${maxTokens} tokens including this notice.\n\n`;
+        const contentBudget = Math.max(1, maxTokens - encodeTokens(marker).length);
+        const headTokens = Math.min(2048, Math.floor(contentBudget * 0.1));
+        const tailTokens = Math.max(1, contentBudget - headTokens);
+        return `${decodeTokens(tokens.slice(0, headTokens))}${marker}${decodeTokens(tokens.slice(-tailTokens))}`;
+    } catch {
+        const fallbackLimit = maxTokens * 4;
+        if (text.length <= fallbackLimit) return text;
+        return `${text.slice(0, 4096)}\n\n--- [SYSTEM NOTE: SUBAGENT STATUS OUTPUT TRUNCATED] ---\nTokenizer unavailable; output is conservatively limited.\n\n${text.slice(-Math.max(1, fallbackLimit - 4096))}`;
+    }
+}
+
+function formatSubAgentStatus(tasks) {
+    return truncateSubAgentStatusOutput(JSON.stringify(tasks, null, 2));
+}
+
+
+async function resolveSubAgentModelMeta(args = {}) {
+    try {
+        const { getConfig, resolveDefaultAssistantModel } = require('./data.js');
+        const configData = await getConfig();
+        const resolvedConfig = configData?.config || {};
+        const modelRoute = ['superior', 'general', 'fast'].includes(args?.model_route) ? args.model_route : 'general';
+        const model = resolveDefaultAssistantModel(resolvedConfig, modelRoute);
+        const providerInfo = resolveProviderConfigByModel(resolvedConfig, model);
+        return {
+            modelRoute,
+            modelName: providerInfo.modelName || (typeof model === 'string' ? (model.split('|')[1] || model) : ''),
+            providerName: providerInfo.providerName || providerInfo.providerId || ''
+        };
+    } catch {
+        return {
+            modelRoute: typeof args?.model_route === 'string' ? args.model_route : 'general',
+            modelName: '',
+            providerName: ''
+        };
+    }
+}
+
+function executeBackgroundSubAgent(task, args, globalContext) {
+    const originalOnUpdate = globalContext?.onUpdate;
+    const taskContext = {
+        ...(globalContext || {}),
+        onUpdate: (payload) => {
+            task.latestLog = limitSubAgentLog(payload);
+            task.updatedAt = Date.now();
+            if (typeof originalOnUpdate === 'function') {
+                try {
+                    originalOnUpdate(task.latestLog, toSubAgentSnapshot(task));
+                } catch {
+                    // Ignore UI callback failures; background execution must continue.
+                }
+            }
+        }
+    };
+
+    void Promise.resolve()
+        .then(() => runSubAgent(args, taskContext, task.controller.signal))
+        .then((result) => {
+            task.result = normalizeSubAgentText(result);
+            if (task.controller.signal.aborted) task.status = 'stopped';
+            else if (/^\[Sub-Agent Error\]/.test(task.result)) {
+                task.status = 'failed';
+                task.error = task.result;
+            } else task.status = 'completed';
+            if (task.status === 'stopped' && !task.latestLog.includes('[Stop]')) {
+                task.latestLog = limitSubAgentLog(`${task.latestLog}\n[Stop] Stopped by user.`.trim());
+            }
+        })
+        .catch((error) => {
+            const message = error?.message || String(error);
+            if (task.controller.signal.aborted || error?.name === 'AbortError') {
+                task.status = 'stopped';
+                task.error = message;
+                task.latestLog = limitSubAgentLog(`${task.latestLog}\n[Stop] ${message}`.trim());
+            } else {
+                task.status = 'failed';
+                task.error = message;
+                task.latestLog = limitSubAgentLog(`${task.latestLog}\n[Critical Error] ${message}`.trim());
+            }
+        })
+        .finally(() => {
+            task.finishedAt = Date.now();
+            task.updatedAt = task.finishedAt;
+            trimSubAgentTasks();
+            if (typeof originalOnUpdate === 'function') {
+                try {
+                    originalOnUpdate(task.latestLog, toSubAgentSnapshot(task));
+                } catch {
+                    // ignore callback failure
+                }
+            }
+        });
+}
+
+async function createBackgroundSubAgent(args, globalContext) {
+    const id = `subagent_${randomUUID()}`;
+    const modelMeta = await resolveSubAgentModelMeta(args);
+    const ownerId = resolveSubAgentOwnerId(globalContext, args);
+    if (!ownerId) {
+        return { error: 'Sub-Agent requires a conversation owner id for session isolation.' };
+    }
+    const task = {
+        id,
+        status: 'running',
+        task: typeof args?.task === 'string' ? args.task : '',
+        modelRoute: modelMeta.modelRoute,
+        modelName: modelMeta.modelName,
+        providerName: modelMeta.providerName,
+        ownerId,
+        createdAt: Date.now(),
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        finishedAt: null,
+        stopRequestedAt: null,
+        latestLog: '',
+        result: '',
+        error: '',
+        launchArgs: JSON.parse(JSON.stringify(args || {})),
+        launchContext: { ...(globalContext || {}), onUpdate: undefined },
+        controller: new AbortController()
+    };
+    subAgentTasks.set(id, task);
+    trimSubAgentTasks();
+    executeBackgroundSubAgent(task, task.launchArgs, globalContext);
+    return toSubAgentSnapshot(task, { includeOutput: false });
+}
+
+function getOwnedSubAgentTask(id, ownerId) {
+    const task = subAgentTasks.get(id);
+    if (!task) return { error: `Sub-Agent '${id}' was not found or has expired.` };
+    if (!ownerId || task.ownerId !== ownerId) {
+        return { error: `Sub-Agent '${id}' is not accessible from the current conversation.` };
+    }
+    return { task };
+}
+
+function getSubAgentStatus(args = {}, context = null) {
+    const id = typeof args?.subagent_id === 'string' ? args.subagent_id.trim() : '';
+    const includeOutput = args?.include_output === true;
+    const ownerId = resolveSubAgentOwnerId(context, args);
+    if (!ownerId) {
+        return formatSubAgentStatus({ error: 'conversation_owner_id is required to query Sub-Agent status.' });
+    }
+    if (id) {
+        const owned = getOwnedSubAgentTask(id, ownerId);
+        if (owned.error) return formatSubAgentStatus({ error: owned.error });
+        return formatSubAgentStatus(toSubAgentSnapshot(owned.task, { includeOutput }));
+    }
+    return formatSubAgentStatus({
+        subagents: [...subAgentTasks.values()]
+            .filter((task) => task.ownerId === ownerId)
+            .sort((a, b) => b.createdAt - a.createdAt)
+            .map((task) => toSubAgentSnapshot(task, { includeOutput: false }))
+    });
+}
+
+function stopSubAgent(args = {}, context = null) {
+    const id = typeof args?.subagent_id === 'string' ? args.subagent_id.trim() : '';
+    const ownerId = resolveSubAgentOwnerId(context, args);
+    const owned = getOwnedSubAgentTask(id, ownerId);
+    if (owned.error) return formatSubAgentStatus({ error: owned.error });
+    const task = owned.task;
+    if (task.status === 'running') {
+        task.stopRequestedAt = Date.now();
+        task.updatedAt = task.stopRequestedAt;
+        task.controller.abort();
+    }
+    return formatSubAgentStatus(toSubAgentSnapshot(task));
+}
+
+async function rerunSubAgent(args = {}, context = null) {
+    const id = typeof args?.subagent_id === 'string' ? args.subagent_id.trim() : '';
+    const ownerId = resolveSubAgentOwnerId(context, args);
+    const owned = getOwnedSubAgentTask(id, ownerId);
+    if (owned.error) return formatSubAgentStatus({ error: owned.error });
+    const task = owned.task;
+    if (task.status === 'running') return formatSubAgentStatus({ error: `Sub-Agent '${id}' is still running and cannot be restarted yet.` });
+
+    const modelMeta = await resolveSubAgentModelMeta(task.launchArgs || {});
+    const now = Date.now();
+    task.status = 'running';
+    task.modelRoute = modelMeta.modelRoute;
+    task.modelName = modelMeta.modelName;
+    task.providerName = modelMeta.providerName;
+    task.startedAt = now;
+    task.updatedAt = now;
+    task.finishedAt = null;
+    task.stopRequestedAt = null;
+    task.latestLog = '';
+    task.result = '';
+    task.error = '';
+    task.controller = new AbortController();
+    executeBackgroundSubAgent(task, task.launchArgs, task.launchContext);
+    return task.id;
+}
+
+function killSubAgent(args = {}, context = null) {
+    const id = typeof args?.subagent_id === 'string' ? args.subagent_id.trim() : '';
+    const ownerId = resolveSubAgentOwnerId(context, args);
+    const owned = getOwnedSubAgentTask(id, ownerId);
+    if (owned.error) return formatSubAgentStatus({ error: owned.error });
+    const task = owned.task;
+    if (task.status === 'running') {
+        task.stopRequestedAt = Date.now();
+        task.updatedAt = task.stopRequestedAt;
+        task.controller.abort();
+    }
+    return formatSubAgentStatus(toSubAgentSnapshot(task, { includeOutput: false }));
+}
+
+
 // 数据提取函数 (提取标题、作者、简介)
 function extractMetadata(html) {
     const meta = {
@@ -150,7 +431,8 @@ function resolveProviderConfigByModel(fullConfig = {}, modelValue = '') {
         apiType: provider?.apiType || 'chat_completions',
         baseUrl: provider?.url || '',
         apiKey: provider?.api_key || '',
-        headers: provider?.headers || {}
+        headers: provider?.headers || {},
+        retryCount: Number.isInteger(provider?.retryCount) ? provider.retryCount : 3
     };
 }
 
@@ -716,7 +998,7 @@ IMPORTANT:
     ],
     "builtin_search": [
         {
-            name: "web_search",
+            name: "builtin_web_search",
             description: "Search the internet for a given query. Returns snippets only. Constraint: After replying, 'Sources:' citation links must be included.",
             inputSchema: {
                 type: "object",
@@ -732,7 +1014,7 @@ IMPORTANT:
             }
         },
         {
-            name: "web_fetch",
+            name: "builtin_web_fetch",
             description: "Retrieve and parse the FULL text content of a specific URL. Use this when the user provides a URL or after getting a URL from search results. Capable of parsing complex pages like documentation, papers, and code repositories.",
             inputSchema: {
                 type: "object",
@@ -748,7 +1030,7 @@ IMPORTANT:
     "builtin_superagent": [
         {
             name: "sub_agent",
-            description: "【Synchronous Background Worker】Delegates a specific sub-task to a temporary background AI worker. It blocks and waits until the task is fully completed, then returns the final result. Best for step-by-step internal reasoning.",
+            description: "【Asynchronous Background Worker】Starts a temporary Sub-Agent in the background and returns a subagent_id immediately; it never blocks the main conversation. Continue working after launch. Call get_subagent_status with the returned ID when you need progress or the final result.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -762,6 +1044,52 @@ IMPORTANT:
                 required: ["task", "tools"]
             }
         },
+        {
+            name: "get_subagent_status",
+            description: "Get the lifecycle state of one background Sub-Agent. With no subagent_id, lists known tasks as summaries. Set include_output=true only when you need the full logs/result (capped at 100K tokens). Status values: running, completed, stopped, failed.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    subagent_id: { type: "string", description: "Optional Sub-Agent ID returned by sub_agent. Omit to list known Sub-Agents." },
+                    include_output: { type: "boolean", description: "When true and subagent_id is provided, include full latest log/final result/error. Defaults to false for lightweight status checks." }
+                }
+            }
+        },
+        {
+            name: "stop_subagent",
+            description: "Stop one running background Sub-Agent by its subagent_id. This only stops that Sub-Agent and does not cancel the main conversation or other tasks.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    subagent_id: { type: "string", description: "The running Sub-Agent ID to stop." }
+                },
+                required: ["subagent_id"]
+            }
+        },
+        {
+            name: "kill_subagent",
+            description: "Immediately abort one running background Sub-Agent to release its execution resources. Use this when the user asks to kill, cancel, or stop a Sub-Agent that may otherwise keep consuming resources. The task record remains queryable with get_subagent_status.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    subagent_id: { type: "string", description: "The running Sub-Agent ID to kill." }
+                },
+                required: ["subagent_id"]
+            }
+        },
+
+        {
+            name: "rerun_subagent",
+            description: "Retry a completed, stopped, or failed Sub-Agent in place. Keeps the same subagent_id, clears previous logs/result for that ID, and restarts with the original task configuration.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    subagent_id: { type: "string", description: "The completed, stopped, or failed Sub-Agent ID to retry." }
+                },
+                required: ["subagent_id"]
+            }
+        },
+
         {
             name: "list_agents",
             description: "List all pre-configured professional Agents (System Prompts). You can optionally provide an 'agent_name' to inspect its system prompt and capabilities before summoning it.",
@@ -854,7 +1182,7 @@ IMPORTANT:
                 type: "object",
                 properties: {
                     name: { type: "string", description: "Task name: concise, clear, and unique." },
-                    instruction: { type: "string", description: "The specific, self-contained prompt sent to the AI when the schedule triggers. Since it executes autonomously without human interaction, the instruction MUST be highly detailed and actionable. Explicitly state the exact goal, what tools to invoke (e.g., 'Use web_search to find...', 'Use write_file to save...'), and the desired output format. Example: 'Search the web for today's AI news, summarize the top 3 items in a markdown list, and save the result as a local file to...'" },
+                    instruction: { type: "string", description: "The specific, self-contained prompt sent to the AI when the schedule triggers. Since it executes autonomously without human interaction, the instruction MUST be highly detailed and actionable. Explicitly state the exact goal, what tools to invoke (e.g., 'Use builtin_web_search to find...', 'Use write_file to save...'), and the desired output format. Example: 'Search the web for today's AI news, summarize the top 3 items in a markdown list, and save the result as a local file to...'" },
                     agent_name: { type: "string", description: "Optional. Name of the Quick Prompt to use. Defaults to '__DEFAULT__'." },
                     schedule_type: {
                         type: "string", enum: ["interval", "daily", "weekly", "monthly", "single"],
@@ -1521,6 +1849,7 @@ ${userContext || 'No additional context provided.'}
                 apiKey: apiKey,
                 model: requestModelName,
                 apiType: currentApiType,
+                retryCount: Number.isInteger(providerInfo.retryCount) ? providerInfo.retryCount : 3,
                 headers: providerHeaders,
                 messages: messages,
                 tools: availableTools.length > 0 ? availableTools : undefined,
@@ -1651,6 +1980,7 @@ ${userContext || 'No additional context provided.'}
             apiKey: apiKey,
             model: requestModelName,
             apiType: currentApiType,
+            retryCount: Number.isInteger(providerInfo.retryCount) ? providerInfo.retryCount : 3,
             headers: providerHeaders,
             messages: messages,
             tools: availableTools.length > 0 ? availableTools : undefined,
@@ -2662,26 +2992,31 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
     },
 
     // Web Search Handler
-    web_search: async ({ query, count = 5, language = 'zh-CN' }, context, signal) => {
+    builtin_web_search: async ({ query, count = 5, language = 'zh-CN' }, context, signal) => {
         try {
             const limit = Math.min(Math.max(parseInt(count) || 5, 1), 10);
 
             let ddgRegion = 'cn-zh';
             let acceptLang = 'zh-CN,zh;q=0.9,en;q=0.8';
+            let bingMarket = 'zh-CN';
 
             const langInput = (language || '').toLowerCase();
             if (langInput.includes('en') || langInput.includes('us')) {
                 ddgRegion = 'us-en';
                 acceptLang = 'en-US,en;q=0.9';
+                bingMarket = 'en-US';
             } else if (langInput.includes('jp') || langInput.includes('ja')) {
                 ddgRegion = 'jp-jp';
                 acceptLang = 'ja-JP,ja;q=0.9,en;q=0.8';
+                bingMarket = 'ja-JP';
             } else if (langInput.includes('ru')) {
                 ddgRegion = 'ru-ru';
                 acceptLang = 'ru-RU,ru;q=0.9,en;q=0.8';
+                bingMarket = 'ru-RU';
             } else if (langInput === 'all' || langInput === 'world') {
                 ddgRegion = 'wt-wt';
                 acceptLang = 'en-US,en;q=0.9';
+                bingMarket = 'en-WW';
             }
 
             const headers = {
@@ -2698,10 +3033,80 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
                 return str
                     .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
                     .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ")
-                    .replace(/<b>/g, "").replace(/<\/b>/g, "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+                    .replace(/<b>/g, "").replace(/<\/b>/g, "")
+                    .replace(/<strong>/g, "").replace(/<\/strong>/g, "")
+                    .replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+            };
+
+            const parseDuckDuckGoResults = (html) => {
+                const parsed = [];
+                const titleLinkRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+                const snippetRegex = /class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|div)>/g;
+                const titles = [...html.matchAll(titleLinkRegex)];
+                const snippets = [...html.matchAll(snippetRegex)];
+
+                for (let i = 0; i < titles.length && i < limit; i++) {
+                    let link = titles[i][1];
+                    const titleRaw = titles[i][2];
+                    const snippetRaw = snippets[i] ? snippets[i][1] : "";
+
+                    try {
+                        if (link.includes('uddg=')) {
+                            const urlObj = new URL(link, "https://html.duckduckgo.com");
+                            const uddg = urlObj.searchParams.get("uddg");
+                            if (uddg) link = decodeURIComponent(uddg);
+                        }
+                    } catch (e) { }
+
+                    parsed.push({
+                        title: decodeHtml(titleRaw),
+                        link: link,
+                        snippet: decodeHtml(snippetRaw)
+                    });
+                }
+
+                return parsed.filter(item => item.title && item.link);
+            };
+
+            const parseBingResults = (html) => {
+                const parsed = [];
+                const resultRegex = /<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>([\s\S]*?)<\/li>/g;
+                const blocks = [...html.matchAll(resultRegex)];
+
+                const extractBingSnippet = (block) => {
+                    const candidates = [
+                        block.match(/<div[^>]*class="[^"]*b_caption[^"]*"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i),
+                        block.match(/<p[^>]*>([\s\S]*?)<\/p>/i),
+                        block.match(/<div[^>]*class="[^"]*(?:b_lineclamp\d*|b_snippet|b_caption)[^"]*"[^>]*>([\s\S]*?)<\/div>/i),
+                        block.match(/<span[^>]*class="[^"]*(?:b_lineclamp\d*|b_snippet)[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
+                    ];
+                    for (const candidate of candidates) {
+                        const snippet = decodeHtml(candidate ? candidate[1] : "");
+                        if (snippet) return snippet;
+                    }
+
+                    const withoutTitle = block.replace(/<h2[\s\S]*?<\/h2>/i, ' ');
+                    const fallbackText = decodeHtml(withoutTitle);
+                    return fallbackText.length > 240 ? `${fallbackText.slice(0, 240).trim()}...` : fallbackText;
+                };
+
+                for (let i = 0; i < blocks.length && parsed.length < limit; i++) {
+                    const block = blocks[i][1] || "";
+                    const titleMatch = block.match(/<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+                    if (!titleMatch) continue;
+                    parsed.push({
+                        title: decodeHtml(titleMatch[2]),
+                        link: titleMatch[1],
+                        snippet: extractBingSnippet(block)
+                    });
+                }
+
+                return parsed.filter(item => item.title && item.link);
             };
 
             let results = [];
+            let searchRequestFailed = null;
+            let fallbackUsed = false;
 
             try {
                 const body = new URLSearchParams();
@@ -2716,40 +3121,50 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
                     signal: signal
                 });
 
-                const html = await response.text();
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+                }
 
-                // 放宽类名匹配，并同时兼容 <a> 和 <div> 标签结尾
-                const titleLinkRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-                const snippetRegex = /class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|div)>/g;
-                
-                const titles = [...html.matchAll(titleLinkRegex)];
-                const snippets = [...html.matchAll(snippetRegex)];
-                
-                for (let i = 0; i < titles.length && i < limit; i++) {
-                    let link = titles[i][1];
-                    const titleRaw = titles[i][2];
-                    const snippetRaw = snippets[i] ? snippets[i][1] : "";
-                    
-                    try {
-                        if (link.includes('uddg=')) {
-                            const urlObj = new URL(link, "https://html.duckduckgo.com");
-                            const uddg = urlObj.searchParams.get("uddg");
-                            if (uddg) link = decodeURIComponent(uddg);
-                        }
-                    } catch (e) { }
-                    
-                    results.push({
-                        title: decodeHtml(titleRaw),
-                        link: link,
-                        snippet: decodeHtml(snippetRaw)
+                const html = await response.text();
+                results = parseDuckDuckGoResults(html);
+            } catch (e) {
+                searchRequestFailed = e;
+            }
+
+            if (results.length === 0 && searchRequestFailed) {
+                try {
+                    fallbackUsed = true;
+                    const bingHeaders = {
+                        "User-Agent": headers["User-Agent"],
+                        "Accept": headers["Accept"],
+                        "Accept-Language": acceptLang,
+                        "Referer": "https://www.bing.com/"
+                    };
+                    const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=${encodeURIComponent(bingMarket)}&mkt=${encodeURIComponent(bingMarket)}`;
+                    const response = await fetch(bingUrl, {
+                        method: 'GET',
+                        headers: bingHeaders,
+                        signal: signal
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+                    }
+
+                    const html = await response.text();
+                    results = parseBingResults(html);
+                } catch (fallbackError) {
+                    return JSON.stringify({
+                        message: "Web search request failed. Please check your network or proxy settings.",
+                        query: query,
+                        error: searchRequestFailed.message,
+                        fallbackError: fallbackError.message
                     });
                 }
-            } catch (e) {
-                console.warn("DDG fetch error:", e);
             }
 
             if (results.length === 0) {
-                if (ddgRegion === 'cn-zh') return JSON.stringify({ message: "No results found in Chinese region. Try setting language='en' or 'all'.", query: query });
+                if (ddgRegion === 'cn-zh') return JSON.stringify({ message: fallbackUsed ? "No results found from Bing fallback." : "No results found in Chinese region. Try setting language='en' or 'all'.", query: query });
                 return JSON.stringify({ message: "No results found.", query: query });
             }
             return JSON.stringify(results, null, 2);
@@ -2760,7 +3175,7 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
     },
 
     // Web Fetch Handler
-    web_fetch: async ({ url, offset = 0, length = MAX_READ }, context, signal) => {
+    builtin_web_fetch: async ({ url, offset = 0, length = MAX_READ }, context, signal) => {
         try {
             if (!url || !url.startsWith('http')) {
                 return "Error: Invalid URL. Please provide a full URL starting with http:// or https://";
@@ -2795,7 +3210,7 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
                 try {
                     markdownBody = await convertHtmlWithMarkitdownJs(rawText, url);
                 } catch (markitdownError) {
-                    console.warn('[web_fetch] markitdown-js conversion failed, fallback to legacy converter:', markitdownError?.message || markitdownError);
+                    console.warn('[builtin_web_fetch] markitdown-js conversion failed, fallback to legacy converter:', markitdownError?.message || markitdownError);
                     markdownBody = convertHtmlToMarkdown(rawText, url);
                 }
                 if (!markdownBody || markdownBody.length < 50) {
@@ -2815,7 +3230,7 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
                 const nextOffset = startPos + contentChunk.length;
                 result += `\n\n--- [SYSTEM NOTE: CONTENT TRUNCATED] ---\n`;
                 result += `Total characters: ${totalChars}. Current chunk: ${startPos}-${nextOffset}.\n`;
-                result += `Remaining: ${remainingChars}. Call 'web_fetch' with offset=${nextOffset} to read more.\n`;
+                result += `Remaining: ${remainingChars}. Call 'builtin_web_fetch' with offset=${nextOffset} to read more.\n`;
             } else if (startPos > 0) {
                 result += `\n\n--- [SYSTEM NOTE: END OF PAGE REACHED] ---`;
             }
@@ -2826,13 +3241,24 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
         }
     },
 
-    // Sub Agent Handler
-    sub_agent: async (args, globalContext, signal) => {
+    // Background Sub-Agent handlers
+    sub_agent: async (args, globalContext) => {
         if (!globalContext || !globalContext.apiKey) {
             return "Error: Sub-Agent requires global context(should be in a chat session).";
         }
-        return await runSubAgent(args, globalContext, signal);
+        if (!resolveSubAgentOwnerId(globalContext, args)) {
+            return "Error: Sub-Agent requires conversation_owner_id for session isolation.";
+        }
+        const task = await createBackgroundSubAgent(args, globalContext);
+        if (task?.error) return `Error: ${task.error}`;
+        return task.subagent_id;
     },
+    get_subagent_status: async (args = {}, context = null) => getSubAgentStatus(args, context),
+    rerun_subagent: async (args = {}, context = null) => rerunSubAgent(args, context),
+
+    stop_subagent: async (args = {}, context = null) => stopSubAgent(args, context),
+    kill_subagent: async (args = {}, context = null) => killSubAgent(args, context),
+
 
     // --- Agent Collaboration Handlers ---
     list_agents: async (args, context, signal) => {
@@ -3189,7 +3615,7 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
                 enabled: enabled,
                 intervalMinutes: 60, intervalStartTime: '00:00', intervalTimeRanges: [],
                 dailyTime: '12:00', weeklyDays: [1, 2, 3, 4, 5], weeklyTime: '12:00', monthlyDays: [1], monthlyTime: '12:00',
-                extraMcp: [], extraSkills: [], autoSave: true, autoClose: true, history: [],
+                extraMcp: [], extraSkills: [], autoSave: true, autoClose: false, history: [],
                 lastRunTime: enabled ? Date.now() : 0,
                 singleDate: single_date || new Date().toISOString().split('T')[0],
                 singleTime: '12:00',

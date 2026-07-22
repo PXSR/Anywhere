@@ -1,18 +1,341 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount, nextTick, watch, h, computed, defineAsyncComponent } from 'vue';
-import { ElContainer, ElMain, ElDialog, ElImageViewer, ElMessage, ElMessageBox, ElInput, ElButton, ElCheckbox, ElButtonGroup, ElTag, ElTooltip, ElIcon, ElAvatar, ElSwitch, ElSelect, ElOption } from 'element-plus';
-import { createClient } from "webdav/web";
-import { DocumentCopy, QuestionFilled, Download, Search, Tools, CaretRight, Collection, Warning, Cpu, ArrowUp, ArrowDown, Refresh } from '@element-plus/icons-vue';
+  import { ArrowDown, ArrowUp, CaretRight, Collection, Cpu, DocumentCopy, Download, QuestionFilled, Refresh, Search, Tools, Warning } from '@element-plus/icons-vue';
+  import { ElAvatar, ElButton, ElCheckbox, ElContainer, ElDialog, ElIcon, ElImageViewer, ElInput, ElMain, ElMessage, ElMessageBox, ElOption, ElSelect, ElSwitch, ElTag, ElTooltip } from 'element-plus';
+  import { computed, defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+  import { createClient } from "webdav/web";
 
-import TitleBar from './components/TitleBar.vue';
-import ChatHeader from './components/ChatHeader.vue';
-const ChatMessage = defineAsyncComponent(() => import('./components/ChatMessage.vue'));
+  import ChatHeader from './components/ChatHeader.vue';
 import ChatInput from './components/ChatInput.vue';
 import ModelSelectionDialog from './components/ModelSelectionDialog.vue';
 import TaskPanel from './components/TaskPanel.vue';
+  import TitleBar from './components/TitleBar.vue';
+  const ChatMessage = defineAsyncComponent(() => import('./components/ChatMessage.vue'));
 
 import TextSearchUI from './utils/TextSearchUI.js';
-import { formatTimestamp, sanitizeToolArgs, sanitizeToolFunctionName } from './utils/formatters.js';
+import { formatTimestamp, formatToolResult, sanitizeToolArgs, sanitizeToolFunctionName } from './utils/formatters.js';
+
+const conversationOwnerId = ref('');
+
+const ensureConversationOwnerId = () => {
+  if (typeof conversationOwnerId.value === 'string' && conversationOwnerId.value.trim()) {
+    return conversationOwnerId.value.trim();
+  }
+  const nextId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+    ? `conv_${crypto.randomUUID()}`
+    : `conv_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  conversationOwnerId.value = nextId;
+  return nextId;
+};
+
+const withConversationOwnerContext = (context = null) => {
+  const ownerId = ensureConversationOwnerId();
+  const base = context && typeof context === 'object' ? { ...context } : {};
+  base.conversationOwnerId = ownerId;
+  return base;
+};
+
+const withConversationOwnerArgs = (args = {}) => {
+  const ownerId = ensureConversationOwnerId();
+  const nextArgs = args && typeof args === 'object' ? { ...args } : {};
+  nextArgs.conversation_owner_id = ownerId;
+  return nextArgs;
+};
+
+const subAgentTasks = ref([]);
+let subAgentStatusPollTimer = null;
+
+const unwrapSubAgentToolText = (value) => {
+  let current = formatToolResult(value);
+  for (let index = 0; index < 2; index += 1) {
+    try {
+      const parsed = JSON.parse(current);
+      if (Array.isArray(parsed)) {
+        const text = parsed.find((item) => item?.type === 'text' && typeof item.text === 'string')?.text;
+        if (text) {
+          current = text;
+          continue;
+        }
+      }
+    } catch {
+      // The tool already returned plain text.
+    }
+    break;
+  }
+  return current;
+};
+
+const parseSubAgentStatus = (value) => {
+  try {
+    const parsed = JSON.parse(unwrapSubAgentToolText(value));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const upsertSubAgentTask = (snapshot) => {
+  if (!snapshot?.subagent_id) return;
+  const normalized = { ...snapshot };
+  const index = subAgentTasks.value.findIndex((item) => item.subagent_id === normalized.subagent_id);
+  if (index >= 0) subAgentTasks.value.splice(index, 1, { ...subAgentTasks.value[index], ...normalized });
+  else subAgentTasks.value.unshift(normalized);
+};
+
+const registerSubAgentFromToolContent = (toolContent, taskText = '') => {
+  const idMatch = String(toolContent || '').match(/(subagent_[\w-]+)/i);
+  if (!idMatch) return;
+  upsertSubAgentTask({
+    subagent_id: idMatch[1],
+    status: 'running',
+    task: typeof taskText === 'string' && taskText.trim() ? taskText.trim() : '后台 Sub-Agent'
+  });
+  void refreshSubAgentStatuses();
+  scheduleAutoSave({ reason: 'subagent-registered', immediate: true });
+};
+
+
+const normalizeSubAgentSummary = (task) => {
+  if (!task || typeof task !== 'object') return null;
+  const id = typeof task.subagent_id === 'string' ? task.subagent_id.trim() : '';
+  if (!id) return null;
+  return {
+    subagent_id: id,
+    status: task.status || 'running',
+    task: typeof task.task === 'string' ? task.task : '后台 Sub-Agent',
+    model_route: task.model_route || '',
+    model_name: task.model_name || '',
+    provider_name: task.provider_name || '',
+    created_at: task.created_at || null,
+    started_at: task.started_at || null,
+    finished_at: task.finished_at || null,
+    updated_at: task.updated_at || null
+  };
+};
+
+const restoreSubAgentTasksFromSession = (sessionData = {}) => {
+  const restoredTasks = Array.isArray(sessionData.subAgentTasks)
+    ? sessionData.subAgentTasks.map(normalizeSubAgentSummary).filter(Boolean)
+    : [];
+  subAgentTasks.value = restoredTasks;
+  const restoredDetails = sessionData.subAgentDetails && typeof sessionData.subAgentDetails === 'object' && !Array.isArray(sessionData.subAgentDetails)
+    ? sessionData.subAgentDetails
+    : {};
+  const allowedIds = new Set(restoredTasks.map((item) => item.subagent_id));
+  const nextDetails = {};
+  Object.entries(restoredDetails).forEach(([id, detail]) => {
+    if (allowedIds.has(id) && detail && typeof detail === 'object') nextDetails[id] = detail;
+  });
+  subAgentDetails.value = nextDetails;
+  closeSubAgentDetailFromInput();
+  void refreshSubAgentStatuses();
+};
+
+const clearSubAgentSessionState = () => {
+  subAgentTasks.value = [];
+  subAgentDetails.value = {};
+  closeSubAgentDetailFromInput();
+};
+
+const refreshSubAgentStatuses = async () => {
+  if (!window.api?.invokeMcpTool || subAgentTasks.value.length === 0) return;
+  await Promise.all(subAgentTasks.value.map(async (task) => {
+    try {
+      const response = await window.api.invokeMcpTool(
+        'get_subagent_status',
+        withConversationOwnerArgs({ subagent_id: task.subagent_id }),
+        null,
+        withConversationOwnerContext()
+      );
+      const snapshot = parseSubAgentStatus(response);
+      if (snapshot?.subagent_id) {
+        upsertSubAgentTask(snapshot);
+        return;
+      }
+      if (snapshot?.error) {
+        if (task.status === 'running') {
+          upsertSubAgentTask({ ...task, status: 'stopped', finished_at: Date.now(), updated_at: Date.now() });
+        }
+      }
+    } catch (error) {
+      console.warn('[Sub-Agent] Failed to refresh status:', error);
+    }
+  }));
+};
+
+const subAgentDetails = ref({});
+
+const loadSubAgentDetail = async (subagentId) => {
+  if (!subagentId || !window.api?.invokeMcpTool) return;
+  try {
+    const response = await window.api.invokeMcpTool(
+      'get_subagent_status',
+      withConversationOwnerArgs({
+        subagent_id: subagentId,
+        include_output: true
+      }),
+      null,
+      withConversationOwnerContext()
+    );
+    const snapshot = parseSubAgentStatus(response);
+    if (!snapshot?.subagent_id) return;
+    subAgentDetails.value = { ...subAgentDetails.value, [snapshot.subagent_id]: snapshot };
+    upsertSubAgentTask({
+      subagent_id: snapshot.subagent_id,
+      status: snapshot.status,
+      task: snapshot.task,
+      model_route: snapshot.model_route,
+      model_name: snapshot.model_name,
+      provider_name: snapshot.provider_name,
+      created_at: snapshot.created_at,
+      started_at: snapshot.started_at,
+      finished_at: snapshot.finished_at,
+      updated_at: snapshot.updated_at
+    });
+  } catch (error) {
+    console.warn('[Sub-Agent] Failed to load detail:', error);
+  }
+};
+
+
+const startSubAgentStatusPolling = () => {
+  if (subAgentStatusPollTimer) return;
+  subAgentStatusPollTimer = window.setInterval(() => void refreshSubAgentStatuses(), 1500);
+};
+
+const selectedSubAgentDetailId = ref('');
+let subAgentDetailPollTimer = null;
+
+const closeSubAgentDetailFromInput = () => {
+  selectedSubAgentDetailId.value = '';
+  if (subAgentDetailPollTimer) {
+    window.clearInterval(subAgentDetailPollTimer);
+    subAgentDetailPollTimer = null;
+  }
+};
+
+const openSubAgentDetailFromInput = async (subagentId) => {
+  selectedSubAgentDetailId.value = subagentId;
+  await loadSubAgentDetail(subagentId);
+  if (subAgentDetailPollTimer) return;
+  subAgentDetailPollTimer = window.setInterval(() => {
+    const task = subAgentTasks.value.find((item) => item.subagent_id === selectedSubAgentDetailId.value);
+    if (!selectedSubAgentDetailId.value) return;
+    if (!task || task.status !== 'running') {
+      if (subAgentDetailPollTimer) {
+        window.clearInterval(subAgentDetailPollTimer);
+        subAgentDetailPollTimer = null;
+      }
+      return;
+    }
+    void loadSubAgentDetail(task.subagent_id);
+  }, 2500);
+};
+
+
+const stopSubAgentFromInput = async (subagentId) => {
+  if (!subagentId || !window.api?.invokeMcpTool) return;
+  try {
+    const response = await window.api.invokeMcpTool(
+      'kill_subagent',
+      withConversationOwnerArgs({ subagent_id: subagentId }),
+      null,
+      withConversationOwnerContext()
+    );
+    const snapshot = parseSubAgentStatus(response);
+    if (snapshot?.subagent_id) upsertSubAgentTask(snapshot);
+    await refreshSubAgentStatuses();
+    if (selectedSubAgentDetailId.value === subagentId) await loadSubAgentDetail(subagentId);
+  } catch (error) {
+    showDismissibleMessage.error(`结束 Sub-Agent 失败：${error?.message || error}`);
+  }
+};
+
+const acknowledgeSubAgentFromInput = (subagentId) => {
+  const index = subAgentTasks.value.findIndex((task) => task.subagent_id === subagentId);
+  if (index >= 0) subAgentTasks.value.splice(index, 1);
+  if (subagentId && subAgentDetails.value[subagentId]) {
+    const next = { ...subAgentDetails.value };
+    delete next[subagentId];
+    subAgentDetails.value = next;
+  }
+  if (selectedSubAgentDetailId.value === subagentId) closeSubAgentDetailFromInput();
+};
+
+const acknowledgeAllFinishedSubAgentsFromInput = () => {
+  const keepRunning = [];
+  const removedIds = new Set();
+  subAgentTasks.value.forEach((task) => {
+    if (task?.status === 'running') keepRunning.push(task);
+    else if (task?.subagent_id) removedIds.add(task.subagent_id);
+  });
+  subAgentTasks.value = keepRunning;
+  if (removedIds.size > 0) {
+    const nextDetails = { ...subAgentDetails.value };
+    removedIds.forEach((id) => { delete nextDetails[id]; });
+    subAgentDetails.value = nextDetails;
+  }
+  if (selectedSubAgentDetailId.value && removedIds.has(selectedSubAgentDetailId.value)) {
+    closeSubAgentDetailFromInput();
+  }
+  scheduleAutoSave({ reason: 'subagent-ack-all', immediate: true });
+};
+
+const killAllRunningSubAgentsForCurrentConversation = async () => {
+  if (!window.api?.invokeMcpTool) return;
+  const runningTasks = subAgentTasks.value.filter((task) => task?.status === 'running' && task?.subagent_id);
+  if (runningTasks.length === 0) return;
+
+  await Promise.all(runningTasks.map(async (task) => {
+    try {
+      await window.api.invokeMcpTool(
+        'kill_subagent',
+        withConversationOwnerArgs({ subagent_id: task.subagent_id }),
+        null,
+        withConversationOwnerContext()
+      );
+      upsertSubAgentTask({
+        ...task,
+        status: 'stopped',
+        finished_at: Date.now(),
+        updated_at: Date.now()
+      });
+    } catch (error) {
+      console.warn('[Sub-Agent] Failed to kill on conversation close:', task.subagent_id, error);
+      upsertSubAgentTask({
+        ...task,
+        status: 'stopped',
+        finished_at: Date.now(),
+        updated_at: Date.now()
+      });
+    }
+  }));
+};
+
+const rerunSubAgentFromInput = async (subagentId) => {
+  if (!subagentId || !window.api?.invokeMcpTool) return;
+  try {
+    const response = await window.api.invokeMcpTool(
+      'rerun_subagent',
+      withConversationOwnerArgs({ subagent_id: subagentId }),
+      null,
+      withConversationOwnerContext()
+    );
+    const returnedId = String(formatToolResult(response) || '').match(/(subagent_[\w-]+)/i)?.[1];
+    if (returnedId !== subagentId) throw new Error('重新运行未保持当前 Sub-Agent ID');
+    if (subAgentDetails.value[subagentId]) {
+      const next = { ...subAgentDetails.value };
+      delete next[subagentId];
+      subAgentDetails.value = next;
+    }
+    upsertSubAgentTask({ subagent_id: subagentId, status: 'running', task: '后台 Sub-Agent' });
+    void refreshSubAgentStatuses();
+    if (selectedSubAgentDetailId.value === subagentId) void openSubAgentDetailFromInput(subagentId);
+  } catch (error) {
+    showDismissibleMessage.error(`重新运行 Sub-Agent 失败：${error?.message || error}`);
+  }
+};
+
+
 
 let gptTokenizerEncodePromise = null;
 const loadGptTokenizerEncode = () => {
@@ -107,6 +430,15 @@ const centerActiveNavNode = async (targetIndex = focusedMessageIndex.value) => {
 
 // 核心状态：是否粘滞在底部
 const isSticky = ref(true);
+let chatObserver = null;    // ResizeObserver 实例，用于兜底监听消息高度变化
+let stickyObservedContainer = null;
+let stickyObservedMessage = null;
+let stickyScrollGuardUntil = 0;
+let lastUserScrollIntentAt = 0;
+let lastKnownChatScrollTop = 0;
+let stickyScrollRafIds = [];
+const STICKY_SCROLL_GUARD_MS = 220;
+const USER_SCROLL_INTENT_MS = 260;
 
 const AUTO_SAVE_INPUT_DEBOUNCE_MS = 800;
 const AUTO_SAVE_LOADING_THROTTLE_MS = 2500;
@@ -137,15 +469,76 @@ const getMessageElementByIndex = (index) => {
   return target?.$el?.nodeType === 1 ? target.$el : null;
 };
 
+const getLastMessageElement = () => {
+  const lastIndex = getLastNavigableMessageIndex();
+  return lastIndex === null || lastIndex === undefined
+    ? null
+    : getMessageElementByIndex(lastIndex);
+};
+
+
+const normalizeModelDialogProviderCollapseStates = (input, providerNames = []) => {
+  const nextStates = {};
+  const source = input && typeof input === 'object' ? input : {};
+  const providerSet = new Set(providerNames.filter(Boolean));
+
+  providerSet.forEach((providerName) => {
+    nextStates[providerName] = typeof source[providerName] === 'boolean' ? source[providerName] : true;
+  });
+
+  return nextStates;
+};
+
+const syncModelDialogProviderCollapseStates = (config) => {
+  const providerNames = (modelList.value || [])
+    .map(item => item?.providerName || String(item?.label || '').split('|')[0])
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index);
+
+  const savedStates = config?.ui?.windowModelDialogProviderCollapseStates;
+  const normalizedStates = normalizeModelDialogProviderCollapseStates(savedStates, providerNames);
+  const prevSerialized = JSON.stringify(modelDialogProviderCollapseStates.value || {});
+  const nextSerialized = JSON.stringify(normalizedStates);
+
+  if (prevSerialized !== nextSerialized) {
+    modelDialogProviderCollapseStates.value = normalizedStates;
+  }
+
+  return normalizedStates;
+};
+
+const handleProviderCollapseStatesChange = async (nextStates) => {
+  const normalizedStates = normalizeModelDialogProviderCollapseStates(
+    nextStates,
+    (modelList.value || []).map(item => item?.providerName || String(item?.label || '').split('|')[0])
+  );
+  const prevSerialized = JSON.stringify(modelDialogProviderCollapseStates.value || {});
+  const nextSerialized = JSON.stringify(normalizedStates);
+
+  if (prevSerialized === nextSerialized) {
+    return;
+  }
+
+  modelDialogProviderCollapseStates.value = normalizedStates;
+  currentConfig.value.ui = currentConfig.value.ui || {};
+  currentConfig.value.ui.windowModelDialogProviderCollapseStates = normalizedStates;
+
+  try {
+    await window.api.saveSetting('ui.windowModelDialogProviderCollapseStates', normalizedStates);
+  } catch (error) {
+    console.warn('保存模型弹窗折叠状态失败', error);
+  }
+};
+
 const updateModelListAndMap = (config) => {
   const newModelList = [];
   const newModelMap = {};
-  
+
   const folders = config.providerFolders || {};
   const order = config.providerOrder || [];
-  
+
   // 1. 文件夹按字母序排序
-  const sortedFolderIds = Object.keys(folders).sort((a, b) => 
+  const sortedFolderIds = Object.keys(folders).sort((a, b) =>
     (folders[a].name || '').localeCompare(folders[b].name || '')
   );
 
@@ -167,16 +560,27 @@ const updateModelListAndMap = (config) => {
   orderedProviderIds.forEach(id => {
     const provider = config.providers[id];
     if (provider?.enable) {
+      const providerName = String(provider.name || id);
       provider.modelList.forEach(m => {
         const key = `${id}|${m}`;
-        newModelList.push({ key, value: key, label: `${provider.name}|${m}` });
-        newModelMap[key] = `${provider.name}|${m}`;
+        newModelList.push({
+          key,
+          value: key,
+          label: `${providerName}|${m}`,
+          providerName,
+          modelName: String(m || ''),
+          providerId: String(id),
+          providerUrl: String(provider.url || ''),
+          providerApiKey: String(provider.api_key || '')
+        });
+        newModelMap[key] = `${providerName}|${m}`;
       });
     }
   });
 
   modelList.value = newModelList;
   modelMap.value = newModelMap;
+  syncModelDialogProviderCollapseStates(config);
 };
 
 const urlParams = new URLSearchParams(window.location.search);
@@ -204,6 +608,53 @@ const autoCloseOnBlur = ref(false);
 const modelList = ref([]);
 const modelMap = ref({});
 const model = ref("");
+
+const currentModelLogo = ref('');
+let modelLogoResolveToken = 0;
+
+const getCurrentModelNameForLogo = (modelValue = model.value) => {
+  const parts = String(modelValue || '').split('|');
+  return (parts[1] || parts[0] || '').trim();
+};
+
+const resolveCurrentModelLogo = async (modelValue = model.value) => {
+  const modelName = getCurrentModelNameForLogo(modelValue);
+  const requestToken = ++modelLogoResolveToken;
+
+  if (!modelName) {
+    currentModelLogo.value = '';
+    return;
+  }
+
+  try {
+    const response = await fetch(`https://llm-model.141277.xyz/v1/resolve?model=${encodeURIComponent(modelName)}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const logo = typeof payload?.resolved?.logo === 'string' ? payload.resolved.logo.trim() : '';
+    const shouldUseLogo = /^https?:\/\//i.test(logo);
+
+    if (requestToken === modelLogoResolveToken) {
+      currentModelLogo.value = shouldUseLogo ? logo : '';
+    }
+  } catch (error) {
+    if (requestToken === modelLogoResolveToken) {
+      currentModelLogo.value = '';
+    }
+  }
+};
+
+const handleModelLogoError = () => {
+  currentModelLogo.value = '';
+};
+
+watch(model, (nextModel) => {
+  resolveCurrentModelLogo(nextModel);
+}, { immediate: false });
+
+const modelDialogProviderCollapseStates = ref({});
 const isAlwaysOnTop = ref(true);
 const currentOS = ref('win');
 const currentTaskConfig = ref(null);
@@ -328,21 +779,8 @@ const getConversationDisplayName = () => {
 };
 
 const getSessionMetadata = () => {
-  const timestamps = [];
-  chat_show.value.forEach((message) => {
-    const candidates = [message?.timestamp, message?.completedTimestamp, message?.updatedAt, message?.createdAt];
-    candidates.forEach((candidate) => {
-      const normalized = normalizeSessionTimestamp(candidate);
-      if (normalized) timestamps.push(normalized);
-    });
-  });
-
-  timestamps.sort((a, b) => new Date(a) - new Date(b));
-
   return {
     title: getConversationDisplayName(),
-    createdAt: timestamps[0] || new Date().toISOString(),
-    updatedAt: timestamps[timestamps.length - 1] || new Date().toISOString(),
   };
 };
 
@@ -709,6 +1147,22 @@ const expandedMcpServers = ref(new Set());
 
 const lastAppliedMcpConfigFingerprint = ref('');
 
+  const stableComparableValue = (value) => {
+    if (Array.isArray(value)) return value.map(stableComparableValue);
+    if (value && typeof value === 'object') {
+      return Object.keys(value).sort().reduce((acc, key) => {
+        if (key === 'clientSecret') {
+          acc[key] = value[key] ? '__present__' : '';
+          return acc;
+        }
+        const item = stableComparableValue(value[key]);
+        if (item !== undefined) acc[key] = item;
+        return acc;
+      }, {});
+    }
+    return value;
+  };
+
 const buildComparableMcpServerConfig = (server = {}) => ({
   type: server?.type || '',
   command: server?.command || '',
@@ -720,6 +1174,7 @@ const buildComparableMcpServerConfig = (server = {}) => ({
   headers: server?.headers && typeof server.headers === 'object'
     ? Object.entries(server.headers).sort(([a], [b]) => String(a).localeCompare(String(b)))
     : [],
+  auth: stableComparableValue(server?.auth || null),
   isPersistent: Boolean(server?.isPersistent),
   timeoutSeconds: Number(server?.timeoutSeconds) || 120
 });
@@ -765,7 +1220,8 @@ const refreshSelectedMcpServers = async () => {
       baseUrl: serverConf.baseUrl,
       env: serverConf.env,
       headers: serverConf.headers,
-      args: serverConf.args
+      args: serverConf.args,
+      auth: serverConf.auth,
     };
 
     const res = await window.api.testMcpConnection(configToTest);
@@ -1126,6 +1582,11 @@ const findFocusedMessageIndex = () => {
   else if (isSticky.value || isAtBottom.value) focusedMessageIndex.value = getLastNavigableMessageIndex();
 };
 
+const markUserScrollIntent = () => {
+  lastUserScrollIntentAt = Date.now();
+};
+
+
 // 滚动监听：仅负责更新 isSticky 状态和 UI 按钮显示
 const handleScroll = (event) => {
   if (isForcingScroll.value) return;
@@ -1136,6 +1597,9 @@ const handleScroll = (event) => {
   // 计算距离底部的距离
   const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
   const tolerance = 20; // 容差值
+  const previousScrollTop = lastKnownChatScrollTop;
+  const scrollTopDelta = el.scrollTop - previousScrollTop;
+  lastKnownChatScrollTop = el.scrollTop;
 
   // 核心逻辑：用户只要向上滚动离开底部，就取消粘滞；一旦触底，重新激活粘滞
   const atBottom = distanceToBottom <= tolerance;
@@ -1146,6 +1610,19 @@ const handleScroll = (event) => {
     showScrollToBottomButton.value = false;
     focusedMessageIndex.value = getLastNavigableMessageIndex();
   } else {
+    const hasRecentUserIntent = Date.now() - lastUserScrollIntentAt <= USER_SCROLL_INTENT_MS;
+    const isLikelyProgrammaticStickyScroll = isSticky.value
+      && !hasRecentUserIntent
+      && (Date.now() <= stickyScrollGuardUntil || scrollTopDelta >= -1);
+
+    if (isLikelyProgrammaticStickyScroll) {
+      // 流式 Markdown/代码块后续排版会让 scrollHeight 继续增长；不要误判为用户离开底部。
+      isAtBottom.value = true;
+      showScrollToBottomButton.value = false;
+      scheduleStickyScrollFrames();
+      return;
+    }
+
     if (isSticky.value) isSticky.value = false; // 用户主动离开了底部
     if (isAtBottom.value) isAtBottom.value = false;
     showScrollToBottomButton.value = true;
@@ -1193,31 +1670,6 @@ watch(() => chat_show.value.length, () => {
 });
 
 const isCollapsed = (index) => collapsedMessages.value.has(index);
-
-const addCopyButtonsToCodeBlocks = async () => {
-  await nextTick();
-  document.querySelectorAll('.markdown-body pre.hljs').forEach(pre => {
-    if (pre.querySelector('.code-block-copy-button')) return;
-    const codeElement = pre.querySelector('code'); if (!codeElement) return;
-    const wrapper = document.createElement('div'); wrapper.className = 'code-block-wrapper'; pre.parentNode.insertBefore(wrapper, pre); wrapper.appendChild(pre);
-    const codeText = codeElement.textContent || ''; const lines = codeText.trimEnd().split('\n'); const lineCount = lines.length;
-    const copyButtonSVG = `<svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>`;
-    const createButton = (positionClass) => {
-      const button = document.createElement('button'); button.className = `code-block-copy-button ${positionClass}`; button.innerHTML = copyButtonSVG; button.title = 'Copy code';
-      button.addEventListener('click', async (event) => {
-        event.stopPropagation();
-        try {
-          await navigator.clipboard.writeText(codeText.trimEnd());
-          showDismissibleMessage.success('Code copied to clipboard!');
-        }
-        catch (err) { console.error('Failed to copy code:', err); showDismissibleMessage.error('Failed to copy code.'); }
-      });
-      wrapper.appendChild(button);
-    };
-    createButton('code-block-copy-button-bottom');
-    if (lineCount > 3) createButton('code-block-copy-button-top');
-  });
-};
 
 const handleMainClick = async (event) => {
   const target = event.target;
@@ -1332,14 +1784,44 @@ const withTemporaryAutoScroll = (chatContainer, updater) => {
   chatContainer.style.scrollBehavior = previousBehavior || 'smooth';
 };
 
+const markStickyProgrammaticScroll = () => {
+  stickyScrollGuardUntil = Date.now() + STICKY_SCROLL_GUARD_MS;
+};
+
+const clearStickyScrollFrames = () => {
+  stickyScrollRafIds.forEach((id) => cancelAnimationFrame(id));
+  stickyScrollRafIds = [];
+};
+
 const scrollToBottomImmediately = () => {
   const chatContainer = chatContainerRef.value?.$el;
   if (!chatContainer) return;
+  markStickyProgrammaticScroll();
   withTemporaryAutoScroll(chatContainer, () => {
     chatContainer.scrollTop = chatContainer.scrollHeight;
+    lastKnownChatScrollTop = chatContainer.scrollTop;
   });
   isAtBottom.value = true;
   showScrollToBottomButton.value = false;
+};
+
+const scheduleStickyScrollFrames = () => {
+  if (!isSticky.value) return;
+  clearStickyScrollFrames();
+  scrollToBottomImmediately();
+
+  const firstFrameId = requestAnimationFrame(() => {
+    stickyScrollRafIds = stickyScrollRafIds.filter((id) => id !== firstFrameId);
+    if (!isSticky.value) return;
+    scrollToBottomImmediately();
+
+    const secondFrameId = requestAnimationFrame(() => {
+      stickyScrollRafIds = stickyScrollRafIds.filter((id) => id !== secondFrameId);
+      if (isSticky.value) scrollToBottomImmediately();
+    });
+    stickyScrollRafIds.push(secondFrameId);
+  });
+  stickyScrollRafIds.push(firstFrameId);
 };
 
 const scrollChatContainerToMessage = (index, behavior = 'smooth') => {
@@ -1370,7 +1852,7 @@ const keepMessageAnchor = async (messageElement, updater, fallbackToBottom = fal
   if (fallbackToBottom && isSticky.value) {
     await updater();
     await nextTick();
-    scrollToBottomImmediately();
+    scheduleStickyScrollFrames();
     return;
   }
 
@@ -1384,13 +1866,56 @@ const keepMessageAnchor = async (messageElement, updater, fallbackToBottom = fal
   const newElementTop = messageElement.offsetTop;
   withTemporaryAutoScroll(chatContainer, () => {
     chatContainer.scrollTop = newElementTop - originalVisualPosition;
+    lastKnownChatScrollTop = chatContainer.scrollTop;
   });
+};
+
+const ensureStickyResizeObserver = () => {
+  if (chatObserver || typeof ResizeObserver === 'undefined') return chatObserver;
+  chatObserver = new ResizeObserver(() => {
+    if (!isSticky.value) return;
+    if (Date.now() - lastUserScrollIntentAt <= USER_SCROLL_INTENT_MS) return;
+    scheduleStickyScrollFrames();
+  });
+  return chatObserver;
+};
+
+const updateStickyResizeObserver = async () => {
+  await nextTick();
+  const observer = ensureStickyResizeObserver();
+  if (!observer) return;
+
+  const chatContainer = chatContainerRef.value?.$el || null;
+  const lastMessageElement = getLastMessageElement();
+
+  if (stickyObservedContainer !== chatContainer) {
+    if (stickyObservedContainer) observer.unobserve(stickyObservedContainer);
+    stickyObservedContainer = chatContainer;
+    if (stickyObservedContainer) observer.observe(stickyObservedContainer);
+  }
+
+  if (stickyObservedMessage !== lastMessageElement) {
+    if (stickyObservedMessage) observer.unobserve(stickyObservedMessage);
+    stickyObservedMessage = lastMessageElement;
+    if (stickyObservedMessage) observer.observe(stickyObservedMessage);
+  }
+};
+
+const cleanupStickyResizeObserver = () => {
+  clearStickyScrollFrames();
+  if (chatObserver) {
+    chatObserver.disconnect();
+    chatObserver = null;
+  }
+  stickyObservedContainer = null;
+  stickyObservedMessage = null;
 };
 
 const syncStickyScrollAfterRender = () => {
   if (!isSticky.value) return;
   nextTick(() => {
-    scrollToBottomImmediately();
+    updateStickyResizeObserver();
+    scheduleStickyScrollFrames();
   });
 };
 
@@ -1461,25 +1986,96 @@ const handleWindowBlur = () => {
   }
 };
 
+
+const getChatInputTextarea = () => chatInputRef.value?.senderRef?.$refs.textarea || null;
+
+const isVisibleElement = (element) => {
+  if (!(element instanceof Element)) return false;
+  const style = window.getComputedStyle(element);
+  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 || rect.height > 0;
+};
+
+const hasVisibleElement = (selector) => Array.from(document.querySelectorAll(selector)).some(isVisibleElement);
+
+const isEditableElement = (element) => {
+  if (!(element instanceof HTMLElement)) return false;
+  const tagName = element.tagName.toLowerCase();
+  return tagName === 'input' || tagName === 'textarea' || element.isContentEditable;
+};
+
+const isInteractiveElement = (element) => {
+  if (!(element instanceof HTMLElement)) return false;
+  return Boolean(element.closest('button, [role="button"], a[href], select, .el-button, .el-select, .el-checkbox, .el-switch'));
+};
+
+const isChatInputInternalElement = (element) => {
+  if (!(element instanceof Element)) return false;
+  return Boolean(element.closest('.input-footer, .chat-input-area-vertical'));
+};
+
+const hasOpenChatInputSelector = () => hasVisibleElement('.mcp-quick-select, .option-selector-row');
+
+const hasBlockingOverlay = () => {
+  if (
+    systemPromptDialogVisible.value ||
+    changeModel_page.value ||
+    isMcpDialogVisible.value ||
+    isSkillDialogVisible.value ||
+    imageViewerVisible.value
+  ) {
+    return true;
+  }
+
+  return hasVisibleElement('.el-message-box, .el-overlay-message-box, .el-dialog__wrapper, .el-overlay-dialog, .el-image-viewer__wrapper');
+};
+
+const shouldAutoFocusChatInput = () => {
+  const textarea = getChatInputTextarea();
+  if (!textarea) return false;
+  const activeElement = document.activeElement;
+
+  if (!activeElement || activeElement === document.body || activeElement === document.documentElement) {
+    return !hasBlockingOverlay() && !hasOpenChatInputSelector();
+  }
+
+  if (activeElement === textarea) return true;
+
+  if (hasBlockingOverlay() || hasOpenChatInputSelector()) return false;
+
+  if (hasVisibleElement('.editing-wrapper, .text-search-container, .tool-choice-wrapper, .tool-approval-actions')) {
+    return false;
+  }
+
+  if (activeElement.closest?.('.editing-wrapper, .text-search-container, .tool-choice-wrapper, .tool-approval-actions')) {
+    return false;
+  }
+
+  if (isEditableElement(activeElement)) return false;
+
+  if (isInteractiveElement(activeElement) && !isChatInputInternalElement(activeElement)) {
+    return false;
+  }
+
+  return true;
+};
+
+const focusChatInputIfSafe = (options = { cursor: 'end' }) => {
+  if (!shouldAutoFocusChatInput()) return false;
+  chatInputRef.value?.focus(options);
+  return true;
+};
+
 const handleWindowFocus = () => {
   if (isFilePickerOpen.value) {
     isFilePickerOpen.value = false;
   }
   setTimeout(() => {
-    if (systemPromptDialogVisible.value) {
-      return;
-    }
-    if (document.activeElement && document.activeElement.tagName.toLowerCase() === 'textarea' && document.activeElement.closest('.editing-wrapper')) {
-      return;
-    }
-    if (document.activeElement && document.activeElement.closest('.text-search-container')) {
-      return;
-    }
-    const textarea = chatInputRef.value?.senderRef?.$refs.textarea;
-    if (!textarea) return;
-    if (document.activeElement !== textarea) {
-      if (lastSelectionStart.value !== null && lastSelectionEnd.value !== null) chatInputRef.value?.focus({ position: { start: lastSelectionStart.value, end: lastSelectionEnd.value } });
-      else chatInputRef.value?.focus({ cursor: 'end' });
+    if (lastSelectionStart.value !== null && lastSelectionEnd.value !== null) {
+      focusChatInputIfSafe({ position: { start: lastSelectionStart.value, end: lastSelectionEnd.value } });
+    } else {
+      focusChatInputIfSafe({ cursor: 'end' });
     }
   }, 50);
 };
@@ -1697,6 +2293,13 @@ const closePage = async (force_save = false) => {
   // 1. 如果是为了打开文件选择器而失去焦点，拦截关闭
   if (isFilePickerOpen.value) return;
 
+  // 关闭对话前先结束本对话所有运行中 Subagent，避免后台孤儿任务继续占资源
+  try {
+    await killAllRunningSubAgentsForCurrentConversation();
+  } catch (e) {
+    console.warn('[Sub-Agent] Kill-on-close failed:', e);
+  }
+
   // 条件：配置了本地存储路径 且 当前对话已有名称
   if (currentConfig.value?.webdav?.localChatPath && (defaultConversationName.value || shouldForceSave)) {
     try {
@@ -1718,7 +2321,8 @@ watch(zoomLevel, (newZoom) => {
   if (window.api && typeof window.api.setZoomFactor === 'function') window.api.setZoomFactor(newZoom);
 });
 watch(chat_show, async () => {
-  await addCopyButtonsToCodeBlocks();
+  // 代码块复制按钮已下沉到 ChatMessage 本地注入，避免每次 deep watch 全页扫描 pre.hljs
+  await updateStickyResizeObserver();
 }, { deep: true, flush: 'post' });
 watch(() => currentConfig.value?.isDarkMode, (isDark) => {
   if (isDark) {
@@ -1735,6 +2339,12 @@ watch(() => currentConfig.value?.isDarkMode, (isDark) => {
 onMounted(async () => {
   if (isInit.value) return;
   isInit.value = true;
+
+  startSubAgentStatusPolling();
+
+
+
+  await updateStickyResizeObserver();
 
   if (window.api && window.api.onAlwaysOnTopChanged) {
     window.api.onAlwaysOnTopChanged((newState) => {
@@ -2019,7 +2629,8 @@ onMounted(async () => {
 
         // 标记需要直接发送
         shouldDirectSend = true;
-      } if (data.type === "summon") {
+      } else if (data.type === "summon") {
+        defaultConversationName.value = buildConversationTimestampedBasename('召唤', { force: false, includeCode: true, includeSummonPrefix: false }) || `召唤-${CODE.value}-${buildConversationTimestampSuffix()}`;
         shouldDirectSend = true;
         isFileDirectSend = true;
         if (data.summonData) {
@@ -2124,7 +2735,6 @@ onMounted(async () => {
       else await askAI(true);
     }
 
-    await addCopyButtonsToCodeBlocks();
     setTimeout(() => {
       chatInputRef.value?.focus({ cursor: 'end' });
     }, 100);
@@ -2169,7 +2779,7 @@ onMounted(async () => {
           const fileProcessingPromises = data.payload.map((fileInfo) => processFilePath(fileInfo.path));
           await Promise.all(fileProcessingPromises);
           isFileDirectSend = true;
-        } catch (error) { 
+        } catch (error) {
           console.error(error);
           showDismissibleMessage.error("处理文件失败: " + error.message);
           return; // 处理失败则终止发送
@@ -2271,7 +2881,7 @@ onMounted(async () => {
 const AUTO_NAMING_TIMEOUT_MS = 30000;
 const AUTO_NAMING_MAX_TEXT_CHARS = 1000;
 const AUTO_NAMING_MAX_IMAGES = 3;
-const AUTO_NAMING_MAX_TITLE_TOKENS = 40;
+const AUTO_NAMING_MAX_TITLE_TOKENS = 16;
 const buildAutoNamingSystemPrompt = () => {
   const locale = currentConfig.value?.language === 'en'
     ? 'English'
@@ -2279,7 +2889,7 @@ const buildAutoNamingSystemPrompt = () => {
       ? 'Chinese'
       : (currentConfig.value?.language || 'the user primary language');
 
-  return `You are a conversation title generator. I will provide dialogue content in a <content> block. Summarize the conversation between the user and assistant into a short title that captures the main topic of this conversation.
+  return `You are a conversation title generator. I will provide dialogue content with clearly labeled <system_prompt> and <user_prompt> blocks. Summarize the conversation into a short title that captures the main topic of this conversation.
 
 Rules:
 1. The title language must match the user's primary language.
@@ -2352,26 +2962,30 @@ const buildConversationTimestampSuffix = (date = new Date()) => {
   return `${year}${month}${day}-${hours}${minutes}${seconds}-${milliseconds}`;
 };
 
-const buildConversationTimestampedBasename = (namePrefix = '', { force = false, date = new Date(), includeCode = true } = {}) => {
+const buildConversationTimestampedBasename = (namePrefix = '', { force = false, date = new Date(), includeCode = true, includeSummonPrefix = true } = {}) => {
   const safeNamePrefix = sanitizeConversationTitlePart(namePrefix, 36);
   if (!safeNamePrefix) return '';
   const safeCodeName = sanitizeConversationTitlePart(CODE.value || 'AI', 36).replace(/[\\/:*?"<>|]/g, '_');
   const timestampSuffix = buildConversationTimestampSuffix(date);
   return includeCode && safeCodeName
-    ? `${getAutoSavePrefixTag(force)}${safeNamePrefix}-${safeCodeName}-${timestampSuffix}`
-    : `${getAutoSavePrefixTag(force)}${safeNamePrefix}-${timestampSuffix}`;
+    ? `${getAutoSavePrefixTag({ force, includeSummonPrefix })}${safeNamePrefix}-${safeCodeName}-${timestampSuffix}`
+    : `${getAutoSavePrefixTag({ force, includeSummonPrefix })}${safeNamePrefix}-${timestampSuffix}`;
 };
 
-const getAutoSavePrefixTag = (force = false) => {
-  if (basic_msg.value?.type === "summon") return "召唤-";
+const getAutoSavePrefixTag = (options = {}) => {
+  const normalizedOptions = typeof options === 'boolean'
+    ? { force: options }
+    : (options && typeof options === 'object' ? options : {});
+  const { force = false, includeSummonPrefix = true } = normalizedOptions;
+  if (includeSummonPrefix && basic_msg.value?.type === "summon") return "召唤-";
   if (force) return "关闭留档-";
   return "";
 };
 
-const buildConversationTitleOnly = (namePrefix, force = false) => {
+const buildConversationTitleOnly = (namePrefix, force = false, options = {}) => {
   const safeNamePrefix = sanitizeConversationTitlePart(namePrefix, 36);
   if (!safeNamePrefix) return '';
-  return `${getAutoSavePrefixTag(force)}${safeNamePrefix}`;
+  return `${getAutoSavePrefixTag({ force, ...options })}${safeNamePrefix}`;
 };
 
 const resolveUniqueConversationFileName = async (baseTitle = '', dirPath = '') => {
@@ -2430,7 +3044,7 @@ const isNamedLocalConversationAvailable = () => Boolean(
 );
 
 const shouldPersistCurrentSessionAutomatically = () => {
-  return isCurrentPromptAutoSaveEnabled() || isNamedLocalConversationAvailable();
+  return basic_msg.value?.type === 'summon' || isCurrentPromptAutoSaveEnabled() || isNamedLocalConversationAvailable();
 };
 
 const cancelAutoNamingRequest = () => {
@@ -2511,6 +3125,13 @@ const getFirstUserMessageTextTail = (firstUserMsg) => {
   return takeLastTextChars(textContent, AUTO_NAMING_MAX_TEXT_CHARS);
 };
 
+const wrapAutoNamingPromptBlock = (tag, content) => {
+  const normalizedTag = String(tag || '').trim();
+  const normalizedContent = typeof content === 'string' ? content.trim() : String(content ?? '').trim();
+  if (!normalizedTag || !normalizedContent) return '';
+  return `<${normalizedTag}>\n${normalizedContent}\n</${normalizedTag}>`;
+};
+
 const buildAutoNamingUserMessageText = (firstUserMsg) => {
   const sections = [];
   const conversationSystemPrompt = getCurrentConversationSystemPromptTail();
@@ -2518,11 +3139,11 @@ const buildAutoNamingUserMessageText = (firstUserMsg) => {
   const fileNames = [];
 
   if (conversationSystemPrompt) {
-    sections.push(`Conversation system prompt:\n${conversationSystemPrompt}`);
+    sections.push(`Conversation system prompt:\n${wrapAutoNamingPromptBlock('system_prompt', conversationSystemPrompt)}`);
   }
 
   if (firstUserMessage) {
-    sections.push(`First user message:\n${firstUserMessage}`);
+    sections.push(`First user message:\n${wrapAutoNamingPromptBlock('user_prompt', firstUserMessage)}`);
   }
 
   if (Array.isArray(firstUserMsg?.content)) {
@@ -2560,7 +3181,7 @@ const buildAutoNamingImageParts = (firstUserMsg) => {
     .filter(Boolean);
 };
 
-const buildAutoNamingPromptText = (content) => `<content>\n${content}\n</content>`;
+const buildAutoNamingPromptText = (content) => String(content ?? '').trim();
 
 const buildAutoNamingUserContent = (firstUserMsg) => {
   const userMessageText = buildAutoNamingUserMessageText(firstUserMsg);
@@ -2690,7 +3311,7 @@ const generateSuggestedConversationBasename = async ({
   if (targetFirstUserMsg && allowFastModel && isConfiguredFastModelAvailable(currentConfig.value?.defaultFastModel)) {
     const aiNamePrefix = await generateConversationNamePrefixWithFastModel(targetFirstUserMsg, signal);
     if (aiNamePrefix) {
-      generatedBaseTitle = buildConversationTitleOnly(aiNamePrefix, force);
+      generatedBaseTitle = buildConversationTitleOnly(aiNamePrefix, force, { includeSummonPrefix: false });
     }
   }
 
@@ -2804,6 +3425,9 @@ const autoSaveSession = async (force = false) => {
     return false;
   }
 
+  const promptConfig = currentConfig.value?.prompts?.[CODE.value] || {};
+  const autoSaveProjectId = typeof promptConfig.autoSaveProjectId === 'string' ? promptConfig.autoSaveProjectId : '';
+
   // 2. 获取当前快捷助手的配置
   const shouldAutoSave = shouldPersistCurrentSessionAutomatically();
 
@@ -2820,6 +3444,24 @@ const autoSaveSession = async (force = false) => {
   // 6. 执行写入操作
   try {
     await persistSessionToLocalJsonFile(defaultConversationName.value);
+
+    try {
+      const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
+      const filename = `${defaultConversationName.value}.json`;
+      const existingProjectId = findProjectIdByFilename(localProjects, filename);
+      if (!existingProjectId && autoSaveProjectId) {
+        const projectName = localProjects.projects.find((p) => p.id === autoSaveProjectId)?.name || '';
+        await reassignLocalProject({
+          projectId: autoSaveProjectId,
+          projectName,
+          addFilename: filename,
+          removeFilenames: []
+        });
+      }
+    } catch (projectError) {
+      console.warn('[projects] auto-save local project assignment failed:', projectError);
+    }
+
     lastAutoSaveAt = Date.now();
     return true;
   } catch (error) {
@@ -2912,6 +3554,15 @@ const scheduleLoadingAutoSave = (reason = 'loading-progress') => {
 
 onBeforeUnmount(async () => {  // 15s 轮询自动保存已移除；当前仅保留显式业务触发的保存链路。
 
+
+  closeSubAgentDetailFromInput();
+
+  if (subAgentStatusPollTimer) {
+    window.clearInterval(subAgentStatusPollTimer);
+    subAgentStatusPollTimer = null;
+  }
+
+
   window.removeEventListener('wheel', handleWheel);
   window.removeEventListener('focus', handleWindowFocus);
   window.removeEventListener('blur', handleWindowBlur);
@@ -2920,6 +3571,8 @@ onBeforeUnmount(async () => {  // 15s 轮询自动保存已移除；当前仅保
   await window.api.closeMcpClient();
   window.removeEventListener('error', handleGlobalImageError, true);
   window.removeEventListener('keydown', handleGlobalKeyDown);
+
+  cleanupStickyResizeObserver();
   clearScheduledAutoSave();
 
 });
@@ -2959,17 +3612,21 @@ const saveWindowSize = async () => {
   }
 }
 
-const getSessionDataAsObject = () => {
+const getSessionDataAsObject = (options = {}) => {
   const currentPromptConfig = currentConfig.value.prompts[CODE.value] || {};
+  const explicitTitle = typeof options?.title === 'string' ? options.title.trim() : '';
   return {
     anywhere_history: true, CODE: CODE.value, basic_msg: basic_msg.value, isInit: isInit.value,
     autoCloseOnBlur: autoCloseOnBlur.value, model: model.value,
-    sessionMetadata: getSessionMetadata(),
+    sessionMetadata: { title: explicitTitle || getSessionMetadata().title },
     currentPromptConfig: currentPromptConfig, history: history.value, chat_show: chat_show.value, selectedVoice: selectedVoice.value,
     activeMcpServerIds: sessionMcpServerIds.value || [],
     activeSkillIds: sessionSkillIds.value || [],
     isAutoApproveTools: isAutoApproveTools.value,
-    taskList: taskList.value
+    taskList: taskList.value,
+    conversationOwnerId: ensureConversationOwnerId(),
+    subAgentTasks: subAgentTasks.value.map(normalizeSubAgentSummary).filter(Boolean),
+    subAgentDetails: subAgentDetails.value
   };
 }
 // --- 项目（目录）归属：窗口端 helper ---
@@ -3089,6 +3746,134 @@ const assignCloudProject = async ({ projectId, projectName, basename }) => {
   await client.putFileContents(remotePath, content, { overwrite: true });
 };
 
+
+const CHAT_METADATA_FILENAME = 'chat-metadata.yaml';
+
+const normalizeWebdavContents = (contents) => {
+  if (Array.isArray(contents)) return contents;
+  if (contents && Array.isArray(contents.data)) return contents.data;
+  return [];
+};
+
+const normalizeWebdavFileTime = (value) => normalizeSessionTimestamp(value) || '';
+const buildChatMetadataRemotePath = (remoteDir) => `${remoteDir}/${CHAT_METADATA_FILENAME}`;
+
+const resolveWindowCloudSaveFileSystemTimes = async (filename) => {
+  const localDir = currentConfig.value?.webdav?.localChatPath || '';
+  const nowIso = new Date().toISOString();
+  if (!localDir) {
+    return { createdAt: nowIso, updatedAt: nowIso, source: 'now' };
+  }
+
+  try {
+    const files = await window.api.listJsonFiles(localDir);
+    const matchedFile = (Array.isArray(files) ? files : []).find((item) => item?.basename === filename);
+    if (!matchedFile) {
+      return { createdAt: nowIso, updatedAt: nowIso, source: 'now' };
+    }
+
+    const createdAt = normalizeSessionTimestamp(matchedFile.createdAt || matchedFile.birthtime || matchedFile.ctime) || normalizeSessionTimestamp(matchedFile.updatedAt) || nowIso;
+    const updatedAt = normalizeSessionTimestamp(matchedFile.updatedAt || matchedFile.lastmod || matchedFile.mtime) || createdAt;
+    return { createdAt, updatedAt, source: 'local-file' };
+  } catch {
+    return { createdAt: nowIso, updatedAt: nowIso, source: 'now' };
+  }
+};
+
+const buildWindowChatMetadataPayload = (basename, options = {}) => {
+  const { sessionData = null, createdAt = '', updatedAt = '' } = options;
+  const metadata = sessionData?.sessionMetadata && typeof sessionData.sessionMetadata === 'object'
+    ? sessionData.sessionMetadata
+    : getSessionMetadata();
+  const normalizedCreatedAt = normalizeSessionTimestamp(createdAt);
+  const normalizedUpdatedAt = normalizeSessionTimestamp(updatedAt);
+  const fallbackNow = new Date().toISOString();
+
+  return {
+    title: typeof metadata?.title === 'string' && metadata.title.trim()
+      ? metadata.title.trim()
+      : stripJsonName(basename),
+    createdAt: normalizedCreatedAt || normalizedUpdatedAt || fallbackNow,
+    updatedAt: normalizedUpdatedAt || normalizedCreatedAt || fallbackNow
+  };
+};
+
+const readCloudChatMetadataIndex = async (client, remoteDir) => {
+  try {
+    const text = await client.getFileContents(buildChatMetadataRemotePath(remoteDir), { format: 'text' });
+    return window.api.normalizeChatMetadataIndex(
+      await window.api.parseChatMetadataYaml(typeof text === 'string' ? text : String(text || ''))
+    );
+  } catch {
+    return window.api.normalizeChatMetadataIndex({ version: 1, chats: {} });
+  }
+};
+
+const writeCloudChatMetadataIndex = async (client, remoteDir, metadata) => {
+  const content = await window.api.serializeChatMetadataYaml(metadata);
+  await client.putFileContents(buildChatMetadataRemotePath(remoteDir), content, { overwrite: true });
+};
+
+const reconcileWindowCloudChatMetadata = async (client, remoteDir, files = null) => {
+  const list = Array.isArray(files)
+    ? files
+    : normalizeWebdavContents(await client.getDirectoryContents(remoteDir, { details: true }).catch(() => []));
+  const jsonFiles = normalizeWebdavContents(list)
+    .map((item) => ({
+      ...item,
+      basename: String(item?.basename || item?.filename || item?.name || '').trim()
+    }))
+    .filter((item) => item?.type === 'file' && item.basename.toLowerCase().endsWith('.json'));
+  const metadata = await readCloudChatMetadataIndex(client, remoteDir);
+  const nextChats = { ...(metadata?.chats || {}) };
+  let changed = false;
+
+  jsonFiles.forEach((file) => {
+    const current = nextChats[file.basename];
+    const candidate = window.api.normalizeChatMetadataEntry(file.basename, {
+      title: current?.title || stripJsonName(file.basename),
+      createdAt: current?.createdAt || normalizeWebdavFileTime(file.createdAt || file.creationdate || file.birthtime || file.ctime || file.lastmod || file.props?.creationdate || file.props?.getcreationdate),
+      updatedAt: current?.updatedAt || normalizeWebdavFileTime(file.updatedAt || file.lastmod || file.lastModified || file.mtime || file.props?.getlastmodified || file.props?.lastmod || file.createdAt)
+    });
+    if (JSON.stringify(current || null) !== JSON.stringify(candidate || null)) {
+      nextChats[file.basename] = candidate;
+      changed = true;
+    }
+  });
+
+  Object.keys(nextChats).forEach((basename) => {
+    if (!jsonFiles.some((file) => file.basename === basename)) {
+      delete nextChats[basename];
+      changed = true;
+    }
+  });
+
+  const nextMetadata = window.api.normalizeChatMetadataIndex({ version: 1, chats: nextChats });
+  if (changed) {
+    await writeCloudChatMetadataIndex(client, remoteDir, nextMetadata);
+  }
+  return nextMetadata;
+};
+
+const upsertWindowCloudChatMetadata = async (client, remoteDir, filename, chatMetadata) => {
+  const remoteList = normalizeWebdavContents(await client.getDirectoryContents(remoteDir, { details: true }).catch(() => []));
+  const metadata = await reconcileWindowCloudChatMetadata(client, remoteDir, remoteList);
+  const previousEntry = metadata.chats[filename] ? { ...metadata.chats[filename] } : null;
+  metadata.chats[filename] = window.api.normalizeChatMetadataEntry(filename, chatMetadata);
+  await writeCloudChatMetadataIndex(client, remoteDir, metadata);
+  return { metadata, previousEntry };
+};
+
+const restoreWindowCloudChatMetadataEntry = async (client, remoteDir, filename, metadata, previousEntry) => {
+  if (!metadata) return;
+  if (previousEntry) {
+    metadata.chats[filename] = previousEntry;
+  } else {
+    delete metadata.chats[filename];
+  }
+  await writeCloudChatMetadataIndex(client, remoteDir, metadata).catch(() => {});
+};
+
 const saveSessionToCloud = async () => {
   const defaultBasename = defaultConversationName.value || buildConversationTimestampedBasename(CODE.value || 'AI', { force: false, includeCode: false });
   const inputValue = ref(defaultBasename);
@@ -3140,14 +3925,30 @@ const saveSessionToCloud = async () => {
           instance.confirmButtonLoading = true;
           showDismissibleMessage.info('正在保存到云端...');
           try {
-            const sessionData = getSessionDataAsObject();
+            const sessionData = getSessionDataAsObject({ title: finalBasename });
             const jsonString = JSON.stringify(sessionData, null, 2);
             const { url, username, password, data_path } = currentConfig.value.webdav;
             const client = createClient(url, { username, password });
             const remoteDir = data_path.endsWith('/') ? data_path.slice(0, -1) : data_path;
             const remoteFilePath = `${remoteDir}/${filename}`;
             if (!(await client.exists(remoteDir))) await client.createDirectory(remoteDir, { recursive: true });
-            await client.putFileContents(remoteFilePath, jsonString, { overwrite: true });
+            const fileSystemTimes = await resolveWindowCloudSaveFileSystemTimes(filename);
+            const { metadata: previousMetadataIndex, previousEntry } = await upsertWindowCloudChatMetadata(
+              client,
+              remoteDir,
+              filename,
+              buildWindowChatMetadataPayload(filename, {
+                sessionData,
+                createdAt: fileSystemTimes.createdAt,
+                updatedAt: fileSystemTimes.updatedAt
+              })
+            );
+            try {
+              await client.putFileContents(remoteFilePath, jsonString, { overwrite: true });
+            } catch (uploadError) {
+              await restoreWindowCloudChatMetadataEntry(client, remoteDir, filename, previousMetadataIndex, previousEntry);
+              throw uploadError;
+            }
             defaultConversationName.value = finalBasename;
             try {
               const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
@@ -3452,27 +4253,27 @@ const saveSessionAsHtml = async () => {
 
     const cssStyles = `
       <style>
-        :root { 
-            --bg-color: #f7f7f7; 
-            --text-color: #333; 
-            --card-bg: #fff; 
-            --user-bg: #e1f5fe; 
-            --ai-bg: #fff; 
-            --border-color: #eee; 
-            --accent-color: #1F2937; 
+        :root {
+            --bg-color: #f7f7f7;
+            --text-color: #333;
+            --card-bg: #fff;
+            --user-bg: #e1f5fe;
+            --ai-bg: #fff;
+            --border-color: #eee;
+            --accent-color: #1F2937;
             --timeline-line: #e0e0e0;
             --timeline-dot-default: #bdbdbd;
             --timeline-dot-active: #1F2937;
         }
         @media (prefers-color-scheme: dark) {
-          :root { 
-              --bg-color: #1a1a1a; 
-              --text-color: #e0e0e0; 
-              --card-bg: #2a2a2a; 
-              --user-bg: #0d47a1; 
-              --ai-bg: #3a3a3a; 
-              --border-color: #444; 
-              --accent-color: #64b5f6; 
+          :root {
+              --bg-color: #1a1a1a;
+              --text-color: #e0e0e0;
+              --card-bg: #2a2a2a;
+              --user-bg: #0d47a1;
+              --ai-bg: #3a3a3a;
+              --border-color: #444;
+              --accent-color: #64b5f6;
               --timeline-line: #444;
               --timeline-dot-default: #666;
               --timeline-dot-active: #64b5f6;
@@ -3494,7 +4295,7 @@ const saveSessionAsHtml = async () => {
             z-index: 100;
             max-height: 80vh;
             overflow-y: auto;
-            scrollbar-width: none; 
+            scrollbar-width: none;
             padding: 10px;
         }
         .timeline-toc::-webkit-scrollbar { display: none; }
@@ -3506,7 +4307,7 @@ const saveSessionAsHtml = async () => {
             display: flex;
             flex-direction: column;
             align-items: center;
-            gap: 12px; 
+            gap: 12px;
         }
         .timeline-list::before {
             content: '';
@@ -3534,7 +4335,7 @@ const saveSessionAsHtml = async () => {
         .timeline-dot.user-dot {
             background-color: var(--timeline-dot-active);
             border-color: var(--timeline-dot-active);
-            width: 12px; 
+            width: 12px;
             height: 12px;
         }
         .timeline-dot.ai-dot {
@@ -3672,7 +4473,7 @@ const saveSessionAsHtml = async () => {
   } catch (error) { if (error !== 'cancel' && error !== 'close') console.error('MessageBox error:', error); }
 };
 
-const persistSessionToLocalJsonFile = async (baseName = defaultConversationName.value) => {
+const persistSessionToLocalJsonFile = async (baseName = defaultConversationName.value, options = {}) => {
   const localChatPath = currentConfig.value.webdav?.localChatPath;
   const normalizedBaseName = typeof baseName === 'string' ? baseName.trim() : '';
 
@@ -3681,7 +4482,7 @@ const persistSessionToLocalJsonFile = async (baseName = defaultConversationName.
   }
 
   const separator = currentOS.value === 'win' ? '\\' : '/';
-  const sessionData = getSessionDataAsObject();
+  const sessionData = getSessionDataAsObject({ title: typeof options?.title === 'string' ? options.title : normalizedBaseName });
   const jsonString = JSON.stringify(sessionData, null, 2);
   const fullPath = `${localChatPath}${separator}${normalizedBaseName}.json`;
 
@@ -3691,8 +4492,6 @@ const persistSessionToLocalJsonFile = async (baseName = defaultConversationName.
 
 
 const saveSessionAsJson = async () => {
-  const sessionData = getSessionDataAsObject();
-  const jsonString = JSON.stringify(sessionData, null, 2);
   const defaultBasename = defaultConversationName.value || buildConversationTimestampedBasename(CODE.value || 'AI', { force: false, includeCode: false });
   const inputValue = ref(defaultBasename);
   const isAutoNaming = ref(false);
@@ -3746,7 +4545,7 @@ const saveSessionAsJson = async () => {
 
             // 优化逻辑：如果有本地路径，直接写入；否则弹出保存框
             if (localChatPath) {
-              await persistSessionToLocalJsonFile(finalBasename);
+              await persistSessionToLocalJsonFile(finalBasename, { title: finalBasename });
               // 更新项目归属（仅在已配置本地路径时维护 projects.yaml）
               try {
                 const oldFilename = defaultConversationName.value ? `${defaultConversationName.value}.json` : '';
@@ -3763,6 +4562,8 @@ const saveSessionAsJson = async () => {
               }
             } else {
               // 未配置路径，弹出系统选择框
+              const sessionData = getSessionDataAsObject({ title: finalBasename });
+              const jsonString = JSON.stringify(sessionData, null, 2);
               await window.api.saveFile({
                 title: '保存聊天会话',
                 defaultPath: finalFilename,
@@ -3795,6 +4596,8 @@ const renameRemoteSessionFileWithMetadata = async (client, remoteDir, oldFilenam
   const oldRemotePath = `${normalizedRemoteDir}/${oldFilename}`;
   const newRemotePath = `${normalizedRemoteDir}/${newFilename}`;
   const nextTitle = newFilename.toLowerCase().endsWith('.json') ? newFilename.slice(0, -5) : newFilename;
+  const metadata = await reconcileWindowCloudChatMetadata(client, normalizedRemoteDir);
+  const previousEntry = metadata.chats[oldFilename] ? { ...metadata.chats[oldFilename] } : null;
 
   await client.moveFile(oldRemotePath, newRemotePath);
 
@@ -3816,8 +4619,17 @@ const renameRemoteSessionFileWithMetadata = async (client, remoteDir, oldFilenam
       }
     }
   } catch {
-    // ignore remote metadata sync failure to preserve rename compatibility
+    // ignore remote title sync failure; YAML metadata is still updated below
   }
+
+  delete metadata.chats[oldFilename];
+  if (newFilename.toLowerCase().endsWith('.json')) {
+    metadata.chats[newFilename] = window.api.normalizeChatMetadataEntry(newFilename, {
+      ...(previousEntry || {}),
+      title: nextTitle
+    });
+  }
+  await writeCloudChatMetadataIndex(client, normalizedRemoteDir, metadata);
 };
 
 
@@ -4308,7 +5120,7 @@ const loadSession = async (jsonData) => {
     if (chat_show.value.length > visibleHistoryCount) {
       console.warn(`[Auto-Heal] 检测到 UI 节点冗余，自动清理了 ${chat_show.value.length - visibleHistoryCount} 条异常显示节点。`);
       chat_show.value.splice(visibleHistoryCount);
-    } 
+    }
     // 如果 UI 气泡少于真实历史记录 (通常是因为旧版本 Bug 导致的历史污染)，反向截断真实的 history
     else if (chat_show.value.length < visibleHistoryCount) {
       let visibleCount = 0;
@@ -4334,6 +5146,11 @@ const loadSession = async (jsonData) => {
     taskList.value = Array.isArray(jsonData.taskList) ? normalizeTaskList(jsonData.taskList) : [];
     taskPanelVisible.value = false;
     pendingAppendBuffer.value = [];
+    conversationOwnerId.value = typeof jsonData.conversationOwnerId === 'string' && jsonData.conversationOwnerId.trim()
+      ? jsonData.conversationOwnerId.trim()
+      : '';
+    ensureConversationOwnerId();
+    restoreSubAgentTasksFromSession(jsonData);
 
     const configData = await window.api.getConfig();
     currentConfig.value = configData.config;
@@ -4591,6 +5408,7 @@ async function applyMcpTools(show_none = true, reason = 'unknown') {
         headers: serverConf.headers,
         timeoutSeconds: serverConf.timeoutSeconds,
         isPersistent: serverConf.isPersistent,
+        auth: serverConf.auth,
       };
     }
   }
@@ -5140,6 +5958,7 @@ const askAI = async (forceSend = false) => {
         apiKey: api_key.value,
         model: model.value.split("|")[1],
         apiType: apiType,
+        retryCount: Number.isInteger(currentProviderConfig?.retryCount) ? currentProviderConfig.retryCount : 3,
         headers: JSON.parse(JSON.stringify(currentProviderConfig?.headers || {})),
         messages: messagesForThisRequest,
         stream: useStream,
@@ -5327,6 +6146,13 @@ const askAI = async (forceSend = false) => {
           if (currentTotalLength > 1500) throttleDelay = 160;
           if (currentTotalLength > 4000) throttleDelay = 250;
           if (currentTotalLength > 8000) throttleDelay = 400;
+
+          // 未闭合代码围栏时加大节流，降低流式代码块重渲染频率
+          const fenceTicks = (aggregatedContent.match(/```/g) || []).length
+            + (aggregatedContent.match(/~~~/g) || []).length;
+          if (fenceTicks % 2 === 1) {
+            throttleDelay = Math.max(throttleDelay, 360);
+          }
 
           if (isTurnAborted()) {
             break;
@@ -5549,21 +6375,14 @@ const askAI = async (forceSend = false) => {
                 const currentBaseUrl = base_url.value;
                 const currentModelName = model.value.split('|')[1] || model.value;
 
-                const onUpdateCallback = (logContent) => {
-                  if (!isTurnAborted() && uiToolCall) {
-                    uiToolCall.result = logContent + "\n\n[Skill (Sub-Agent) Running...]";
-                  }
-                };
-
-                executionContext = {
+                executionContext = withConversationOwnerContext({
                   apiKey: currentApiKey,
                   baseUrl: currentBaseUrl,
                   model: currentModelName,
                   tools: activeTools.filter(t => t.function.name !== 'sub_agent'),
                   mcpSystemPrompt: mcpSystemPromptStr,
-                  onUpdate: onUpdateCallback,
                   apiType: apiType
-                };
+                });
 
                 toolContent = await window.api.resolveSkillInvocation(
                   currentConfig.value.skillPath,
@@ -5575,18 +6394,7 @@ const askAI = async (forceSend = false) => {
 
                 throwIfTurnAborted();
 
-                if (uiToolCall) {
-                  if (toolContent.includes("[Sub-Agent]")) {
-                    const currentLog = uiToolCall.result ? uiToolCall.result.replace("\n\n[Skill (Sub-Agent) Running...]", "") : "";
-                    if (!currentLog.includes(toolContent)) {
-                      uiToolCall.result = `${currentLog}\n\n=== Skill Execution Result ===\n${toolContent}`;
-                    } else {
-                      uiToolCall.result = currentLog;
-                    }
-                  } else {
-                    uiToolCall.result = toolContent;
-                  }
-                }
+                if (uiToolCall) uiToolCall.result = toolContent;
 
               } else {
                 let executionContext = null;
@@ -5598,45 +6406,43 @@ const askAI = async (forceSend = false) => {
 
                   const toolsContext = activeTools.filter(t => t.function.name !== 'sub_agent');
 
-                  const onUpdateCallback = (logContent) => {
-                    if (!isTurnAborted() && uiToolCall) {
-                      uiToolCall.result = logContent + "\n\n[Sub-Agent 执行中...]";
-                    }
-                  };
-
-                  executionContext = {
+                  executionContext = withConversationOwnerContext({
                     apiKey: currentApiKey,
                     baseUrl: currentBaseUrl,
                     model: currentModelName,
                     tools: toolsContext,
                     mcpSystemPrompt: mcpSystemPromptStr,
-                    onUpdate: onUpdateCallback,
                     apiType: apiType
-                  };
+                  });
                 }
+
+                const invokeArgs = (
+                  toolCall.function.name === 'sub_agent'
+                  || toolCall.function.name === 'get_subagent_status'
+                  || toolCall.function.name === 'stop_subagent'
+                  || toolCall.function.name === 'kill_subagent'
+                  || toolCall.function.name === 'rerun_subagent'
+                ) ? withConversationOwnerArgs(toolArgs) : toolArgs;
 
                 const result = await window.api.invokeMcpTool(
                   toolCall.function.name,
-                  toolArgs,
+                  invokeArgs,
                   toolCallControllers.value.get(toolCall.id)?.signal || requestSignal,
-                  executionContext
+                  withConversationOwnerContext(executionContext)
                 );
 
-                toolContent = Array.isArray(result) ? result.filter(item => item?.type === 'text' && typeof item.text === 'string').map(item => item.text).join('\n\n') : String(result);
+                toolContent = formatToolResult(result);
                 throwIfTurnAborted();
 
-                if (uiToolCall) {
-                  if (toolCall.function.name === 'sub_agent') {
-                    const currentLog = uiToolCall.result ? uiToolCall.result.replace("\n\n[Sub-Agent 执行中...]", "") : "";
-                    if (!currentLog.includes(toolContent)) {
-                      uiToolCall.result = `${currentLog}\n\n=== 最终结果 ===\n${toolContent}`;
-                    } else {
-                      uiToolCall.result = currentLog;
-                    }
-                  } else {
-                    uiToolCall.result = toolContent;
-                  }
-                }
+                if (uiToolCall) uiToolCall.result = toolContent;
+              }
+
+
+              if (toolCall.function.name === 'sub_agent' || toolCall.function.name === 'Skill') {
+                const taskText = toolCall.function.name === 'sub_agent'
+                  ? (typeof toolArgs?.task === 'string' ? toolArgs.task : '')
+                  : (typeof toolArgs?.task === 'string' ? toolArgs.task : (typeof toolArgs?.skill === 'string' ? `Skill: ${toolArgs.skill}` : ''));
+                registerSubAgentFromToolContent(toolContent, taskText);
               }
 
               if (!isTurnAborted() && uiToolCall) uiToolCall.approvalStatus = 'finished';
@@ -5781,10 +6587,7 @@ const askAI = async (forceSend = false) => {
       chat_show.value[currentAssistantChatShowIndex].completedTimestamp = new Date().toLocaleString('sv-SE');
     }
     await nextTick();
-    const textarea = chatInputRef.value?.senderRef?.$refs.textarea;
-    if (textarea && document.activeElement !== textarea) {
-      chatInputRef.value?.focus({ cursor: 'end' });
-    }
+    focusChatInputIfSafe({ cursor: 'end' });
 
     if (currentTaskConfig.value) {
       let savedFileName = '未保存';
@@ -5801,6 +6604,20 @@ const askAI = async (forceSend = false) => {
 
           await window.api.writeLocalFile(filePath, jsonString);
           savedFileName = `${defaultConversationName.value}.json`;
+
+          try {
+            const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
+            const taskProjectId = typeof currentTaskConfig.value.autoSaveProjectId === 'string' ? currentTaskConfig.value.autoSaveProjectId : '';
+            const projectName = localProjects.projects.find((p) => p.id === taskProjectId)?.name || '';
+            await reassignLocalProject({
+              projectId: taskProjectId,
+              projectName,
+              addFilename: savedFileName,
+              removeFilenames: []
+            });
+          } catch (projectError) {
+            console.warn('[projects] task auto-save local project assignment failed:', projectError);
+          }
         }
         // 将历史记录写入主配置
         await window.api.addTaskHistory(currentTaskConfig.value.id, {
@@ -5883,7 +6700,7 @@ const cancelAskAI = () => {
   loading.value = false;
   syncAutoCloseOnBlurListener();
   scheduleAutoSave({ reason: 'assistant-cancelled', immediate: true });
-  chatInputRef.value?.focus();
+  focusChatInputIfSafe({ cursor: 'end' });
 };
 const copyText = async (content, index) => { if (loading.value && index === chat_show.value.length - 1) return; await window.api.copyText(content); };
 const reaskAI = async () => {
@@ -5990,9 +6807,15 @@ const deleteMessage = (index) => {
   focusedMessageIndex.value = null;
 };
 
-const clearHistory = () => {
+const clearHistory = async () => {
   if (loading.value) {
     return;
+  }
+
+  try {
+    await killAllRunningSubAgentsForCurrentConversation();
+  } catch (e) {
+    console.warn('[Sub-Agent] Kill-on-clear failed:', e);
   }
 
   const systemPromptFromConfig = currentConfig.value.prompts[CODE.value]?.prompt;
@@ -6016,6 +6839,9 @@ const clearHistory = () => {
   taskList.value = [];
   taskPanelVisible.value = false;
   pendingAppendBuffer.value = [];
+  clearSubAgentSessionState();
+  conversationOwnerId.value = '';
+  ensureConversationOwnerId();
   chatInputRef.value?.focus({ cursor: 'end' });
   showDismissibleMessage.success('历史记录已清除');
 };
@@ -6271,16 +7097,18 @@ const scrollToMessageByIndex = (index) => {
         :os="currentOS" @save-window-size="handleSaveWindowSize" @save-session="handleSaveSession"
         @toggle-pin="handleTogglePin" @toggle-always-on-top="handleToggleAlwaysOnTop" @minimize="handleMinimize"
         @maximize="handleMaximize" @close="handleCloseWindow" />
-      <ChatHeader :modelMap="modelMap" :model="model" :is-mcp-loading="isMcpLoading" :systemPrompt="currentSystemPrompt"
+      <ChatHeader :modelMap="modelMap" :model="model" :model-logo="currentModelLogo" :is-mcp-loading="isMcpLoading" :systemPrompt="currentSystemPrompt"
         :has-task-tool="hasTaskMcpTool" :task-panel-visible="taskPanelVisible" :task-status="taskOverallStatus"
         @open-model-dialog="handleOpenModelDialog" @show-system-prompt="handleShowSystemPrompt"
+        @model-logo-error="handleModelLogoError"
         @toggle-task-panel="taskPanelVisible = !taskPanelVisible" />
 
       <TaskPanel :tasks="taskList" :visible="taskPanelVisible" @close="taskPanelVisible = false" />
 
       <div class="main-area-wrapper">
         <el-main ref="chatContainerRef" class="chat-main custom-scrollbar" @click="handleMainClick"
-          @scroll="handleScroll">
+          @wheel.passive="markUserScrollIntent" @touchstart.passive="markUserScrollIntent"
+          @pointerdown="markUserScrollIntent" @scroll="handleScroll">
           <ChatMessage v-for="(message, index) in chat_show" :key="message.id" :is-auto-approve="isAutoApproveTools"
             @update-auto-approve="handleToggleAutoApprove" @confirm-tool="handleToolApproval"
             @reject-tool="handleToolApproval" :ref="el => setMessageRef(el, message.id)" :message="message"
@@ -6363,16 +7191,23 @@ const scrollToMessageByIndex = (index) => {
           v-model:selectedVoice="selectedVoice" v-model:tempReasoningEffort="tempReasoningEffort" :loading="loading"
           :ctrlEnterToSend="currentConfig.CtrlEnterToSend" :layout="inputLayout" :voiceList="currentConfig.voiceList"
           :is-mcp-active="isMcpActive" :all-mcp-servers="availableMcpServers" :active-mcp-ids="sessionMcpServerIds"
-          :active-skill-ids="sessionSkillIds" :all-skills="allSkillsList" :append-buffer="pendingAppendBuffer" @submit="handleSubmit" @cancel="handleCancel"
+          :active-skill-ids="sessionSkillIds" :all-skills="allSkillsList" :append-buffer="pendingAppendBuffer" :sub-agent-tasks="subAgentTasks" @submit="handleSubmit" @cancel="handleCancel"
           @clear-history="handleClearHistory" @remove-file="handleRemoveFile" @upload="handleUpload"
           @send-audio="handleSendAudio" @open-mcp-dialog="handleOpenMcpDialog" @pick-file-start="handlePickFileStart"
           @toggle-mcp="handleQuickMcpToggle" @toggle-skill="handleQuickSkillToggle"
-          @open-skill-dialog="toggleSkillDialog" @cancel-buffer="removeBufferedMessage" />
+          @open-skill-dialog="toggleSkillDialog" @cancel-buffer="removeBufferedMessage" @stop-subagent="stopSubAgentFromInput"
+          :sub-agent-details="subAgentDetails"
+          @acknowledge-subagent="acknowledgeSubAgentFromInput"
+          @acknowledge-all-subagents="acknowledgeAllFinishedSubAgentsFromInput"
+          @rerun-subagent="rerunSubAgentFromInput"
+          @open-subagent-detail="openSubAgentDetailFromInput" @close-subagent-detail="closeSubAgentDetailFromInput" />
       </div>
     </el-container>
   </main>
 
   <ModelSelectionDialog v-model="changeModel_page" :modelList="modelList" :currentModel="model"
+    :providerCollapseStates="modelDialogProviderCollapseStates"
+    @update:providerCollapseStates="handleProviderCollapseStatesChange"
     @select="handleChangeModel" @save-model="handleSaveModel" />
 
   <el-dialog v-model="systemPromptDialogVisible" title="" custom-class="system-prompt-dialog" width="60%"

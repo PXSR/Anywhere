@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, nextTick } from 'vue';
+import { computed, ref, nextTick, watch, onMounted, onBeforeUnmount } from 'vue';
 import { Bubble, Thinking, XMarkdown } from 'vue-element-plus-x';
 import { ElTooltip, ElButton, ElInput, ElCollapse, ElCollapseItem, ElIcon, ElCheckbox, ElTag, ElMessage } from 'element-plus';
 import { DocumentCopy, Refresh, Delete, Document, CaretTop, CaretBottom, Edit, Check, Close, CloseBold, Picture } from '@element-plus/icons-vue';
@@ -16,6 +16,8 @@ const loadHtml2Canvas = () => {
   }
   return html2canvasPromise;
 };
+
+const CODE_BLOCK_COPY_SVG = `<svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>`;
 
 const props = defineProps({
   message: Object,
@@ -34,6 +36,11 @@ const editInputRef = ref(null);
 const isEditing = ref(false);
 const editedContent = ref('');
 const messageWrapperRef = ref(null);
+const markdownRootRef = ref(null);
+let copyButtonRafId = 0;
+let copyButtonTimerId = 0;
+
+const isStreamingThisMessage = computed(() => Boolean(props.isLoading && props.isLastMessage));
 
 // 计算耗时或显示开始时间
 const formatTokenCount = (value) => {
@@ -310,8 +317,7 @@ const formatToolArgs = (argsString) => {
   }
 };
 
-const preprocessKatex = (text) => {
-  if (!text) return '';
+const preprocessKatexPlainText = (text) => {
   let processedText = text;
 
   // 1. 替换非标准连字符
@@ -339,9 +345,63 @@ const preprocessKatex = (text) => {
   return processedText;
 };
 
+const preprocessKatex = (text) => {
+  if (!text) return '';
+
+  const protectedMap = new Map();
+  let placeholderIndex = 0;
+  const addPlaceholder = (segment) => {
+    const placeholder = `\uE000KATEX_PROTECTED_${placeholderIndex++}\uE001`;
+    protectedMap.set(placeholder, segment);
+    return placeholder;
+  };
+
+  // KaTeX 兼容预处理只能作用于普通 Markdown 文本。
+  // 代码围栏与行内代码中的反斜杠/方括号是代码语义，例如 Bash 正则 ^\[bot\]，不能被转换成 $$bot$$。
+  let protectedText = text.replace(/(^|\n)([ \t]*)(`{3,}|~{3,})([^\n]*)\n[\s\S]*?(?:\n[ \t]*\3[ \t]*(?=\n|$)|$)/g, (match) => {
+    return addPlaceholder(match);
+  });
+
+  protectedText = protectedText.replace(/(`+)([^`\n]*?)\1/g, (match) => {
+    return addPlaceholder(match);
+  });
+
+  let processedText = preprocessKatexPlainText(protectedText);
+  protectedMap.forEach((segment, placeholder) => {
+    processedText = processedText.replaceAll(placeholder, segment);
+  });
+
+  return processedText;
+};
+
 const mermaidConfig = computed(() => ({
   theme: props.isDarkMode ? 'dark' : 'neutral',
 }));
+
+const normalizeWindowsLocalMarkdownImagePaths = (markdown) => {
+  const protectedMap = new Map();
+  let placeholderIndex = 0;
+  const addPlaceholder = (segment) => {
+    const placeholder = `\uE000LOCAL_IMAGE_PROTECTED_${placeholderIndex++}\uE001`;
+    protectedMap.set(placeholder, segment);
+    return placeholder;
+  };
+
+  // 仅处理普通 Markdown 图片路径，避免改写代码围栏和行内代码中的示例文本。
+  let protectedText = String(markdown || '')
+    .replace(/(^|\n)([ \t]*)(`{3,}|~{3,})([^\n]*)\n[\s\S]*?(?:\n[ \t]*\3[ \t]*(?=\n|$)|$)/g, (match) => addPlaceholder(match));
+  protectedText = protectedText.replace(/(`+)([^`\n]*?)\1/g, (match) => addPlaceholder(match));
+
+  protectedText = protectedText.replace(/(!\[[^\]\r\n]*\]\()([A-Za-z]:[\\/][^)\r\n]*)(\))/g, (match, prefix, rawPath, suffix) => {
+    return `${prefix}${String(rawPath || '').replace(/\\/g, '/')}${suffix}`;
+  });
+
+  protectedMap.forEach((segment, placeholder) => {
+    protectedText = protectedText.replaceAll(placeholder, segment);
+  });
+  return protectedText;
+};
+
 
 const formatMessageContent = (content, role) => {
   if (!content) return "";
@@ -447,7 +507,7 @@ const handleEditKeyDown = (event) => {
 const renderedMarkdownContent = computed(() => {
   const content = props.message.role ? props.message.content : props.message;
   const role = props.message.role ? props.message.role : 'user';
-  let formattedContent = formatMessageContent(content, role);
+  let formattedContent = normalizeWindowsLocalMarkdownImagePaths(formatMessageContent(content, role));
   formattedContent = preprocessKatex(formattedContent);
 
   const protectedMap = new Map();
@@ -499,6 +559,98 @@ const renderedMarkdownContent = computed(() => {
   return finalContent || '';
 });
 
+const injectCopyButtonsForRoot = (root) => {
+  if (!root) return;
+  const codeBlocks = root.querySelectorAll('pre.hljs, pre.shiki');
+  codeBlocks.forEach((pre) => {
+    if (pre.closest('.code-block-wrapper')) return;
+    if (pre.querySelector('.code-block-copy-button')) return;
+    const codeElement = pre.querySelector('code');
+    if (!codeElement) return;
+
+    const parent = pre.parentNode;
+    if (!parent) return;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'code-block-wrapper';
+    parent.insertBefore(wrapper, pre);
+    wrapper.appendChild(pre);
+
+    const codeText = codeElement.textContent || '';
+    const lineCount = codeText.trimEnd().split('\n').length;
+    const createButton = (positionClass) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `code-block-copy-button ${positionClass}`;
+      button.innerHTML = CODE_BLOCK_COPY_SVG;
+      button.title = 'Copy code';
+      button.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(codeText.trimEnd());
+          ElMessage.success('Code copied to clipboard!');
+        } catch (err) {
+          console.error('Failed to copy code:', err);
+          ElMessage.error('Failed to copy code.');
+        }
+      });
+      wrapper.appendChild(button);
+    };
+    createButton('code-block-copy-button-bottom');
+    if (lineCount > 3) createButton('code-block-copy-button-top');
+  });
+};
+
+const scheduleInjectCopyButtons = (immediate = false) => {
+  // 流式过程中不注入复制按钮，避免频繁 DOM wrap 造成 reflow
+  if (isStreamingThisMessage.value && !immediate) return;
+
+  if (copyButtonTimerId) {
+    clearTimeout(copyButtonTimerId);
+    copyButtonTimerId = 0;
+  }
+  if (copyButtonRafId) {
+    cancelAnimationFrame(copyButtonRafId);
+    copyButtonRafId = 0;
+  }
+
+  const run = async () => {
+    await nextTick();
+    copyButtonRafId = requestAnimationFrame(() => {
+      copyButtonRafId = 0;
+      injectCopyButtonsForRoot(markdownRootRef.value);
+    });
+  };
+
+  if (immediate) {
+    run();
+    return;
+  }
+
+  copyButtonTimerId = setTimeout(() => {
+    copyButtonTimerId = 0;
+    run();
+  }, 120);
+};
+
+watch(
+  () => [renderedMarkdownContent.value, props.isLoading, props.isLastMessage, props.isCollapsed, isEditing.value],
+  ([, loading, isLast]) => {
+    const finishedStreaming = isLast && !loading;
+    scheduleInjectCopyButtons(finishedStreaming);
+  },
+  { flush: 'post' }
+);
+
+onMounted(() => {
+  scheduleInjectCopyButtons(true);
+});
+
+onBeforeUnmount(() => {
+  if (copyButtonTimerId) clearTimeout(copyButtonTimerId);
+  if (copyButtonRafId) cancelAnimationFrame(copyButtonRafId);
+});
+
 const hasContentToShow = computed(() => {
   const hasText = renderedMarkdownContent.value && renderedMarkdownContent.value.trim().length > 0;
   const hasTools = props.message.tool_calls && props.message.tool_calls.length > 0;
@@ -545,7 +697,7 @@ const truncateFilename = (filename, maxLength = 30) => {
 
       <Bubble class="user-bubble" placement="end" shape="corner" maxWidth="100%">
         <template #content>
-          <div v-if="!isEditing" class="markdown-wrapper" :class="{ 'collapsed': isCollapsed }">
+          <div v-if="!isEditing" ref="markdownRootRef" class="markdown-wrapper" :class="{ 'collapsed': isCollapsed }">
             <XMarkdown :markdown="renderedMarkdownContent" :is-dark="isDarkMode" :enable-latex="true"
               :mermaid-config="mermaidConfig" :default-theme-mode="isDarkMode ? 'dark' : 'light'"
               :themes="{ light: 'github-light', dark: 'github-dark-default' }" :allow-html="true" />
@@ -611,7 +763,7 @@ const truncateFilename = (filename, maxLength = 30) => {
           </Thinking>
         </template>
         <template #content v-if="hasContentToShow">
-          <div v-if="!isEditing" class="markdown-wrapper" :class="{ 'collapsed': isCollapsed }">
+          <div v-if="!isEditing" ref="markdownRootRef" class="markdown-wrapper" :class="{ 'collapsed': isCollapsed }">
             <XMarkdown :markdown="renderedMarkdownContent" :is-dark="isDarkMode" :enable-latex="true"
               :mermaid-config="mermaidConfig" :default-theme-mode="isDarkMode ? 'dark' : 'light'"
               :themes="{ light: 'one-light', dark: 'vesper' }" :allow-html="true" />
@@ -1133,6 +1285,64 @@ html.dark .chat-message .ai-bubble {
 
   html:not(.dark) & :deep(pre.shiki) {
     background-color: #f6f8fa !important;
+  }
+
+  :deep(.code-block-wrapper) {
+    position: relative;
+    margin: 0.75em 0;
+  }
+
+  :deep(.code-block-wrapper > pre) {
+    margin: 0;
+  }
+
+  :deep(.code-block-copy-button) {
+    position: absolute;
+    z-index: 2;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.88);
+    color: var(--el-text-color-secondary);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+  }
+
+  :deep(.code-block-wrapper:hover .code-block-copy-button),
+  :deep(.code-block-copy-button:focus-visible) {
+    opacity: 1;
+  }
+
+  :deep(.code-block-copy-button-top) {
+    top: 8px;
+    right: 8px;
+  }
+
+  :deep(.code-block-copy-button-bottom) {
+    right: 8px;
+    bottom: 8px;
+  }
+
+  :deep(.code-block-copy-button:hover) {
+    color: var(--el-color-primary);
+    background: rgba(255, 255, 255, 0.98);
+  }
+
+  html.dark & :deep(.code-block-copy-button) {
+    border-color: rgba(255, 255, 255, 0.12);
+    background: rgba(30, 32, 36, 0.9);
+    color: var(--el-text-color-secondary);
+  }
+
+  html.dark & :deep(.code-block-copy-button:hover) {
+    background: rgba(40, 44, 52, 0.98);
+    color: var(--el-color-primary);
   }
 
   html.dark & {

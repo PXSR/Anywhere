@@ -1,4 +1,4 @@
-const { createChatCompletion, getRandomItem } = require('./chat.js');
+const { createChatCompletion, getRandomItem, batchTestProviderKeys } = require('./chat.js');
 
 const {
   getConfig,
@@ -56,13 +56,17 @@ const {
   killAllBackgroundShells,
 } = require('./mcp_builtin.js');
 
-const {
-  initializeMcpClient,
-  invokeMcpTool,
-  closeMcpClient,
-  connectAndFetchTools,
-  connectAndInvokeTool,
-} = require('./mcp.js');
+function getMcpModule() {
+  return require('./mcp.js');
+}
+
+function getOauthStore() {
+  return require('./mcp_oauth_store.js');
+}
+
+function getOauthProvider() {
+  return require('./mcp_oauth_provider.js');
+}
 
 const {
   listSkills,
@@ -72,7 +76,9 @@ const {
   saveSkill,
   deleteSkill,
   exportSkillToPackage,
+  exportSkillPackageBuffer,
   extractSkillPackage,
+  importSkillPackageBuffer,
 } = require('./skill.js');
 
 // 引入会议讨论模块
@@ -98,6 +104,14 @@ const {
   findProjectByBasename,
 } = require('./projects.js');
 
+const {
+  parseChatMetadataYaml,
+  serializeChatMetadataYaml,
+  normalizeChatMetadataIndex,
+  normalizeChatMetadataEntry,
+} = require('./chat_metadata.js');
+
+
 window.api = {
   getConfig,
   updateConfig,
@@ -105,6 +119,7 @@ window.api = {
   updateConfigWithoutFeatures,
   getUser,
   getRandomItem,
+  batchTestProviderKeys,
   createChatCompletion: async (params) => {
     return await createChatCompletion(params);
   },
@@ -128,6 +143,10 @@ window.api = {
   mergeFileAssignment,
   mergeProjectAssignment,
   findProjectByBasename,
+  parseChatMetadataYaml,
+  serializeChatMetadataYaml,
+  normalizeChatMetadataIndex,
+  normalizeChatMetadataEntry,
   setZoomFactor,
   defaultConfig,
   savePromptWindowSettings,
@@ -135,6 +154,7 @@ window.api = {
   copyImage: utools.copyImage,
   getMcpToolCache,
   initializeMcpClient: async (activeServerConfigs) => {
+    const { initializeMcpClient } = getMcpModule();
     try {
       const cache = await getMcpToolCache();
       return await initializeMcpClient(activeServerConfigs, cache, saveMcpToolCache);
@@ -145,6 +165,7 @@ window.api = {
   },
   testMcpConnection: async (serverConfig) => {
     try {
+      const { connectAndFetchTools } = getMcpModule();
       // 1. 获取新工具列表
       const rawTools = await connectAndFetchTools(serverConfig.id, {
         transport: serverConfig.type,
@@ -153,6 +174,7 @@ window.api = {
         url: serverConfig.baseUrl,
         env: serverConfig.env,
         headers: serverConfig.headers,
+        auth: serverConfig.auth,
       });
 
       const sanitizedTools = rawTools.map(tool => ({
@@ -188,6 +210,7 @@ window.api = {
   saveMcpToolCache,
   testInvokeMcpTool: async (serverConfig, toolName, args) => {
     try {
+      const { connectAndInvokeTool } = getMcpModule();
       const result = await connectAndInvokeTool(serverConfig.id, {
         transport: serverConfig.type,
         command: serverConfig.command,
@@ -196,15 +219,72 @@ window.api = {
         env: serverConfig.env,
         headers: serverConfig.headers,
         timeoutSeconds: serverConfig.timeoutSeconds,
-        type: serverConfig.type // 确保 type 传递给 builtin 判断
+        type: serverConfig.type, // 确保 type 传递给 builtin 判断
+        auth: serverConfig.auth,
       }, toolName, args);
       return { success: true, result };
     } catch (error) {
       return { success: false, error: String(error.message || error) };
     }
   },
-  invokeMcpTool,
-  closeMcpClient,
+  invokeMcpTool: async (...args) => {
+    const { invokeMcpTool } = getMcpModule();
+    return await invokeMcpTool(...args);
+  },
+  closeMcpClient: async (...args) => {
+    const { closeMcpClient } = getMcpModule();
+    return await closeMcpClient(...args);
+  },
+  // --- MCP OAuth IPC ---
+  mcpOAuth_getStatus: async ({ serverId, serverConfig } = {}) => {
+    try {
+      const { getMcpAuthStatus } = getMcpModule();
+      return { success: true, status: await getMcpAuthStatus(serverId, serverConfig) };
+    } catch (e) {
+      return { success: false, error: String(e.message || e) };
+    }
+  },
+  mcpOAuth_startAuthFlow: async ({ serverConfig } = {}) => {
+    try {
+      const { ensureMcpAuthenticated, getMcpAuthStatus } = getMcpModule();
+      const ok = await ensureMcpAuthenticated(serverConfig.id, serverConfig);
+      const status = await getMcpAuthStatus(serverConfig.id, serverConfig);
+      return { success: true, authenticated: ok, status };
+    } catch (e) {
+      console.error("[Preload] mcpOAuth_startAuthFlow error:", e);
+      return { success: false, error: String(e.message || e) };
+    }
+  },
+  mcpOAuth_refresh: async ({ serverId, serverConfig } = {}) => {
+    try {
+      const oauthProvider = getOauthProvider();
+      const { getMcpAuthStatus } = getMcpModule();
+      await oauthProvider.refreshOAuthTokens(serverId, serverConfig || {});
+      const status = await getMcpAuthStatus(serverId, serverConfig || {});
+      return { success: true, refreshed: true, status };
+    } catch (e) {
+      return { success: false, error: String(e.message || e) };
+    }
+  },
+  mcpOAuth_logout: async ({ serverId } = {}) => {
+    try {
+      const oauthStore = getOauthStore();
+      await oauthStore.clearTokens(serverId);
+      await oauthStore.clearCodeVerifier(serverId);
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: String(e.message || e) };
+    }
+  },
+  mcpOAuth_saveManualClient: async ({ serverId, clientId, clientSecret } = {}) => {
+    try {
+      const oauthStore = getOauthStore();
+      await oauthStore.saveClientInfo(serverId, { client_id: clientId, client_secret: clientSecret });
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: String(e.message || e) };
+    }
+  },
   isFileTypeSupported,
   parseFileObject,
   exportLocalChatFile: async (sourcePath, dialogOptions = {}) => {
@@ -244,11 +324,19 @@ window.api = {
     return res;
   },
   // 暴露给前端的导出/导入接口
-  exportSkillToPackage: async (rootPath, skillId, outputDir) => {
-    return exportSkillToPackage(rootPath, skillId, outputDir);
+  exportSkillToPackage: async (rootPath, skillId, outputDir, options = {}) => {
+    return exportSkillToPackage(rootPath, skillId, outputDir, options);
+  },
+  exportSkillPackageBuffer: async (rootPath, skillId, options = {}) => {
+    return exportSkillPackageBuffer(rootPath, skillId, options);
   },
   extractSkillPackage: async (filePath) => {
     return extractSkillPackage(filePath);
+  },
+  importSkillPackageBuffer: async (rootPath, skillId, packageBuffer) => {
+    const result = importSkillPackageBuffer(rootPath, skillId, packageBuffer);
+    broadcastEvent('skills-updated');
+    return result;
   },
   // 按系统默认方式打开文件或目录
   shellOpenPath: (fullPath) => {
@@ -428,7 +516,7 @@ const commandHandlers = {
     // 2. 将高开销的底层 API 调用和窗口创建推入下一个事件循环，让系统的隐藏动画先行
     setTimeout(() => {
       const { windowMap, openAppendSelectorWindow } = require('./data.js');
-      
+
       // 清理僵尸窗口逻辑
       for (const [sid, win] of windowMap.entries()) {
         if (win.isDestroyed()) {
@@ -452,7 +540,7 @@ const commandHandlers = {
         if (payload[0].isDirectory){
           payload_new = "`"+payload[0].path+"`";
           type_new = "over";
-        } 
+        }
       }
 
       // 如果只有一个窗口，直接跳过选择，智能追加
@@ -463,7 +551,7 @@ const commandHandlers = {
           if (win.isMinimized()) win.restore();
           if (!win.isVisible()) win.show();
           win.focus();
-          
+
           win.webContents.send('window-append-msg', {
             type: type_new,
             payload: payload_new
@@ -483,7 +571,7 @@ const commandHandlers = {
     // 避免弹出主窗口
     utools.hideMainWindow();
     const { type, payload, code } = action;
-    
+
     const senderId = code.replace('append_to_', '');
     const { windowMap } = require('./data.js');
     const win = windowMap.get(senderId);
@@ -683,11 +771,11 @@ const commandHandlers = {
 // --- Main Plugin Entry ---
 utools.onPluginEnter(async (action) => {
   const { code } = action;
-  
+
   // 启动时顺便清理一下因强制退出等意外残留的僵尸指令
   const features = utools.getFeatures();
   const { windowMap } = require('./data.js');
-  
+
   for (const [sid, win] of windowMap.entries()) {
     if (win.isDestroyed()) {
       windowMap.delete(sid);
@@ -738,7 +826,7 @@ ipcRenderer.on('forward-append-msg', (e, { senderId, type, payload }) => {
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.show();
     win.focus();
-    
+
     win.webContents.send('window-append-msg', { type, payload });
   }
 });
@@ -786,134 +874,190 @@ ipcRenderer.on('window-event', (e, { senderId, event }) => {
 });
 
 // --- 定时任务轮询调度器 ---
-let lastCheckMinute = Math.floor(Date.now() / 60000);
-setInterval(async () => {
-  try {
-    const currentMinute = Math.floor(Date.now() / 60000);
-    if (currentMinute <= lastCheckMinute) return;
-    lastCheckMinute = currentMinute;
+const TASK_SCHEDULER_CHECK_INTERVAL_MS = 1000;
+const TASK_SCHEDULER_SLOT_TTL_MS = 48 * 60 * 60 * 1000;
+let taskSchedulerTimer = null;
+let isTaskSchedulerChecking = false;
+const processedTaskRunSlots = new Map();
 
+function formatTaskSchedulerHhMm(date) {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function formatTaskSchedulerYmd(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function parseTaskSchedulerTime(value) {
+  if (typeof value !== 'string') return null;
+  const match = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return { hours, minutes };
+}
+
+function buildTaskSchedulerRunSlotKey(taskId, task, nowDate) {
+  return `${taskId}:${task.triggerType}:${formatTaskSchedulerYmd(nowDate)}:${formatTaskSchedulerHhMm(nowDate)}`;
+}
+
+function isTaskSchedulerTimestampInCurrentSlot(timestamp, nowDate) {
+  const numericTimestamp = Number(timestamp || 0);
+  if (!Number.isFinite(numericTimestamp) || numericTimestamp <= 0) return false;
+  const date = new Date(numericTimestamp);
+  return formatTaskSchedulerYmd(date) === formatTaskSchedulerYmd(nowDate) && formatTaskSchedulerHhMm(date) === formatTaskSchedulerHhMm(nowDate);
+}
+
+function isTaskSchedulerWithinIntervalRanges(task, nowDate) {
+  if (!Array.isArray(task?.intervalTimeRanges) || task.intervalTimeRanges.length === 0) {
+    return true;
+  }
+
+  const nowHhMm = formatTaskSchedulerHhMm(nowDate);
+  return task.intervalTimeRanges.some(range => {
+    if (Array.isArray(range) && range.length === 2) {
+      return nowHhMm >= range[0] && nowHhMm <= range[1];
+    }
+    return false;
+  });
+}
+
+function pruneTaskSchedulerRunSlots(now = Date.now()) {
+  for (const [slotKey, timestamp] of processedTaskRunSlots.entries()) {
+    if (now - timestamp > TASK_SCHEDULER_SLOT_TTL_MS) {
+      processedTaskRunSlots.delete(slotKey);
+    }
+  }
+}
+
+function getDueTaskRunSlotKey(taskId, task, now, nowDate) {
+  if (!task || typeof task !== 'object' || !task.enabled) return null;
+
+  const currentH = nowDate.getHours();
+  const currentM = nowDate.getMinutes();
+  const slotKey = buildTaskSchedulerRunSlotKey(taskId, task, nowDate);
+
+  if (processedTaskRunSlots.has(slotKey) || task.lastRunSlotKey === slotKey) return null;
+  if (isTaskSchedulerTimestampInCurrentSlot(task.lastRunTime, nowDate)) return null;
+
+  if (task.triggerType === 'interval') {
+    let shouldTrigger = false;
+
+    if (task.intervalStartTime) {
+      const parsedStart = parseTaskSchedulerTime(task.intervalStartTime);
+      if (!parsedStart) return null;
+
+      const currentTotalMins = currentH * 60 + currentM;
+      const startTotalMins = parsedStart.hours * 60 + parsedStart.minutes;
+      const intervalMins = Math.max(Number(task.intervalMinutes || 1), 1);
+
+      if (currentTotalMins >= startTotalMins) {
+        const diffMins = currentTotalMins - startTotalMins;
+        shouldTrigger = diffMins % intervalMins === 0;
+      }
+    } else {
+      const lastRun = Number(task.lastRunTime || 0);
+      const intervalMs = Math.max(Number(task.intervalMinutes || 1), 1) * 60000;
+      shouldTrigger = now - lastRun >= intervalMs;
+    }
+
+    return shouldTrigger && isTaskSchedulerWithinIntervalRanges(task, nowDate) ? slotKey : null;
+  }
+
+  if (task.triggerType === 'daily' && task.dailyTime) {
+    const parsed = parseTaskSchedulerTime(task.dailyTime);
+    return parsed && currentH === parsed.hours && currentM === parsed.minutes ? slotKey : null;
+  }
+
+  if (task.triggerType === 'weekly' && task.weeklyTime && Array.isArray(task.weeklyDays)) {
+    const parsed = parseTaskSchedulerTime(task.weeklyTime);
+    const currentDay = nowDate.getDay();
+    return parsed && task.weeklyDays.includes(currentDay) && currentH === parsed.hours && currentM === parsed.minutes ? slotKey : null;
+  }
+
+  if (task.triggerType === 'monthly' && task.monthlyTime) {
+    const parsed = parseTaskSchedulerTime(task.monthlyTime);
+    const currentMonthDay = nowDate.getDate();
+    const validDays = Array.isArray(task.monthlyDays) ? task.monthlyDays : [];
+    return parsed && validDays.includes(currentMonthDay) && currentH === parsed.hours && currentM === parsed.minutes ? slotKey : null;
+  }
+
+  if (task.triggerType === 'single' && task.singleDate && task.singleTime) {
+    const parsed = parseTaskSchedulerTime(task.singleTime);
+    const currentYMD = formatTaskSchedulerYmd(nowDate);
+    return parsed && currentYMD === task.singleDate && currentH === parsed.hours && currentM === parsed.minutes ? slotKey : null;
+  }
+
+  return null;
+}
+
+async function runScheduledTask(taskId, task, configResult) {
+  const windowConfig = JSON.parse(JSON.stringify(configResult.config));
+
+  if (task.promptKey === '__DEFAULT__') {
+    if (!windowConfig.prompts) windowConfig.prompts = {};
+    const modelRoute = ['superior', 'general', 'fast'].includes(task?.modelRoute) ? task.modelRoute : 'general';
+    windowConfig.prompts['__DEFAULT__'] = {
+      type: "general",
+      prompt: "",
+      showMode: "window",
+      model: resolveDefaultAssistantModel(windowConfig, modelRoute),
+      stream: true,
+      isAlwaysOnTop: windowConfig.isAlwaysOnTop_global ?? true,
+      autoCloseOnBlur: windowConfig.autoCloseOnBlur_global ?? true,
+      window_width: 580,
+      window_height: 740,
+      icon: ""
+    };
+  }
+
+  const msg = {
+    os: utools.isMacOS() ? "macos" : utools.isWindows() ? "win" : "linux",
+    code: task.promptKey,
+    type: "task",
+    payload: task.description,
+    taskConfig: { id: taskId, ...task },
+    tempPromptConfig: task.promptKey === '__DEFAULT__' ? windowConfig.prompts['__DEFAULT__'] : null
+  };
+
+  return await openWindow(windowConfig, msg);
+}
+
+async function checkScheduledTasks() {
+  if (isTaskSchedulerChecking) return;
+  isTaskSchedulerChecking = true;
+
+  try {
     const configResult = await getConfig();
-    const tasks = configResult.config.tasks || {};
-    const now = Date.now();
+    const tasks = configResult?.config?.tasks || {};
     let needsUpdate = false;
 
     for (const taskId in tasks) {
       const task = tasks[taskId];
-      if (!task.enabled) continue;
+      const now = Date.now();
+      const nowDate = new Date(now);
+      const slotKey = getDueTaskRunSlotKey(taskId, task, now, nowDate);
+      if (!slotKey) continue;
 
-      let shouldTrigger = false;
-      const lastRun = task.lastRunTime || 0;
-
-      // 获取当前的具体时分
-      const currentH = new Date().getHours();
-      const currentM = new Date().getMinutes();
-      // 防抖：确保同一分钟内不会因为重复判断而触发两次
-      const safeCooldown = (now - lastRun) > 60000;
-
-      if (task.triggerType === 'interval') {
-        if (task.intervalStartTime) {
-          const [hours, minutes] = task.intervalStartTime.split(':').map(Number);
-          const currentTotalMins = currentH * 60 + currentM;
-          const startTotalMins = hours * 60 + minutes;
-          const intervalMins = Math.max(task.intervalMinutes || 1, 1);
-
-          if (currentTotalMins >= startTotalMins) {
-            const diffMins = currentTotalMins - startTotalMins;
-            if (diffMins % intervalMins === 0 && safeCooldown) {
-              shouldTrigger = true;
-            }
-          }
-        } else {
-          // 纯间隔触发（无特定时间点），由于没有对齐的时钟点，仅依据与上一次触发的时间差来定
-          const intervalMs = Math.max(task.intervalMinutes || 1, 1) * 60000;
-          if (now - lastRun >= intervalMs) {
-            shouldTrigger = true;
-          }
+      try {
+        const senderId = await runScheduledTask(taskId, task, configResult);
+        if (!senderId) {
+          console.warn(`[Task Scheduler] task ${taskId} due but window did not open`);
+          continue;
         }
-      } else if (task.triggerType === 'daily' && task.dailyTime) {
-        const [hours, minutes] = task.dailyTime.split(':').map(Number);
-        if (currentH === hours && currentM === minutes && safeCooldown) {
-          shouldTrigger = true;
-        }
-      } else if (task.triggerType === 'weekly' && task.weeklyTime && task.weeklyDays) {
-        const [hours, minutes] = task.weeklyTime.split(':').map(Number);
-        const currentDay = new Date().getDay();
-        if (task.weeklyDays.includes(currentDay)) {
-          if (currentH === hours && currentM === minutes && safeCooldown) {
-            shouldTrigger = true;
-          }
-        }
-      } else if (task.triggerType === 'monthly' && task.monthlyTime) {
-        const [hours, minutes] = task.monthlyTime.split(':').map(Number);
-        const currentMonthDay = new Date().getDate();
-        const validDays = Array.isArray(task.monthlyDays) ? task.monthlyDays : [];
 
-        if (validDays.includes(currentMonthDay)) {
-          if (currentH === hours && currentM === minutes && safeCooldown) {
-            shouldTrigger = true;
-          }
-        }
-      } else if (task.triggerType === 'single' && task.singleDate && task.singleTime) {
-        const nowD = new Date();
-        const currentYMD = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, '0')}-${String(nowD.getDate()).padStart(2, '0')}`;
-        const [hours, minutes] = task.singleTime.split(':').map(Number);
-
-        if (currentYMD === task.singleDate && currentH === hours && currentM === minutes && safeCooldown) {
-          shouldTrigger = true;
+        const completedAt = Date.now();
+        task.lastRunTime = completedAt;
+        task.lastRunSlotKey = slotKey;
+        if (task.triggerType === 'single') {
           task.enabled = false;
         }
-      }
-
-      if (shouldTrigger && task.triggerType === 'interval' && task.intervalTimeRanges && task.intervalTimeRanges.length > 0) {
-        const nowHhMm = `${String(new Date().getHours()).padStart(2, '0')}:${String(new Date().getMinutes()).padStart(2, '0')}`;
-        const isWithinRange = task.intervalTimeRanges.some(range => {
-          if (Array.isArray(range) && range.length === 2) {
-            return nowHhMm >= range[0] && nowHhMm <= range[1];
-          }
-          return false;
-        });
-
-        // 如果当前时间不在任何一个设定的时间段内，否决触发
-        if (!isWithinRange) {
-          shouldTrigger = false;
-        }
-      }
-
-      if (shouldTrigger) {
-        task.lastRunTime = now;
+        processedTaskRunSlots.set(slotKey, completedAt);
         needsUpdate = true;
-
-        const windowConfig = JSON.parse(JSON.stringify(configResult.config));
-
-        if (task.promptKey === '__DEFAULT__') {
-      if (!windowConfig.prompts) windowConfig.prompts = {};
-      const modelRoute = ['superior', 'general', 'fast'].includes(task?.modelRoute) ? task.modelRoute : 'general';
-      windowConfig.prompts['__DEFAULT__'] = {
-        type: "general",
-        prompt: "",
-        showMode: "window",
-        model: resolveDefaultAssistantModel(windowConfig, modelRoute),
-            stream: true,
-            isAlwaysOnTop: windowConfig.isAlwaysOnTop_global ?? true,
-            autoCloseOnBlur: windowConfig.autoCloseOnBlur_global ?? true,
-            window_width: 580,
-            window_height: 740,
-            icon: ""
-          };
-        }
-
-        // 触发独立窗口
-        const msg = {
-          os: utools.isMacOS() ? "macos" : utools.isWindows() ? "win" : "linux",
-          code: task.promptKey,
-          type: "task",
-          payload: task.description,
-          taskConfig: { id: taskId, ...task },
-          tempPromptConfig: task.promptKey === '__DEFAULT__' ? windowConfig.prompts['__DEFAULT__'] : null
-        };
-        // 传入安全的 windowConfig
-        await openWindow(windowConfig, msg);
+      } catch (error) {
+        console.error(`[Task Scheduler] failed to run task ${taskId}:`, error);
       }
     }
 
@@ -922,8 +1066,25 @@ setInterval(async () => {
     }
   } catch (e) {
     console.error("Task Scheduler Error:", e);
+  } finally {
+    pruneTaskSchedulerRunSlots();
+    isTaskSchedulerChecking = false;
   }
-}, 1000); // 每秒轮询一次，保证精准执行
+}
+
+function startTaskScheduler() {
+  if (taskSchedulerTimer) return;
+  taskSchedulerTimer = setInterval(() => {
+    void checkScheduledTasks();
+  }, TASK_SCHEDULER_CHECK_INTERVAL_MS);
+  void checkScheduledTasks();
+}
+
+try {
+  startTaskScheduler();
+} catch (e) {
+  console.error('[Task Scheduler] failed to start:', e);
+}
 
 ipcRenderer.on('background-shell-request', async (e, { requestId, action, payload }) => {
   try {

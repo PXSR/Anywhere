@@ -413,16 +413,11 @@ async function readSessionMetadata(filePath, fallbackBasename, cacheContext = nu
         }
 
         const sessionMetadata = sessionData.sessionMetadata || {};
-        const timestamps = collectSessionTimestamps(sessionData);
-        const fallbackCreatedAt = timestamps[0] || null;
-        const fallbackUpdatedAt = timestamps[timestamps.length - 1] || null;
 
         const normalizedMetadata = {
             title: typeof sessionMetadata.title === 'string' && sessionMetadata.title.trim()
                 ? sessionMetadata.title.trim()
                 : (fallbackBasename.endsWith('.json') ? fallbackBasename.slice(0, -5) : fallbackBasename),
-            createdAt: normalizeSessionTimestamp(sessionMetadata.createdAt) || fallbackCreatedAt,
-            updatedAt: normalizeSessionTimestamp(sessionMetadata.updatedAt) || fallbackUpdatedAt,
         };
 
         if (cacheContext && cacheContext.stats) {
@@ -444,8 +439,9 @@ async function readSessionMetadata(filePath, fallbackBasename, cacheContext = nu
  * @param {string} dirPath - 目录路径
  * @returns {Promise<Array<object>>} 返回文件信息数组
  */
-async function listJsonFiles(dirPath) {
+async function listJsonFiles(dirPath, options = {}) {
     if (!dirPath) return [];
+    const includeSessionMetadataTitle = options?.includeSessionMetadataTitle !== false;
     const resolvedDirPath = path.resolve(String(dirPath).trim());
     const entries = await fs.readdir(resolvedDirPath, { withFileTypes: true });
     const jsonFiles = entries.filter(
@@ -459,11 +455,24 @@ async function listJsonFiles(dirPath) {
             const filePath = path.join(resolvedDirPath, entry.name);
             try {
                 const stats = await fs_node.promises.stat(filePath);
-                return createSessionFileSummary({
+                const summary = createSessionFileSummary({
                     filePath,
                     basename: entry.name,
                     stats
                 });
+                if (!includeSessionMetadataTitle) {
+                    return summary;
+                }
+                const sessionMetadata = await readSessionMetadata(filePath, entry.name, { stats });
+
+                if (sessionMetadata) {
+                    return {
+                        ...summary,
+                        title: sessionMetadata.title || summary.title
+                    };
+                }
+
+                return summary;
             } catch (error) {
                 console.error(`无法获取文件信息: ${filePath}`, error);
                 return null;

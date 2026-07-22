@@ -156,7 +156,7 @@ async function handleCodeClick(text) {
   if (!text || typeof text !== 'string') {
     return 'copied';
   }
-  
+
   // 移除首尾空白和引号 (支持 'path' 或 "path")
   const content = text.trim().replace(/^["']|["']$/g, '');
 
@@ -174,19 +174,19 @@ async function handleCodeClick(text) {
   // 2. 检查是否为本地文件路径
   try {
     let resolvedPath = content;
-    
+
     // 处理 ~ 路径 (macOS/Linux)
     if (content.startsWith('~')) {
       resolvedPath = path.join(utools.getPath('home'), content.slice(1));
     }
-    
+
     // 简单的路径格式校验 (Windows盘符 或 Unix根路径 或 相对路径)
     // 增加对 C:\ 或 /Users 等格式的宽容度
     const isLikelyPath = /^[a-zA-Z]:[\\/]/.test(resolvedPath) || resolvedPath.startsWith('/') || resolvedPath.startsWith('./') || resolvedPath.startsWith('../') || resolvedPath.includes(path.sep);
 
     if (isLikelyPath) {
         const exists = fs.existsSync(resolvedPath);
-        
+
         if (exists) {
             // 尝试打开文件或目录
             utools.shellOpenPath(resolvedPath);
@@ -209,6 +209,9 @@ window.api = {
     saveSetting,
     getUser,
     getRandomItem: (list) => getChatModule().getRandomItem(list),
+    batchTestProviderKeys: async (input = {}) => {
+        return await getChatModule().batchTestProviderKeys(input);
+    },
     createChatCompletion: async (params) => {
         return await getChatModule().createChatCompletion(params);
     },
@@ -223,7 +226,12 @@ window.api = {
     parseProjectsYaml: (...args) => getProjectsModule().parseProjectsYaml(...args),
     serializeProjectsYaml: (...args) => getProjectsModule().serializeProjectsYaml(...args),
     mergeFileAssignment: (...args) => getProjectsModule().mergeFileAssignment(...args),
+    mergeProjectAssignment: (...args) => getProjectsModule().mergeProjectAssignment(...args),
     findProjectByBasename: (...args) => getProjectsModule().findProjectByBasename(...args),
+    parseChatMetadataYaml: (...args) => getProjectsModule().parseChatMetadataYaml(...args),
+    serializeChatMetadataYaml: (...args) => getProjectsModule().serializeChatMetadataYaml(...args),
+    normalizeChatMetadataIndex: (...args) => getProjectsModule().normalizeChatMetadataIndex(...args),
+    normalizeChatMetadataEntry: (...args) => getProjectsModule().normalizeChatMetadataEntry(...args),
     handleCodeClick,
     sethotkey,
     setZoomFactor,
@@ -235,7 +243,7 @@ window.api = {
     initializeMcpClient: async (activeServerConfigs) => {
         const { initializeMcpClient } = getMcpModule();
         try {
-            const cache = await getMcpToolCache();            
+            const cache = await getMcpToolCache();
             return await initializeMcpClient(activeServerConfigs, cache, saveMcpToolCache);
         } catch (e) {
             console.error("[WindowPreload] Error loading MCP cache:", e);
@@ -253,6 +261,7 @@ window.api = {
                 url: serverConfig.baseUrl,
                 env: serverConfig.env,
                 headers: serverConfig.headers,
+                auth: serverConfig.auth,
             });
 
             const sanitizeToolAlias = (name, fallback = 'tool') => {
@@ -304,6 +313,13 @@ window.api = {
     saveMcpToolCache,
     closeMcpClient: async (...args) => {
         return await getMcpModule().closeMcpClient(...args);
+    },
+    // Read-only OAuth status passthrough (window can display auth badges but
+    // cannot drive login — that lives in the main panel via preload.js).
+    mcpOAuth_getStatus: async ({ serverId, serverConfig } = {}) => {
+        const mod = getMcpModule();
+        if (mod.getMcpAuthStatus) return { success: true, status: await mod.getMcpAuthStatus(serverId, serverConfig) };
+        return { success: false, error: 'getMcpAuthStatus unavailable' };
     },
     isFileTypeSupported,
     parseFileObject,
@@ -402,6 +418,22 @@ window.api = {
             throw e;
         }
     },
+
+    exportSkillToPackage: async (rootPath, skillId, outputDir, options = {}) => {
+        return getSkillModule().exportSkillToPackage(rootPath, skillId, outputDir, options);
+    },
+    exportSkillPackageBuffer: async (rootPath, skillId, options = {}) => {
+        return getSkillModule().exportSkillPackageBuffer(rootPath, skillId, options);
+    },
+    extractSkillPackage: async (filePath) => {
+        return getSkillModule().extractSkillPackage(filePath);
+    },
+    importSkillPackageBuffer: async (rootPath, skillId, packageBuffer) => {
+        const res = await getSkillModule().importSkillPackageBuffer(rootPath, skillId, packageBuffer);
+        broadcastEvent('skills-updated');
+        return res;
+    },
+
     onMcpCacheUpdated: (callback) => {
         const normalizePayload = (payload) => {
             if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -453,13 +485,13 @@ window.api = {
                     text: "Error: Sub-Agent skill requires execution context (API Key, etc)."
                 }], null, 2);
             }
-            
+
             // 3. 自动调用内置的 sub_agent 工具
             // 注意：invokeBuiltinTool 已经修复为返回序列化的 JSON 字符串，直接透传即可
             return await getMcpBuiltinModule().invokeBuiltinTool(
-                'sub_agent', 
-                result.subAgentArgs, 
-                signal, 
+                'sub_agent',
+                result.subAgentArgs,
+                signal,
                 globalContext
             );
         }

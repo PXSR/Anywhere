@@ -1,5 +1,111 @@
+// Polyfill Timer.unref/ref for runtimes (e.g. uTools/Electron preload) where
+// setTimeout may return a number or a handle without Node's Timeout.unref().
+// @modelcontextprotocol/sdk StdioClientTransport.close() does:
+//   new Promise(resolve => setTimeout(resolve, 2000).unref())
+// Without this shim, closing user-configured stdio MCP clients fails with:
+//   "setTimeout(...).unref is not a function"
+// which surfaces as "工具执行或参数解析错误" after an otherwise successful tool call.
+(function ensureTimerUnrefPolyfill() {
+  const g = typeof globalThis !== 'undefined' ? globalThis : global;
+  if (!g || typeof g.setTimeout !== 'function') return;
+
+  let probe;
+  try {
+    probe = g.setTimeout(() => {}, 0);
+    if (typeof g.clearTimeout === 'function') g.clearTimeout(probe);
+  } catch (_) {
+    return;
+  }
+
+  if (probe && typeof probe.unref === 'function') return;
+
+  if (probe && (typeof probe === 'object' || typeof probe === 'function')) {
+    try {
+      const proto = Object.getPrototypeOf(probe);
+      if (proto && typeof proto.unref !== 'function') {
+        Object.defineProperty(proto, 'unref', {
+          value: function unref() { return this; },
+          configurable: true,
+          writable: true,
+        });
+      }
+      if (proto && typeof proto.ref !== 'function') {
+        Object.defineProperty(proto, 'ref', {
+          value: function ref() { return this; },
+          configurable: true,
+          writable: true,
+        });
+      }
+      if (typeof probe.unref === 'function') return;
+    } catch (_) {
+      // fall through to wrapper path
+    }
+  }
+
+  const originalSetTimeout = g.setTimeout;
+  if (originalSetTimeout.__anywhereUnrefPatched) return;
+
+  function attachUnref(handle) {
+    if (handle == null) return handle;
+    if (typeof handle === 'object' || typeof handle === 'function') {
+      if (typeof handle.unref !== 'function') {
+        try { handle.unref = function unref() { return handle; }; } catch (_) { /* ignore */ }
+      }
+      if (typeof handle.ref !== 'function') {
+        try { handle.ref = function ref() { return handle; }; } catch (_) { /* ignore */ }
+      }
+      return handle;
+    }
+
+    // Primitive timer id (browser-like). Provide a chainable wrapper that still
+    // round-trips through clearTimeout via the patched clearer below.
+    return {
+      __anywhereTimerId: handle,
+      unref() { return this; },
+      ref() { return this; },
+      valueOf() { return handle; },
+      [Symbol.toPrimitive]() { return handle; },
+    };
+  }
+
+  function setTimeoutPatched(...args) {
+    return attachUnref(originalSetTimeout.apply(this, args));
+  }
+  setTimeoutPatched.__anywhereUnrefPatched = true;
+  g.setTimeout = setTimeoutPatched;
+
+  if (typeof g.setInterval === 'function' && !g.setInterval.__anywhereUnrefPatched) {
+    const originalSetInterval = g.setInterval;
+    function setIntervalPatched(...args) {
+      return attachUnref(originalSetInterval.apply(this, args));
+    }
+    setIntervalPatched.__anywhereUnrefPatched = true;
+    g.setInterval = setIntervalPatched;
+  }
+
+  function patchClearer(name) {
+    const original = g[name];
+    if (typeof original !== 'function' || original.__anywhereUnrefPatched) return;
+    function clearerPatched(handle) {
+      const id = handle && typeof handle === 'object' && Object.prototype.hasOwnProperty.call(handle, '__anywhereTimerId')
+        ? handle.__anywhereTimerId
+        : handle;
+      return original.call(this, id);
+    }
+    clearerPatched.__anywhereUnrefPatched = true;
+    g[name] = clearerPatched;
+  }
+
+  patchClearer('clearTimeout');
+  patchClearer('clearInterval');
+})();
+
+
 const { MultiServerMCPClient } = require("@langchain/mcp-adapters");
 const { getBuiltinTools, invokeBuiltinTool } = require('./mcp_builtin.js');
+const oauthStore = require('./mcp_oauth_store.js');
+const oauthProvider = require('./mcp_oauth_provider.js');
+const oauthCb = require('./mcp_oauth_cb.js');
 
 const PERSISTENT_CONNECTION_LIMIT = 5; // uTools 限制最多5个持久连接
 const ON_DEMAND_CONCURRENCY_LIMIT = 5; // 非持久连接的并发限制
@@ -117,9 +223,43 @@ function preprocessStdioConfig(config) {
         result.env = { ...process.env, ...result.env };
       }
     }
+
+    // OAuth stdio env injection happens at connect time (async) via
+    // prepareStdioAuthEnv, since token resolution is async.
   }
 
   return result;
+}
+
+// stdio OAuth env injection (async, resolves current token before spawn).
+async function prepareStdioAuthEnv(serverConfig) {
+  const auth = serverConfig && serverConfig.auth && typeof serverConfig.auth === 'object' ? serverConfig.auth : null;
+  if (!auth || auth.type !== 'oauth' || !auth.oauth) return undefined;
+  const serverId = serverConfig && serverConfig.id;
+  if (!serverId) return undefined;
+  const tokens = await oauthStore.loadTokens(serverId);
+  if (!tokens || !tokens.access_token) return undefined;
+  if (oauthStore.isExpired(tokens.expires_at)) {
+    const err = new Error(`OAuth token expired for ${serverId}`);
+    err.needsReauth = true;
+    err.authExpired = true;
+    throw err;
+  }
+  const mapping = (auth.oauth.envMapping && Array.isArray(auth.oauth.envMapping) && auth.oauth.envMapping.length)
+    ? auth.oauth.envMapping
+    : ['OAUTH_TOKEN', 'MCP_OAUTH_TOKEN'];
+  const env = {};
+  for (const key of mapping) env[key] = tokens.access_token;
+  if (tokens.expires_at) env.OAUTH_EXPIRES_AT = String(tokens.expires_at);
+  return env;
+}
+
+async function applyStdioAuthEnv(runtimeConfig, id, sourceConfig) {
+  const transportType = normalizeTransportType(runtimeConfig.transport || runtimeConfig.type || sourceConfig?.transport || sourceConfig?.type || '');
+  if (transportType !== 'stdio') return runtimeConfig;
+  const stdioEnv = await prepareStdioAuthEnv({ id, ...(sourceConfig || {}) });
+  if (stdioEnv) runtimeConfig.env = { ...(runtimeConfig.env || {}), ...stdioEnv };
+  return runtimeConfig;
 }
 
 
@@ -149,7 +289,31 @@ function buildMcpClientServerConfig(id, config = {}, options = {}) {
     delete runtimeConfig.defaultToolTimeout;
   }
 
+  // --- OAuth: mount authProvider for HTTP/SSE; inject env for stdio ---
+  const auth = sourceConfig.auth && typeof sourceConfig.auth === 'object' ? sourceConfig.auth : null;
+  const transportType = normalizeTransportType(sourceConfig.transport || sourceConfig.type || '');
+  if (auth && auth.type === 'oauth' && (transportType === 'http' || transportType === 'sse')) {
+    runtimeConfig.authProvider = oauthProvider.buildOAuthClientProvider(id, sourceConfig);
+  }
+  if (auth && auth.type === 'bearer' && auth.bearerToken) {
+    // Static bearer stays in headers (existing behavior preserved).
+    runtimeConfig.headers = { ...(runtimeConfig.headers || {}), Authorization: `Bearer ${auth.bearerToken}` };
+  }
+  delete runtimeConfig.auth;
+
   return { id, ...runtimeConfig };
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((acc, key) => {
+      const item = stableValue(value[key]);
+      if (item !== undefined) acc[key] = item;
+      return acc;
+    }, {});
+  }
+  return value;
 }
 
 function getToolFetchKey(id, config = {}) {
@@ -161,9 +325,124 @@ function getToolFetchKey(id, config = {}) {
     url: config.url || config.baseUrl || '',
     env: config.env && typeof config.env === 'object' ? Object.entries(config.env).sort(([a], [b]) => a.localeCompare(b)) : [],
     headers: config.headers && typeof config.headers === 'object' ? Object.entries(config.headers).sort(([a], [b]) => a.localeCompare(b)) : [],
+    auth: stableValue(config.auth || null),
     isPersistent: Boolean(config.isPersistent)
   };
   return JSON.stringify(normalizedConfig);
+}
+
+// ---------------------------------------------------------------------------
+// OAuth auth orchestration
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the interactive OAuth login flow for a server when the SDK throws
+ * UnauthorizedError. Steps:
+ *   1. Build provider + start loopback callback.
+ *   2. Trigger discovery+DCR via SDK auth() helper (this calls
+ *      provider.redirectToAuthorization → external browser opens).
+ *   3. Wait for callback, validate state.
+ *   4. Exchange code via finishAuthFlow (transport.finishAuth if a client is
+ *      reachable, else SDK auth() helper).
+ *
+ * Returns true on success, throws on failure. The caller reconnects after.
+ */
+async function ensureMcpAuthenticated(id, serverConfig) {
+  const auth = serverConfig && serverConfig.auth && typeof serverConfig.auth === 'object' ? serverConfig.auth : null;
+  if (!auth || auth.type !== 'oauth') return false;
+
+  const transportType = normalizeTransportType(serverConfig.transport || serverConfig.type || '');
+  if (transportType === 'stdio') {
+    throw new Error(`Interactive OAuth login is not supported for stdio servers (${id}) in this release.`);
+  }
+
+  const serverUrl = serverConfig.url || serverConfig.baseUrl;
+  if (!serverUrl) throw new Error(`OAuth login requires a server url for ${id}`);
+
+  const seedProvider = oauthProvider.buildOAuthClientProvider(id, serverConfig);
+  const state = typeof seedProvider.state === 'function' ? await seedProvider.state() : undefined;
+  const loopback = await oauthCb.startLoopbackCallback({ expectedState: state, port: 0 });
+  const liveProvider = oauthProvider.buildOAuthClientProvider(id, serverConfig, {
+    redirectUri: loopback.redirectUri,
+    state,
+  });
+
+  let authorizeUrl = null;
+  liveProvider.redirectToAuthorization = async (url) => {
+    authorizeUrl = String(url);
+    try {
+      const parsed = new URL(String(url));
+      const nextState = parsed.searchParams.get('state');
+      if (nextState && typeof liveProvider._getPendingState === 'function' && liveProvider._getPendingState() !== nextState) {
+        // keep parity if the SDK regenerated state for any reason
+        liveProvider._getPendingState = () => nextState;
+      }
+    } catch (_) {
+      // ignore malformed urls here; a clearer error is thrown below if needed
+    }
+  };
+
+  try {
+    const { auth: sdkAuth } = oauthProvider.loadSdkAuth();
+    try {
+      await sdkAuth(liveProvider, { serverUrl });
+    } catch (e) {
+      if (!oauthProvider.isUnauthorizedError(e)) throw e;
+    }
+
+    const expectedState = typeof liveProvider._getPendingState === 'function'
+      ? liveProvider._getPendingState()
+      : state;
+    if (!authorizeUrl) {
+      throw new Error(`OAuth authorization URL was not generated for ${id}`);
+    }
+
+    const params = await oauthCb.runAuthFlowWithFallback({
+      authorizeUrl,
+      expectedState,
+      preferredPort: 0,
+      loopback,
+    });
+
+    await oauthProvider.finishAuthFlow({
+      serverId: id,
+      provider: liveProvider,
+      serverConfig,
+      transport: null,
+      callbackParams: params,
+      serverUrl
+    });
+    return true;
+  } finally {
+    if (loopback && loopback.cleanup) loopback.cleanup();
+  }
+}
+
+/**
+ * Returns the auth status for a server (for UI badge + refresh decisions).
+ */
+async function getMcpAuthStatus(serverId, serverConfig) {
+  const auth = serverConfig && serverConfig.auth && typeof serverConfig.auth === 'object' ? serverConfig.auth : null;
+  if (!auth) return { configured: false, authenticated: false, type: 'none' };
+  if (auth.type === 'none') return { configured: false, authenticated: false, type: 'none' };
+  if (auth.type === 'bearer') return { configured: Boolean(auth.bearerToken), authenticated: Boolean(auth.bearerToken), type: 'bearer' };
+  if (auth.type === 'oauth') {
+    const tokens = await oauthStore.loadTokens(serverId);
+    const clientInfo = await oauthStore.loadClientInfo(serverId);
+    const dcrSupported = !auth.oauth || auth.oauth.useDcr !== false;
+    const expired = tokens ? oauthStore.isExpired(tokens.expires_at) : false;
+    return {
+      type: 'oauth',
+      configured: Boolean(auth.oauth),
+      authenticated: Boolean(tokens && tokens.access_token),
+      expired,
+      expiresAt: tokens ? tokens.expires_at : undefined,
+      scope: tokens ? tokens.scope : undefined,
+      dcrSupported,
+      hasClient: Boolean(clientInfo || auth.oauth?.clientId)
+    };
+  }
+  return { configured: false, authenticated: false, type: 'none' };
 }
 
 /**
@@ -188,10 +467,20 @@ async function connectAndFetchTools(id, config) {
     const timeoutId = setTimeout(() => controller.abort(), 10000);
 
     try {
-      const runtimeConfig = buildMcpClientServerConfig(id, config, { useConfiguredTimeout: false });
+      const runtimeConfig = await applyStdioAuthEnv(buildMcpClientServerConfig(id, config, { useConfiguredTimeout: false }), id, config);
       tempClient = new MultiServerMCPClient({ [id]: runtimeConfig }, { signal: controller.signal });
       return await tempClient.getTools();
     } catch (error) {
+      if (error && error.needsReauth) throw error;
+      // OAuth: SDK ran discovery+DCR+redirectToAuthorization then threw UnauthorizedError.
+      // For the ephemeral test-connect path we surface needsReauth so the UI can
+      // drive the interactive login via mcpOAuth_startAuthFlow (avoid blocking here).
+      if (config.auth && config.auth.type === 'oauth' && oauthProvider.isUnauthorizedError(error)) {
+        const needsReauth = new Error(`OAuth authorization required for ${id}`);
+        needsReauth.needsReauth = true;
+        needsReauth.cause = error;
+        throw needsReauth;
+      }
       console.error(`[MCP] Error fetching tools from ${id}:`, error);
       throw error;
     } finally {
@@ -379,13 +668,28 @@ async function initializeMcpClient(activeServerConfigs = {}, cachedToolsMap = {}
       }
 
       try {
-        const runtimeConfig = buildMcpClientServerConfig(id, config);
+        const runtimeConfig = await applyStdioAuthEnv(buildMcpClientServerConfig(id, config), id, config);
         const client = new MultiServerMCPClient({ [id]: runtimeConfig });
-        const tools = await client.getTools();
+        let tools;
+        try {
+          tools = await client.getTools();
+        } catch (e) {
+          if (config.auth && config.auth.type === 'oauth' && oauthProvider.isUnauthorizedError(e)) {
+            // Run interactive login then reconnect once.
+            await ensureMcpAuthenticated(id, config);
+            try { await client.close(); } catch (_) { }
+            const retryConfig = await applyStdioAuthEnv(buildMcpClientServerConfig(id, config), id, config);
+            const retryClient = new MultiServerMCPClient({ [id]: retryConfig });
+            tools = await retryClient.getTools();
+            persistentClients.set(id, retryClient);
+          } else {
+            throw e;
+          }
+        }
         const oldToolsCache = cachedToolsMap[id] || [];
         await cacheResolvedTools(id, tools, oldToolsCache).catch(e => console.error(`[MCP] Auto-cache failed for persistent ${id}:`, e));
         registerFetchedTools(id, config, tools, false, true);
-        persistentClients.set(id, client);
+        if (!persistentClients.has(id)) persistentClients.set(id, client);
         currentlyConnectedServerIds.add(id);
       } catch (error) {
         console.error(`[MCP Debug] Failed to connect to persistent server ${id}:`, error);
@@ -469,7 +773,7 @@ async function invokeMcpTool(toolName, toolArgs, signal, context = null) {
     }
 
     try {
-      const runtimeConfig = buildMcpClientServerConfig(serverConfig.id, serverConfig);
+      const runtimeConfig = await applyStdioAuthEnv(buildMcpClientServerConfig(serverConfig.id, serverConfig), serverConfig.id, serverConfig);
       tempClient = new MultiServerMCPClient({ [serverConfig.id]: runtimeConfig }, { signal: controller.signal });
       const tools = await tempClient.getTools();
       const toolToCall = tools.find(t => t.name === resolvedToolName || sanitizeToolName(t.name, serverConfig.id || 'tool') === toolName);
@@ -497,7 +801,7 @@ async function connectAndInvokeTool(id, config, toolName, toolArgs, context = nu
   const controller = new AbortController();
 
   try {
-    const runtimeConfig = buildMcpClientServerConfig(id, config);
+    const runtimeConfig = await applyStdioAuthEnv(buildMcpClientServerConfig(id, config), id, config);
     tempClient = new MultiServerMCPClient({ [id]: runtimeConfig }, { signal: controller.signal });
     const tools = await tempClient.getTools();
     const normalizedToolName = sanitizeToolName(toolName, id || 'tool');
@@ -514,6 +818,12 @@ async function connectAndInvokeTool(id, config, toolName, toolArgs, context = nu
 
     return await targetTool.call(toolArgs, { signal: controller.signal, timeout: toolTimeoutMs });
   } catch (error) {
+    if (config.auth && config.auth.type === 'oauth' && oauthProvider.isUnauthorizedError(error)) {
+      const needsReauth = new Error(`OAuth authorization required for ${id}`);
+      needsReauth.needsReauth = true;
+      needsReauth.cause = error;
+      throw needsReauth;
+    }
     console.error(`[MCP] Error invoking tool ${toolName} on ${id}:`, error);
     throw error;
   } finally {
@@ -547,4 +857,10 @@ module.exports = {
   closeMcpClient,
   connectAndFetchTools,
   connectAndInvokeTool,
+  ensureMcpAuthenticated,
+  getMcpAuthStatus,
+  _test: {
+    getToolFetchKey,
+    prepareStdioAuthEnv,
+  },
 };

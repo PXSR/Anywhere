@@ -31,6 +31,7 @@ const defaultConfig = {
         api_key: "",
         apiType: "chat_completions",
         headers: {},
+        retryCount: 3,
         modelList: [],
         enable: true,
       },
@@ -63,6 +64,7 @@ const defaultConfig = {
         autoCloseOnBlur: true,
         isAlwaysOnTop: true,
         autoSaveChat: false,
+        autoSaveProjectId: '',
       },
     },
     settingsCardOrder: ['general', 'voice', 'data', 'webdav'],
@@ -248,10 +250,10 @@ function getLocalConfigId() {
 function splitConfigForStorage(fullConfig) {
   // 1. 安全检查：如果传入为空，使用空对象防止崩溃
   const source = fullConfig || {};
-  
+
   // 2. 深拷贝
   const configCopy = JSON.parse(JSON.stringify(source));
-  
+
   // 【新增】剥离出 tasks
   const { prompts, providers, mcpServers, tasks, ...restOfConfig } = configCopy;
 
@@ -312,14 +314,14 @@ async function getConfig() {
       data: baseConfigPart,
       _rev: configDoc._rev
     });
-    
+
     configDoc = await utools.db.promises.get("config");
     localDoc = await utools.db.promises.get(localId);
   }
 
   // --- 3. 中间版本迁移：检查共享配置中是否残留了本地路径 ---
   let baseConfig = (configDoc.data && configDoc.data.config) ? configDoc.data.config : null;
-  
+
   if (baseConfig) {
       // 关键修复：确保 localData 始终是一个对象，即使 localDoc.data 缺失
       let localData = (localDoc && localDoc.data) ? localDoc.data : { skillPath: "", localChatPath: "" };
@@ -349,7 +351,7 @@ async function getConfig() {
       if (needSaveShared) {
         await utools.db.promises.put({
           _id: "config",
-          data: configDoc.data, 
+          data: configDoc.data,
           _rev: configDoc._rev
         });
         configDoc = await utools.db.promises.get("config");
@@ -379,11 +381,11 @@ async function getConfig() {
   fullConfigData.config.prompts = promptsDoc ? promptsDoc.data : defaultConfig.config.prompts;
   fullConfigData.config.providers = providersDoc ? providersDoc.data : defaultConfig.config.providers;
   fullConfigData.config.tasks = tasksDoc ? tasksDoc.data : (defaultConfig.config.tasks || {});
-  
+
   // 注入本地路径 (再次确保安全性)
   const currentLocalData = (localDoc && localDoc.data) ? localDoc.data : {};
   fullConfigData.config.skillPath = currentLocalData.skillPath || "";
-  
+
   if (!fullConfigData.config.webdav) fullConfigData.config.webdav = {};
   fullConfigData.config.webdav.localChatPath = currentLocalData.localChatPath || "";
 
@@ -393,8 +395,8 @@ async function getConfig() {
   const mergedMcpServers = { ...userMcpServers };
   for (const [id, server] of Object.entries(builtinServers)) {
       if (mergedMcpServers[id]) {
-          mergedMcpServers[id] = { 
-              ...server, 
+          mergedMcpServers[id] = {
+              ...server,
               isActive: mergedMcpServers[id].isActive,
               isPersistent: mergedMcpServers[id].isPersistent,
               timeoutSeconds: mergedMcpServers[id].timeoutSeconds
@@ -506,7 +508,7 @@ function checkConfig(config) {
     config.defaultFastModel = "";
     flag = true;
   }
-  
+
   if (!config.settingsCardOrder || !Array.isArray(config.settingsCardOrder)) {
     config.settingsCardOrder = ['general', 'voice', 'data', 'webdav'];
     flag = true;
@@ -546,7 +548,8 @@ function checkConfig(config) {
       voice: '', reasoning_effort: "default", defaultMcpServers: [], defaultSkills: [],
       window_width: 580, window_height: 740, position_x: 0, position_y: 0,
       isAlwaysOnTop: true, autoCloseOnBlur: true, matchRegex: "", icon: "",
-      autoSaveChat: false
+      autoSaveChat: false,
+      autoSaveProjectId: ''
     };
 
     for (const key of Object.keys(config.prompts)) {
@@ -585,6 +588,7 @@ function checkConfig(config) {
       }
       if (p.voice === null) { p.voice = ''; flag = true; }
       if (typeof p.autoSaveChat !== 'boolean') { p.autoSaveChat = false; flag = true; }
+      if (typeof p.autoSaveProjectId !== 'string') { p.autoSaveProjectId = ''; flag = true; }
 
       // 4.4 模型自动修复：仅修复“非空但已失效”的旧模型；空模型表示不绑定专属模型。
       if (p.model && !isValidProviderModelKey(config, p.model)) {
@@ -597,7 +601,7 @@ function checkConfig(config) {
     }
   }
 
-  
+
   if (config.mcpServers && typeof config.mcpServers === 'object') {
     for (const server of Object.values(config.mcpServers)) {
       if (!server || typeof server !== 'object') continue;
@@ -629,6 +633,10 @@ function checkConfig(config) {
       if (prov.folderId === undefined) { prov.folderId = ""; flag = true; }
       if (prov.apiType === undefined) { prov.apiType = "chat_completions"; flag = true; }
       if (!prov.headers || typeof prov.headers !== 'object' || Array.isArray(prov.headers)) { prov.headers = {}; flag = true; }
+      const normalizedRetryCount = Number.isInteger(prov.retryCount)
+        ? Math.min(Math.max(prov.retryCount, 0), 10)
+        : 3;
+      if (prov.retryCount !== normalizedRetryCount) { prov.retryCount = normalizedRetryCount; flag = true; }
     }
   }
 
@@ -662,6 +670,10 @@ function checkConfig(config) {
         task.monthlyDays = [1];
         flag = true;
       }
+      if (typeof task.autoSaveProjectId !== 'string') {
+        task.autoSaveProjectId = '';
+        flag = true;
+      }
     }
   }
 
@@ -686,7 +698,7 @@ async function saveSetting(keyPath, value) {
     if (!doc) {
       doc = { _id: localId, data: {} };
     }
-    
+
     // 更新本地数据
     if (keyPath === 'skillPath') {
       doc.data.skillPath = value;
@@ -803,9 +815,9 @@ async function saveSetting(keyPath, value) {
 /**
  * 更新完整的配置，将其拆分并分别存储
  */
-function updateConfigWithoutFeatures(newConfig) {
+async function updateConfigWithoutFeatures(newConfig) {
   const plainConfig = JSON.parse(JSON.stringify(newConfig.config));
-  
+
   if (plainConfig.mcpServers) {
       const serverToSave = {};
       const builtinIds = Object.keys(getBuiltinServers());
@@ -824,57 +836,32 @@ function updateConfigWithoutFeatures(newConfig) {
 
 
   const { baseConfigPart, promptsPart, providersPart, mcpServersPart, tasksPart, localConfigPart } = splitConfigForStorage(plainConfig);
-
-  // 1. 更新基础配置 (config)
-  let configDoc = utools.db.get("config");
-  utools.db.put({
-    _id: "config",
-    data: baseConfigPart,
-    _rev: configDoc ? configDoc._rev : undefined,
-  });
-
-  // 2. 更新快捷助手配置 (prompts)
-  let promptsDoc = utools.db.get("prompts");
-  utools.db.put({
-    _id: "prompts",
-    data: promptsPart,
-    _rev: promptsDoc ? promptsDoc._rev : undefined,
-  });
-
-  // 3. 更新服务商配置 (providers)
-  let providersDoc = utools.db.get("providers");
-  utools.db.put({
-    _id: "providers",
-    data: providersPart,
-    _rev: providersDoc ? providersDoc._rev : undefined,
-  });
-
-  // 4. 更新MCP服务器配置 (mcpServers)
-  let mcpServersDoc = utools.db.get("mcpServers");
-  utools.db.put({
-    _id: "mcpServers",
-    data: mcpServersPart,
-    _rev: mcpServersDoc ? mcpServersDoc._rev : undefined,
-  });
-
-  // 5. 将 tasks 存入独立文档
-  let tasksDoc = utools.db.get("tasks");
-  utools.db.put({
-    _id: "tasks",
-    data: tasksPart,
-    _rev: tasksDoc ? tasksDoc._rev : undefined,
-  });
-
-  // 6. 更新本地特定配置
   const localId = getLocalConfigId();
-  let localDoc = utools.db.get(localId);
-  utools.db.put({
-    _id: localId,
-    data: localConfigPart,
-    _rev: localDoc ? localDoc._rev : undefined
-  });
 
-  // 7. 广播配置更新
+  const readRev = async (docId) => {
+    const doc = await utools.db.promises.get(docId);
+    return doc ? doc._rev : undefined;
+  };
+
+  const putChecked = async (docId, data) => {
+    const result = await utools.db.promises.put({
+      _id: docId,
+      data,
+      _rev: await readRev(docId),
+    });
+    if (!result || result.ok === false) {
+      throw new Error(`Failed to update config document: ${docId}`);
+    }
+    return result;
+  };
+
+  await putChecked("config", baseConfigPart);
+  await putChecked("prompts", promptsPart);
+  await putChecked("providers", providersPart);
+  await putChecked("mcpServers", mcpServersPart);
+  await putChecked("tasks", tasksPart);
+  await putChecked(localId, localConfigPart);
+
   const fullConfigForFrontend = JSON.parse(JSON.stringify(newConfig.config));
   for (const windowInstance of windowMap.values()) {
     if (!windowInstance.isDestroyed()) {
@@ -887,6 +874,7 @@ function updateConfigWithoutFeatures(newConfig) {
   }
 
   cleanUpBackgroundCache(newConfig);
+  return { success: true, config: fullConfigForFrontend };
 }
 
 function updateConfig(newConfig) {
@@ -953,7 +941,7 @@ function updateConfig(newConfig) {
   // 移除不再需要的 features
   for (const [code, feature] of featuresMap) {
     if (code === "Anywhere Settings" || code === "Resume Conversation") continue;
-    
+
     // 处理追问窗口特征的生命周期 (跳过普通逻辑，只判断窗口存活性)
     if (code.startsWith('append_to_')) {
       const sid = code.replace('append_to_', '');
@@ -991,31 +979,31 @@ function getPosition(config, promptCode, msg = null) {
   const primaryDisplay = utools.getPrimaryDisplay();
   // 优先使用 workArea (工作区)，这样会自动避开 Windows 任务栏或 macOS Dock/顶部菜单栏
   const baseBounds = primaryDisplay.workArea || primaryDisplay.bounds;
-  
+
   let currentDisplay;
 
   // --- 1. 定时任务 -> 强制右上角 (不贴边) ---
   if (msg && msg.type === 'task') {
     const padding = 30; // 距离屏幕边缘的距离
-    
+
     // 计算 X: 屏幕最右侧 - 窗口宽度 - 边距
     windowX = baseBounds.x + baseBounds.width - width - padding;
-    
+
     // 计算 Y: 屏幕最顶部 + 边距
     windowY = baseBounds.y + padding;
-    
+
     currentDisplay = primaryDisplay;
-  } 
+  }
   // --- 2. 召唤任务 (Summon) -> 强制右下角 (不贴边) ---
   else if (msg && msg.type === 'summon') {
     const padding = 30; // 距离屏幕边缘的距离
-    
+
     // 计算 X: 屏幕最右侧 - 窗口宽度 - 边距
     windowX = baseBounds.x + baseBounds.width - width - padding;
-    
+
     // 计算 Y: 屏幕最底部 - 窗口高度 - 边距
     windowY = baseBounds.y + baseBounds.height - height - padding;
-    
+
     currentDisplay = primaryDisplay;
   }
   // --- 3. 普通唤起 -> 依据设置 (固定位置 或 跟随鼠标) ---
@@ -1124,9 +1112,9 @@ async function openWindow(config, msg) {
   }
 
   const promptCode = msg.originalCode || msg.code;
-  
+
   // 1. 将 const 改为 let，以允许修改窗口坐标
-  let { x, y, width, height } = getPosition(config, promptCode, msg); 
+  let { x, y, width, height } = getPosition(config, promptCode, msg);
 
   const OFFSET_STEP = 30;
   let attempts = 0;
@@ -1155,28 +1143,28 @@ async function openWindow(config, msg) {
     }
 
     if (!isOverlap) break; // 当前位置无重叠，直接使用
-    
+
     attempts++;
-    
+
     // 尝试向右下方偏移
     let newX = originalX + attempts * OFFSET_STEP;
     let newY = originalY + attempts * OFFSET_STEP;
-    
+
     // 如果向右下偏移超出了屏幕可用边界，则尝试反向向左上方偏移
     if (displayArea && (newX + width > displayArea.x + displayArea.width || newY + height > displayArea.y + displayArea.height)) {
        newX = originalX - attempts * OFFSET_STEP;
        newY = originalY - attempts * OFFSET_STEP;
-       
+
        // 如果向左上也超出了屏幕左上边界，则贴边对齐并结束偏移
        if (newX < displayArea.x || newY < displayArea.y) {
            newX = Math.max(displayArea.x, newX);
            newY = Math.max(displayArea.y, newY);
            x = newX;
            y = newY;
-           break; 
+           break;
        }
     }
-    
+
     x = newX;
     y = newY;
   }
@@ -1203,11 +1191,11 @@ async function openWindow(config, msg) {
       // 1. 获取已存在的同名窗口，自动生成不冲突的序号
       const features = utools.getFeatures();
       const baseName = `追问 ${promptCode}`;
-      
+
       // 安全转义 promptCode 用于正则匹配，提取最大后缀 x
       const escapedPromptCode = promptCode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const nameRegex = new RegExp(`^追问 ${escapedPromptCode}(?:-(\\d+))?$`);
-      
+
       let maxIdx = -1;
       features.forEach(f => {
         if (f.code.startsWith('append_to_')) {
@@ -1284,13 +1272,13 @@ async function openWindow(config, msg) {
               console.log(`[Timer Checkpoint] utools.createBrowserWindow callback executed. Elapsed: ${(windowShownTime - startTime).toFixed(2)} ms`);
             }
             ubWindow.webContents.send(channel, msg);
-            releaseQueue(); 
+            releaseQueue();
           }
         );
-        
+
         windowMap.set(senderId, ubWindow);
         resolve(senderId);
-        
+
         if (utools.isDev()) {
           ubWindow.webContents.openDevTools({ mode: "detach" });
         }
@@ -1299,7 +1287,7 @@ async function openWindow(config, msg) {
       });
     }).catch((err) => {
       console.error("Window creation queue error:", err);
-      resolve(senderId); 
+      resolve(senderId);
     });
   });
 }
@@ -1424,9 +1412,9 @@ async function openFastInputWindow(config, msg) {
     startTime = performance.now();
     console.log(`[Timer Start] Opening window for code: ${msg.code}`);
   }
-  
-  const streamBuffer = []; 
-  let fastWindowRef = null; 
+
+  const streamBuffer = [];
+  let fastWindowRef = null;
 
   const sendToWindow = (type, payload) => {
     if (fastWindowRef && !fastWindowRef.isDestroyed()) {
@@ -1439,12 +1427,13 @@ async function openFastInputWindow(config, msg) {
   // 1. 准备请求参数
   const code = msg.code;
   const promptConfig = config.prompts[code];
-  
+
   // 解析模型配置：快捷助手 model 允许为空，空值回退到默认助手模型/首个可用模型。
   let apiUrl = config.providers["0"]?.url; // 默认 fallback
   let apiKey = config.providers["0"]?.api_key;
   let apiType = config.providers["0"]?.apiType || 'chat_completions'; // 默认 API 类型
   let providerHeaders = config.providers["0"]?.headers || {};
+  let providerRetryCount = Number.isInteger(config.providers["0"]?.retryCount) ? config.providers["0"]?.retryCount : 3;
   let modelName = "";
 
   const promptModelKey = isValidProviderModelKey(config, promptConfig?.model)
@@ -1459,6 +1448,7 @@ async function openFastInputWindow(config, msg) {
           apiKey = provider.api_key;
           apiType = provider.apiType || 'chat_completions';
           providerHeaders = provider.headers || {};
+          providerRetryCount = Number.isInteger(provider.retryCount) ? provider.retryCount : 3;
           modelName = mName;
       }
   }
@@ -1488,6 +1478,7 @@ async function openFastInputWindow(config, msg) {
       model: modelName,
       apiType: apiType, // 传递 API 类型
       headers: providerHeaders,
+      retryCount: providerRetryCount,
       messages: [
           { role: "system", content: promptConfig.prompt },
           { role: "user", content: content }
@@ -1533,7 +1524,7 @@ async function openFastInputWindow(config, msg) {
               // Chat Completions API
               fullText = response.choices?.[0]?.message?.content || "";
           }
-          
+
           sendToWindow('chunk', fullText);
       }
       sendToWindow('done', null);
@@ -1594,10 +1585,10 @@ async function openFastInputWindow(config, msg) {
 async function openAppendSelectorWindow(features, payload, type) {
   const listData = features.map(f => ({
     senderId: f.code.replace('append_to_', ''),
-    name: f.explain.replace('追问 ', ''), 
+    name: f.explain.replace('追问 ', ''),
     icon: f.icon
   })).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-  
+
   let startTime;
   if (utools.isDev()) {
     startTime = performance.now();
@@ -1609,7 +1600,7 @@ async function openAppendSelectorWindow(features, payload, type) {
   // 智能排版：超过 5 个就变成双列
   const columns = count > 5 ? 2 : 1;
   const rows = Math.ceil(count / columns);
-  
+
   // 根据列数分配宽度：1列 250px，2列 460px
   const winWidth = columns === 1 ? 250 : 460;
   // 精确计算高度：阴影留白(30) + 标题栏(36) + (行数 * 单项高46) + 底部留白(12)
@@ -1641,18 +1632,18 @@ async function openAppendSelectorWindow(features, payload, type) {
       preload: "./fast_window_preload.js",
     }
   }, () => {
-    
+
     if (utools.isDev()) {
       const windowShownTime = performance.now();
       console.log(`[Timer Checkpoint] utools.createBrowserWindow callback executed. Elapsed: ${(windowShownTime - startTime).toFixed(2)} ms`);
     }
 
-    selectorWin.webContents.send('init-selector', { 
-      list: listData, 
-      payload, 
-      type, 
+    selectorWin.webContents.send('init-selector', {
+      list: listData,
+      payload,
+      type,
       isDark,
-      columns 
+      columns
     });
   });
 }
@@ -1951,8 +1942,8 @@ async function addTaskHistory(taskId, logEntry) {
         doc.data[taskId].history = doc.data[taskId].history.slice(0, 50);
     }
     const result = await utools.db.promises.put({ _id: "tasks", data: doc.data, _rev: doc._rev });
-    
-    if (result.ok) { 
+
+    if (result.ok) {
       const fullConfig = await getConfig();
       broadcastEvent('config-updated', fullConfig.config);
     }

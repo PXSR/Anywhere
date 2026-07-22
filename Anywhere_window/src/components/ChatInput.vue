@@ -1,6 +1,6 @@
 <script setup>
 import { ref, h, onMounted, onBeforeUnmount, nextTick, watch, computed } from 'vue';
-import { ElFooter, ElRow, ElCol, ElText, ElDivider, ElButton, ElInput, ElMessage, ElTooltip, ElScrollbar, ElIcon, ElImage } from 'element-plus';
+import { ElFooter, ElRow, ElCol, ElText, ElDivider, ElButton, ElInput, ElMessage, ElMessageBox, ElTag, ElTooltip, ElScrollbar, ElIcon, ElImage, ElDialog } from 'element-plus';
 import { Close, Check, Document, Delete, Collection, Picture, ChatLineRound } from '@element-plus/icons-vue';
 
 // --- Props and Emits ---
@@ -19,11 +19,13 @@ const props = defineProps({
     activeMcpIds: { type: Array, default: () => [] },
     activeSkillIds: { type: Array, default: () => [] },
     allSkills: { type: Array, default: () => [] },
-    appendBuffer: { type: Array, default: () => [] }
+    appendBuffer: { type: Array, default: () => [] },
+    subAgentTasks: { type: Array, default: () => [] },
+    subAgentDetails: { type: Object, default: () => ({}) }
 });
 
 // 增加 toggle-mcp 事件
-const emit = defineEmits(['submit', 'cancel', 'clear-history', 'remove-file', 'upload', 'send-audio', 'open-mcp-dialog', 'pick-file-start', 'toggle-mcp', 'toggle-skill', 'open-skill-dialog', 'cancel-buffer']);
+const emit = defineEmits(['submit', 'cancel', 'clear-history', 'remove-file', 'upload', 'send-audio', 'open-mcp-dialog', 'pick-file-start', 'toggle-mcp', 'toggle-skill', 'open-skill-dialog', 'cancel-buffer', 'stop-subagent', 'acknowledge-subagent', 'acknowledge-all-subagents', 'rerun-subagent', 'open-subagent-detail', 'close-subagent-detail']);
 
 // --- Refs and State ---
 const senderRef = ref(null);
@@ -32,6 +34,78 @@ const waveformCanvasContainer = ref(null);
 const isDragging = ref(false);
 const dragCounter = ref(0);
 const isRecording = ref(false);
+
+const subAgentDialogVisible = ref(false);
+const selectedSubAgentId = ref('');
+
+const selectedSubAgent = computed(() => {
+    const summary = props.subAgentTasks.find((item) => item?.subagent_id === selectedSubAgentId.value) || null;
+    const detail = props.subAgentDetails?.[selectedSubAgentId.value] || null;
+    return detail ? { ...summary, ...detail } : summary;
+});
+const subAgentStatusLabel = (status) => ({ running: '运行中', completed: '已完成', stopped: '已停止', failed: '出错' }[status] || '未知');
+const subAgentStatusType = (status) => ({ running: 'warning', completed: 'success', stopped: 'info', failed: 'danger' }[status] || 'info');
+const shortSubAgentId = (task) => String(task?.subagent_id || '').replace(/^subagent_/, '').slice(0, 4) || '----';
+const subAgentDisplayName = (task) => String(task?.task || '后台 Sub-Agent').replace(/\s+/g, ' ').trim() || '后台 Sub-Agent';
+const subAgentDetailOutput = computed(() => {
+    const task = selectedSubAgent.value;
+    if (!task) return '';
+    return task.final_result || task.error || task.latest_log || '正在加载运行输出…';
+});
+
+const openSubAgentDialog = (task) => {
+    if (!task?.subagent_id) return;
+    selectedSubAgentId.value = task.subagent_id;
+    subAgentDialogVisible.value = true;
+    emit('open-subagent-detail', task.subagent_id);
+};
+
+const requestStopSelectedSubAgent = async () => {
+    const task = selectedSubAgent.value;
+    if (!task || task.status !== 'running') return;
+    try {
+        await ElMessageBox.confirm(`确定结束 Sub-Agent「${subAgentDisplayName(task)}」吗？该操作只会停止此后台任务。`, '结束运行', {
+            confirmButtonText: '结束运行',
+            cancelButtonText: '取消',
+            type: 'warning'
+        });
+        emit('stop-subagent', task.subagent_id);
+    } catch {
+        // User cancelled the confirmation dialog.
+    }
+};
+
+const closeSubAgentDialog = () => {
+    subAgentDialogVisible.value = false;
+    emit('close-subagent-detail');
+};
+
+const acknowledgeSelectedSubAgent = () => {
+    const task = selectedSubAgent.value;
+    if (!task?.subagent_id) return;
+    emit('acknowledge-subagent', task.subagent_id);
+    closeSubAgentDialog();
+};
+
+const finishedSubAgentCount = computed(() =>
+    (props.subAgentTasks || []).filter((task) => task?.status && task.status !== 'running').length
+);
+
+const acknowledgeAllFinishedSubAgents = () => {
+    if (finishedSubAgentCount.value <= 0) return;
+    emit('acknowledge-all-subagents');
+    if (selectedSubAgent.value && selectedSubAgent.value.status !== 'running') {
+        closeSubAgentDialog();
+    }
+};
+
+const rerunSelectedSubAgent = () => {
+    const task = selectedSubAgent.value;
+    if (!task?.subagent_id || task.status === 'running') return;
+    emit('rerun-subagent', task.subagent_id);
+};
+
+
 
 // --- MCP Quick Select State ---
 const showMcpQuickSelect = ref(false);
@@ -677,6 +751,37 @@ defineExpose({ focus, senderRef });
             </el-col>
         </el-row>
 
+
+        <!-- 后台 Sub-Agent 标签（位于输入框上方） -->
+        <el-row v-if="subAgentTasks && subAgentTasks.length > 0 && !isRecording">
+            <el-col :span="24">
+                <div class="subagent-tag-container">
+                    <div class="subagent-tag-header">
+                        <span class="subagent-tag-prefix">SubAgent</span>
+                        <el-button
+                            v-if="finishedSubAgentCount > 0"
+                            class="subagent-ack-all-btn"
+                            size="small"
+                            type="primary"
+                            plain
+                            @click="acknowledgeAllFinishedSubAgents"
+                        >
+                            一键已阅{{ finishedSubAgentCount > 1 ? ` (${finishedSubAgentCount})` : '' }}
+                        </el-button>
+                    </div>
+                    <div class="subagent-tag-scroll">
+                        <div class="subagent-tag-list">
+                            <el-tag v-for="task in subAgentTasks" :key="task.subagent_id" class="subagent-tag"
+                                :type="subAgentStatusType(task.status)" effect="plain" round
+                                :title="task.subagent_id" @click="openSubAgentDialog(task)">
+                                <code>{{ shortSubAgentId(task) }}</code>
+                            </el-tag>
+                        </div>
+                    </div>
+                </div>
+            </el-col>
+        </el-row>
+
         <!-- 文件列表 -->
         <el-row v-if="fileList.length > 0 && !isRecording">
             <el-col :span="0" />
@@ -962,14 +1067,10 @@ defineExpose({ focus, senderRef });
                                     :class="{ 'is-active-special': isMcpActive }" @click="$emit('open-mcp-dialog')">
                                     <el-icon :size="18">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
-                                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                                            stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-hammer"
-                                            aria-hidden="true">
-                                            <path d="m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9"></path>
-                                            <path d="m18 15 4-4"></path>
-                                            <path
-                                                d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5">
-                                            </path>
+                                            viewBox="0 0 180 180" fill="none" aria-hidden="true">
+                                            <path d="M18 84.8528L85.8822 16.9706C95.2548 7.59798 110.451 7.59798 119.823 16.9706C129.196 26.3431 129.196 41.5391 119.823 50.9117L68.5581 102.177" stroke="currentColor" stroke-width="12" stroke-linecap="round" />
+                                            <path d="M69.2652 101.47L119.823 50.9117C129.196 41.5391 144.392 41.5391 153.765 50.9117L154.118 51.2652C163.491 60.6378 163.491 75.8338 154.118 85.2063L92.7248 146.6C89.6006 149.724 89.6006 154.789 92.7248 157.913L105.331 170.52" stroke="currentColor" stroke-width="12" stroke-linecap="round" />
+                                            <path d="M102.853 33.9411L52.6482 84.1457C43.2756 93.5183 43.2756 108.714 52.6482 118.087C62.0208 127.459 77.2167 127.459 86.5893 118.087L136.794 67.8822" stroke="currentColor" stroke-width="12" stroke-linecap="round" />
                                         </svg>
                                     </el-icon>
                                 </el-button>
@@ -1035,6 +1136,41 @@ defineExpose({ focus, senderRef });
             <el-col :span="0" />
         </el-row>
     </el-footer>
+
+
+    <el-dialog v-model="subAgentDialogVisible" title="Sub-Agent 运行详情" width="min(760px, 92vw)"
+        class="subagent-detail-dialog" append-to-body destroy-on-close @closed="closeSubAgentDialog">
+        <template v-if="selectedSubAgent">
+            <div class="subagent-detail-layout">
+                <div class="subagent-detail-meta">
+                    <el-tag :type="subAgentStatusType(selectedSubAgent.status)" effect="dark">{{ subAgentStatusLabel(selectedSubAgent.status) }}</el-tag>
+                    <span class="subagent-detail-id" :title="selectedSubAgent.subagent_id"><code>{{ shortSubAgentId(selectedSubAgent) }}</code></span>
+                    <span v-if="selectedSubAgent.model_name" class="subagent-detail-model" :title="selectedSubAgent.provider_name ? `${selectedSubAgent.provider_name} · ${selectedSubAgent.model_name}` : selectedSubAgent.model_name">
+                        {{ selectedSubAgent.model_name }}
+                    </span>
+                </div>
+                <section class="subagent-detail-section">
+                    <div class="subagent-detail-section-title">任务</div>
+                    <div class="subagent-detail-task-scroll">
+                        <div class="subagent-detail-task">{{ subAgentDisplayName(selectedSubAgent) }}</div>
+                    </div>
+                </section>
+                <section class="subagent-detail-section subagent-detail-result-section">
+                    <div class="subagent-detail-section-title">运行输出</div>
+                    <div class="subagent-detail-output-scroll">
+                        <pre class="subagent-detail-output">{{ subAgentDetailOutput }}</pre>
+                    </div>
+                </section>
+            </div>
+        </template>
+        <template #footer>
+            <el-button @click="closeSubAgentDialog">关闭</el-button>
+            <el-button v-if="selectedSubAgent?.status !== 'running'" @click="rerunSelectedSubAgent">重新运行</el-button>
+            <el-button v-if="selectedSubAgent?.status !== 'running'" type="primary" plain @click="acknowledgeSelectedSubAgent">已阅</el-button>
+            <el-button v-if="selectedSubAgent?.status === 'running'" type="danger" @click="requestStopSelectedSubAgent">结束运行</el-button>
+        </template>
+    </el-dialog>
+
 </template>
 
 <style scoped>
@@ -1961,6 +2097,268 @@ html.dark .append-buffer-container {
 }
 
 .append-buffer-remove {
+    flex-shrink: 0;
+}
+
+.subagent-tag-container {
+    width: 100%;
+    margin-bottom: 8px;
+    padding: 7px 9px;
+    border: 1px solid var(--el-border-color-lighter);
+    border-radius: 10px;
+    background: var(--el-fill-color-lighter);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.025);
+    box-sizing: border-box;
+}
+
+html.dark .subagent-tag-container {
+    background: rgba(42, 42, 42, 0.58);
+}
+
+.subagent-tag-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.subagent-tag-prefix {
+    color: var(--el-text-color-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+.subagent-ack-all-btn {
+    flex-shrink: 0;
+    height: 22px;
+    padding: 0 8px;
+    font-size: 12px;
+}
+
+.subagent-tag-scroll {
+    width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--el-text-color-disabled, #c0c4cc) transparent;
+}
+
+.subagent-tag-scroll::-webkit-scrollbar {
+    height: 6px;
+}
+
+.subagent-tag-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.subagent-tag-scroll::-webkit-scrollbar-thumb {
+    background: var(--el-text-color-disabled, #c0c4cc);
+    border-radius: 999px;
+}
+
+.subagent-tag-scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--el-text-color-secondary, #909399);
+}
+
+.subagent-tag-list {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 6px;
+    width: max-content;
+    min-width: 100%;
+    padding-bottom: 2px;
+}
+
+.subagent-tag {
+    flex: 0 0 auto;
+    cursor: pointer;
+    font-size: 12px;
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.subagent-tag code {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 12px;
+}
+
+.subagent-tag:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 7px rgba(0, 0, 0, 0.1);
+}
+
+.subagent-detail-layout {
+    display: flex;
+    max-height: min(58vh, 460px);
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+}
+
+.subagent-detail-meta {
+    display: flex;
+    flex-shrink: 0;
+    min-width: 0;
+    align-items: center;
+    gap: 10px;
+}
+
+.subagent-detail-id {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--el-text-color-secondary);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.subagent-detail-id code {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.subagent-detail-model {
+    min-width: 0;
+    margin-left: auto;
+    overflow: hidden;
+    color: var(--el-text-color-regular);
+    font-size: 12px;
+    font-weight: 500;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 46%;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--el-fill-color);
+    border: 1px solid var(--el-border-color-lighter);
+}
+
+.subagent-detail-section {
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+    border: 1px solid var(--el-border-color-lighter);
+    border-radius: 10px;
+    background: var(--el-fill-color-lighter);
+    overflow: hidden;
+}
+
+.subagent-detail-result-section {
+    flex: 1 1 auto;
+    min-height: 140px;
+}
+
+.subagent-detail-section-title {
+    flex-shrink: 0;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+    color: var(--el-text-color-secondary);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.subagent-detail-task-scroll,
+.subagent-detail-output-scroll {
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: var(--el-text-color-disabled, #c0c4cc) transparent;
+}
+
+.subagent-detail-task-scroll {
+    flex: 0 0 auto;
+    height: 112px;
+    max-height: 112px;
+}
+
+.subagent-detail-output-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: min(34vh, 300px);
+}
+
+.subagent-detail-task-scroll::-webkit-scrollbar,
+.subagent-detail-output-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.subagent-detail-task-scroll::-webkit-scrollbar-track,
+.subagent-detail-output-scroll::-webkit-scrollbar-track {
+    background: transparent;
+    border-radius: 4px;
+}
+
+.subagent-detail-task-scroll::-webkit-scrollbar-thumb,
+.subagent-detail-output-scroll::-webkit-scrollbar-thumb {
+    background: var(--el-text-color-disabled, #c0c4cc);
+    border-radius: 4px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+
+.subagent-detail-task-scroll::-webkit-scrollbar-thumb:hover,
+.subagent-detail-output-scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--el-text-color-secondary, #909399);
+    background-clip: content-box;
+}
+
+html.dark .subagent-detail-task-scroll::-webkit-scrollbar-thumb,
+html.dark .subagent-detail-output-scroll::-webkit-scrollbar-thumb {
+    background: #6b6b6b;
+    background-clip: content-box;
+}
+
+html.dark .subagent-detail-task-scroll::-webkit-scrollbar-thumb:hover,
+html.dark .subagent-detail-output-scroll::-webkit-scrollbar-thumb:hover {
+    background: #999;
+    background-clip: content-box;
+}
+
+.subagent-detail-task {
+    padding: 10px 12px 18px;
+    color: var(--el-text-color-primary);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.subagent-detail-output {
+    margin: 0;
+    padding: 12px 12px 24px;
+    color: var(--el-text-color-regular);
+    font-family: var(--el-font-family), ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-break: break-word;
+    box-sizing: border-box;
+}
+
+</style>
+
+<style>
+.subagent-detail-dialog.el-dialog {
+    margin-top: 8vh !important;
+    max-height: 84vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.subagent-detail-dialog .el-dialog__body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+    padding-bottom: 8px;
+}
+
+.subagent-detail-dialog .el-dialog__footer {
     flex-shrink: 0;
 }
 </style>

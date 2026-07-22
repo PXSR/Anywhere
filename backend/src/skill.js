@@ -547,7 +547,59 @@ function deleteSkill(skillRootPath, skillId) {
  * @param {string} outputDir 导出目标目录
  * @returns {Promise<string>} 导出的文件路径
  */
-function exportSkillToPackage(skillRootPath, skillId, outputDir) {
+
+function generateEnvExampleContent(envContent) {
+    return String(envContent || '')
+        .split(/\r\n|\n|\r/)
+        .map((line) => {
+            if (!line.includes('=')) return line;
+
+            const equalIndex = line.indexOf('=');
+            return `${line.slice(0, equalIndex + 1)}`;
+        })
+        .join('\n');
+}
+
+function addSkillDirectoryToZip(zip, sourceDir, options = {}) {
+    const hideEnv = options?.hideEnv === true;
+
+    const walk = (currentDir, relativeDir = '') => {
+        const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+        const hasEnvExampleInCurrentDir = entries.some((entry) => entry.isFile() && entry.name === '.env.example');
+
+        for (const entry of entries) {
+            const absolutePath = path.join(currentDir, entry.name);
+            const relativePath = relativeDir ? path.join(relativeDir, entry.name) : entry.name;
+            const zipRelativePath = relativePath.split(path.sep).join('/');
+            const zipDir = path.posix.dirname(zipRelativePath) === '.' ? '' : path.posix.dirname(zipRelativePath);
+
+            if (hideEnv && entry.isFile() && entry.name === '.env') {
+                const envExampleName = hasEnvExampleInCurrentDir ? '.env.example2' : '.env.example';
+                const envExamplePath = zipDir ? `${zipDir}/${envExampleName}` : envExampleName;
+                const envExampleContent = generateEnvExampleContent(fs.readFileSync(absolutePath, 'utf8'));
+                zip.addFile(envExamplePath, Buffer.from(envExampleContent, 'utf8'));
+                continue;
+            }
+
+            if (entry.isDirectory()) {
+                walk(absolutePath, relativePath);
+                continue;
+            }
+
+            if (entry.isFile()) {
+                zip.addLocalFile(
+                    absolutePath,
+                    zipDir,
+                    path.posix.basename(zipRelativePath)
+                );
+            }
+        }
+    };
+
+    walk(sourceDir);
+}
+
+function exportSkillToPackage(skillRootPath, skillId, outputDir, options = {}) {
     return new Promise((resolve, reject) => {
         try {
             const skillDir = path.join(skillRootPath, skillId);
@@ -556,11 +608,10 @@ function exportSkillToPackage(skillRootPath, skillId, outputDir) {
             }
 
             const zip = new AdmZip();
-            // 将整个文件夹添加到 zip，不包含根文件夹本身，直接将内容放在根下
-            zip.addLocalFolder(skillDir);
+            // 将整个文件夹内容添加到 zip 根目录；隐藏 .env 时生成脱敏的 .env.example
+            addSkillDirectoryToZip(zip, skillDir, options);
 
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-            const outputFilename = `${skillId}_${timestamp}.skill`;
+            const outputFilename = `${skillId}.skill`;
             const outputPath = path.join(outputDir, outputFilename);
 
             zip.writeZip(outputPath);
@@ -600,6 +651,54 @@ function extractSkillPackage(filePath) {
     });
 }
 
+function exportSkillPackageBuffer(skillRootPath, skillId, options = {}) {
+    const skillDir = path.join(skillRootPath, skillId);
+    if (!fs.existsSync(skillDir)) {
+        throw new Error(`Skill directory not found: ${skillDir}`);
+    }
+
+    const zip = new AdmZip();
+    addSkillDirectoryToZip(zip, skillDir, options);
+    return zip.toBuffer();
+}
+
+function importSkillPackageBuffer(skillRootPath, skillId, packageBuffer) {
+    const zipBuffer = Buffer.isBuffer(packageBuffer)
+        ? packageBuffer
+        : Array.isArray(packageBuffer)
+            ? Buffer.from(packageBuffer)
+            : Buffer.from(packageBuffer || []);
+
+    const zip = new AdmZip(zipBuffer);
+    const tempDir = path.join(os.tmpdir(), 'anywhere_skill_import_buffer', Date.now().toString());
+    if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    try {
+        zip.extractAllTo(tempDir, true);
+        const finalDir = findSkillEntryDir(tempDir);
+        if (!finalDir) {
+            throw new Error('Invalid skill package: SKILL.md not found');
+        }
+
+        if (!fs.existsSync(skillRootPath)) {
+            fs.mkdirSync(skillRootPath, { recursive: true });
+        }
+
+        const targetDir = path.join(skillRootPath, skillId);
+        if (fs.existsSync(targetDir)) {
+            fs.rmSync(targetDir, { recursive: true, force: true });
+        }
+        fs.cpSync(finalDir, targetDir, { recursive: true, force: true });
+        return { ok: true, targetDir };
+    } finally {
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+    }
+}
+
 module.exports = {
     listSkills,
     getSkillDetails,
@@ -608,5 +707,7 @@ module.exports = {
     saveSkill,
     deleteSkill,
     exportSkillToPackage,
+    exportSkillPackageBuffer,
     extractSkillPackage,
+    importSkillPackageBuffer,
 };
