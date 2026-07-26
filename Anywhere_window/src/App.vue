@@ -446,6 +446,8 @@ let autoSaveTimer = null;
 let scheduledAutoSaveRequest = null;
 let queuedAutoSaveRequest = null;
 let autoSaveExecutionPromise = null;
+let sessionMutationVersion = 0;
+let lastPersistedSessionVersion = 0;
 let lastAutoSaveAt = 0;
 
 
@@ -2337,6 +2339,10 @@ const closePage = async (force_save = false) => {
   // 1. 如果是为了打开文件选择器而失去焦点，拦截关闭
   if (isFilePickerOpen.value) return;
 
+  // Do not let a delayed save create a second full serialization while this window is closing.
+  clearScheduledAutoSave();
+  queuedAutoSaveRequest = null;
+
   // 关闭对话前先结束本对话所有运行中 Subagent，避免后台孤儿任务继续占资源
   try {
     await killAllRunningSubAgentsForCurrentConversation();
@@ -2347,7 +2353,22 @@ const closePage = async (force_save = false) => {
   // 条件：配置了本地存储路径 且 当前对话已有名称
   if (currentConfig.value?.webdav?.localChatPath && (defaultConversationName.value || shouldForceSave)) {
     try {
-      await executeAutoSaveRequest({ reason: 'window-close', force: shouldForceSave });
+      const closeVersion = sessionMutationVersion;
+      await executeAutoSaveRequest({
+        reason: 'window-close',
+        force: shouldForceSave,
+        version: closeVersion,
+        skipQueueWhenBusy: true,
+        skipProjectAssignment: true
+      });
+      if (lastPersistedSessionVersion < closeVersion) {
+        await executeAutoSaveRequest({
+          reason: 'window-close-final',
+          force: shouldForceSave,
+          version: closeVersion,
+          skipProjectAssignment: true
+        });
+      }
     } catch (e) {
       console.error("关闭时自动保存失败:", e);
     }
@@ -3470,7 +3491,7 @@ const triggerAutoNamingForFirstUserMessage = async ({ force = false, requestSign
   return namingTask;
 };
 
-const autoSaveSession = async (force = false) => {
+const autoSaveSession = async (force = false, { skipProjectAssignment = false, version = sessionMutationVersion } = {}) => {
   if (!currentConfig.value?.webdav?.localChatPath) {
     return false;
   }
@@ -3495,23 +3516,26 @@ const autoSaveSession = async (force = false) => {
   try {
     await persistSessionToLocalJsonFile(defaultConversationName.value);
 
-    try {
-      const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
-      const filename = `${defaultConversationName.value}.json`;
-      const existingProjectId = findProjectIdByFilename(localProjects, filename);
-      if (!existingProjectId && autoSaveProjectId) {
-        const projectName = localProjects.projects.find((p) => p.id === autoSaveProjectId)?.name || '';
-        await reassignLocalProject({
-          projectId: autoSaveProjectId,
-          projectName,
-          addFilename: filename,
-          removeFilenames: []
-        });
+    if (!skipProjectAssignment) {
+      try {
+        const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
+        const filename = `${defaultConversationName.value}.json`;
+        const existingProjectId = findProjectIdByFilename(localProjects, filename);
+        if (!existingProjectId && autoSaveProjectId) {
+          const projectName = localProjects.projects.find((p) => p.id === autoSaveProjectId)?.name || '';
+          await reassignLocalProject({
+            projectId: autoSaveProjectId,
+            projectName,
+            addFilename: filename,
+            removeFilenames: []
+          });
+        }
+      } catch (projectError) {
+        console.warn('[projects] auto-save local project assignment failed:', projectError);
       }
-    } catch (projectError) {
-      console.warn('[projects] auto-save local project assignment failed:', projectError);
     }
 
+    lastPersistedSessionVersion = Math.max(lastPersistedSessionVersion, Number(version) || 0);
     lastAutoSaveAt = Date.now();
     return true;
   } catch (error) {
@@ -3536,16 +3560,23 @@ const executeAutoSaveRequest = async (request = {}) => {
   }
 
   if (autoSaveExecutionPromise) {
+    // Closing only needs the in-flight durable write; never enqueue a duplicate full save.
+    if (request.skipQueueWhenBusy) return autoSaveExecutionPromise;
     queuedAutoSaveRequest = {
       force: queuedAutoSaveRequest?.force || request.force || false,
-      reason: request.reason || queuedAutoSaveRequest?.reason || 'queued'
+      reason: request.reason || queuedAutoSaveRequest?.reason || 'queued',
+      version: Math.max(Number(queuedAutoSaveRequest?.version) || 0, Number(request.version) || sessionMutationVersion),
+      skipProjectAssignment: Boolean(queuedAutoSaveRequest?.skipProjectAssignment && request.skipProjectAssignment)
     };
     return autoSaveExecutionPromise;
   }
 
   autoSaveExecutionPromise = (async () => {
     try {
-      return await autoSaveSession(Boolean(request.force));
+      return await autoSaveSession(Boolean(request.force), {
+        skipProjectAssignment: request.skipProjectAssignment === true,
+        version: Number(request.version) || sessionMutationVersion
+      });
     } finally {
       autoSaveExecutionPromise = null;
       if (queuedAutoSaveRequest) {
@@ -3564,7 +3595,7 @@ const scheduleAutoSave = ({ reason = 'generic', immediate = false, force = false
     return;
   }
 
-  const request = { reason, force };
+  const request = { reason, force, version: ++sessionMutationVersion };
 
   if (immediate || force || delay <= 0) {
     clearScheduledAutoSave();
@@ -3665,10 +3696,10 @@ const saveWindowSize = async () => {
 const getSessionDataAsObject = (options = {}) => {
   const currentPromptConfig = currentConfig.value.prompts[CODE.value] || {};
   const explicitTitle = typeof options?.title === 'string' ? options.title.trim() : '';
+  // Keep the request projection current, but do not rebuild the UI cache while serializing.
   rehydrateHistoryToolsIfNeeded();
   syncHistoryFromFullHistory();
-  // Never persist a stale render cache when fullHistory still contains the message.
-  reconcileChatShowWithFullHistory();
+  // Do not reconcile chat_show here: serializing must stay off the close/save hot path.
   return {
     anywhere_history: true, CODE: CODE.value, basic_msg: basic_msg.value, isInit: isInit.value,
     autoCloseOnBlur: autoCloseOnBlur.value, model: model.value,
@@ -6365,21 +6396,75 @@ const getVisibleChatShowIndexes = () => chat_show.value
   .map((message, showIndex) => (message?.role === 'tool' ? -1 : showIndex))
   .filter((showIndex) => showIndex >= 0);
 
-const createRenderableMessageFromFullHistory = (message, previousMessage = null) => ({
-  ...deepCloneSafe(message),
-  id: previousMessage?.id ?? messageIdCounter.value++,
-  timestamp: previousMessage?.timestamp || message?.timestamp || new Date().toLocaleString('sv-SE')
-});
+const buildToolResultIndex = () => {
+  const results = new Map();
+  fullHistory.value.forEach((message) => {
+    if (message?.role !== 'tool' || !message.tool_call_id) return;
+    results.set(message.tool_call_id, normalizeToolResultContent(message.content));
+  });
+  return results;
+};
+
+const toUiToolCallsFromFullHistory = (toolCalls = [], toolResults = new Map()) => {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+  return toolCalls
+    .map((toolCall) => {
+      if (!toolCall || typeof toolCall !== 'object') return null;
+      const id = toolCall.id || toolCall.tool_call_id || '';
+      const name = toolCall.name || toolCall.function?.name || '';
+      if (!id && !name) return null;
+      const hasResult = id && toolResults.has(id);
+      return {
+        id,
+        name,
+        args: toolCall.args ?? toolCall.arguments ?? toolCall.function?.arguments ?? '{}',
+        result: hasResult ? toolResults.get(id) : '等待批准...',
+        approvalStatus: hasResult ? 'finished' : (toolCall.approvalStatus || 'waiting')
+      };
+    })
+    .filter(Boolean);
+};
+
+const normalizeRenderableAssistantToolCalls = (message, toolResults) => {
+  if (message?.role !== 'assistant') return message;
+  return {
+    ...message,
+    tool_calls: toUiToolCallsFromFullHistory(message.tool_calls, toolResults)
+  };
+};
+
+const createRenderableMessageFromFullHistory = (message, previousMessage = null, toolResults = new Map()) => {
+  const renderableMessage = normalizeRenderableAssistantToolCalls(deepCloneSafe(message), toolResults);
+  if (renderableMessage?.role === 'assistant') {
+    renderableMessage.aiName = previousMessage?.aiName || getCurrentAssistantDisplayName();
+    renderableMessage.voiceName = previousMessage?.voiceName || selectedVoice.value || '';
+  }
+  return {
+    ...renderableMessage,
+    id: previousMessage?.id ?? messageIdCounter.value++,
+    timestamp: previousMessage?.timestamp || message?.timestamp || new Date().toLocaleString('sv-SE')
+  };
+};
 
 // Self-heal persisted or runtime UI-cache drift without changing the API transcript.
 // Existing matching bubbles retain their UI metadata; only unmatched in-flight assistant bubbles survive separately.
 const reconcileChatShowWithFullHistory = () => {
+  const toolResults = buildToolResultIndex();
   const expected = fullHistory.value.filter((message) => message?.role !== 'tool');
   const current = chat_show.value.filter((message) => message?.role !== 'tool');
   const expectedSignatures = expected.map((message) => getComparableVisibleMessageSignature(message));
   const currentSignatures = current.map((message) => getComparableVisibleMessageSignature(message, { fromUi: true }));
+  const isRenderableToolCall = (toolCall) => (
+    toolCall && typeof toolCall.name === 'string' && Object.prototype.hasOwnProperty.call(toolCall, 'args')
+  );
   const isAligned = expected.length === current.length
-    && expectedSignatures.every((signature, index) => signature && signature === currentSignatures[index]);
+    && expectedSignatures.every((signature, index) => signature && signature === currentSignatures[index])
+    && expected.every((message, index) => {
+      if (message?.role !== 'assistant') return true;
+      const expectedToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      const currentToolCalls = Array.isArray(current[index]?.tool_calls) ? current[index].tool_calls : [];
+      return expectedToolCalls.length === currentToolCalls.length && currentToolCalls.every(isRenderableToolCall);
+    });
   if (isAligned) return false;
 
   const reusableBySignature = new Map();
@@ -6399,7 +6484,18 @@ const reconcileChatShowWithFullHistory = () => {
     if (previousMessage) reusedMessages.add(previousMessage);
     if (matches.length) reusableBySignature.set(signature, matches);
     else reusableBySignature.delete(signature);
-    return previousMessage || createRenderableMessageFromFullHistory(message);
+    if (!previousMessage) return createRenderableMessageFromFullHistory(message, null, toolResults);
+    const normalizedMessage = normalizeRenderableAssistantToolCalls(deepCloneSafe(message), toolResults);
+    if (normalizedMessage?.role === 'assistant') {
+      normalizedMessage.aiName = previousMessage.aiName || getCurrentAssistantDisplayName();
+      normalizedMessage.voiceName = previousMessage.voiceName || selectedVoice.value || '';
+    }
+    return {
+      ...previousMessage,
+      ...normalizedMessage,
+      id: previousMessage.id,
+      timestamp: previousMessage.timestamp || message?.timestamp || new Date().toLocaleString('sv-SE')
+    };
   });
 
   // During an active response, a trailing assistant bubble may not have reached fullHistory yet.
