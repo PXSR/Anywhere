@@ -456,7 +456,6 @@ window.api = {
   },
   exportMemoryData,
   importMemoryData,
-
   // TTS 相关 API
   getTTSVoices: async () => {
     return await getVoices();
@@ -503,6 +502,14 @@ window.api = {
   exportConferenceToMarkdown: async (sessionId) => {
     try { return exportConferenceToMarkdown(sessionId); }
     catch (e) { return { success: false, error: e.message }; }
+  },
+
+  // Compact cache (upstream)
+  getCompactCache: async () => {
+    return require('./compact.js').getCompactCacheSnapshot();
+  },
+  importCompactCache: async (models = {}) => {
+    return require('./compact.js').importCompactCacheModels(models);
   },
 };
 

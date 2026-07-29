@@ -86,6 +86,10 @@ function getSkillModule() {
     return getLazyRuntime();
 }
 
+function getCompactModule() {
+    return getLazyRuntime();
+}
+
 function getProjectsModule() {
     const runtimePath = './' + 'projects_runtime.js';
     return require(runtimePath);
@@ -556,5 +560,59 @@ window.api = {
     exportConferenceToMarkdown: async (sessionId) => {
         try { return exportConferenceToMarkdown(sessionId); }
         catch (e) { return { success: false, error: e.message }; }
+    },
+
+    // Conversation compaction APIs (upstream)
+    getCompactCache: async () => {
+        return getCompactModule().getCompactCacheSnapshot();
+    },
+    importCompactCache: async (models = {}) => {
+        return getCompactModule().importCompactCacheModels(models);
+    },
+    getModelCompactConfig: async (modelInput = '') => {
+        return getCompactModule().getModelCompactConfig(modelInput);
+    },
+    updateModelCompactConfig: async (modelInput = '', patch = {}) => {
+        return getCompactModule().updateModelCompactConfig(modelInput, patch);
+    },
+    applyAdvancedCompactConfigToAll: async (patch = {}) => {
+        return getCompactModule().applyAdvancedCompactConfigToAll(patch);
+    },
+    resolveModelContext: async (modelInput = '', options = {}) => {
+        return getCompactModule().resolveModelContextLength(modelInput, options);
+    },
+    pruneCompactCache: async (enabledModels = []) => {
+        return getCompactModule().pruneCompactCacheByEnabledModels(enabledModels);
+    },
+    estimateCompactTokens: async (messages = []) => {
+        const tokens = getCompactModule().estimateMessagesTokens(messages);
+        return { ok: true, tokens };
+    },
+    shouldAutoCompact: async (input = {}) => {
+        return {
+            ok: true,
+            should: getCompactModule().shouldAutoCompact(input || {})
+        };
+    },
+    runConversationCompact: async (input = {}, options = {}) => {
+        try {
+            const signal = options?.signal || input?.signal || null;
+            const onProgress = typeof options?.onProgress === 'function'
+                ? options.onProgress
+                : (typeof input?.onProgress === 'function' ? input.onProgress : null);
+            const nextInput = { ...(input && typeof input === 'object' ? input : {}) };
+            delete nextInput.signal;
+            delete nextInput.onProgress;
+            return await getCompactModule().runConversationCompaction({
+                ...nextInput,
+                signal,
+                onProgress
+            });
+        } catch (error) {
+            if (error?.name === 'AbortError' || /abort/i.test(String(error?.message || ''))) {
+                return { ok: false, error: { name: 'AbortError', message: error.message || 'aborted' } };
+            }
+            return { ok: false, error: { message: error?.message || String(error) } };
+        }
     },
 };

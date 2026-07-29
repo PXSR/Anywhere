@@ -446,6 +446,8 @@ let autoSaveTimer = null;
 let scheduledAutoSaveRequest = null;
 let queuedAutoSaveRequest = null;
 let autoSaveExecutionPromise = null;
+let sessionMutationVersion = 0;
+let lastPersistedSessionVersion = 0;
 let lastAutoSaveAt = 0;
 
 
@@ -652,6 +654,9 @@ const handleModelLogoError = () => {
 
 watch(model, (nextModel) => {
   resolveCurrentModelLogo(nextModel);
+  loadCompactConfigForCurrentModel({ forceRefresh: false }).catch((error) => {
+    console.warn('[compact] model change config load failed:', error);
+  });
 }, { immediate: false });
 
 const modelDialogProviderCollapseStates = ref({});
@@ -662,9 +667,32 @@ const currentTaskConfig = ref(null);
 const currentProviderID = ref(defaultConfig.config.providerOrder[0]);
 const base_url = ref("");
 const api_key = ref("");
+// fullHistory is the only complete API-level transcript. history/chat_show are derived request/UI views.
+const fullHistory = ref([]);
 const history = ref([]);
 const chat_show = ref([]);
 const loading = ref(false);
+const compacting = ref(false);
+const compactProgress = ref({ percent: 0, message: '', stage: '' });
+
+// Invalidate stale async config loads whenever the active compact settings change.
+let compactConfigLoadVersion = 0;
+let compactConfigModelValue = '';
+
+
+const compactConfig = ref({
+  autoCompactEnabled: true,
+  triggerRatio: 0.9,
+  contextLength: 262144,
+  contextLengthSource: 'default',
+  contextLengthManual: false,
+  keepRecentRounds: 3,
+  compactPrompt: '',
+  resolvedId: ''
+});
+const compactArchives = ref([]);
+const autoCompactSuppressedForTurn = ref(false);
+let compactAbortController = null;
 const prompt = ref("");
 const signalController = ref(null);
 const activeAssistantTurnId = ref(0);
@@ -983,9 +1011,9 @@ const finalizeCancelledAssistantTurn = (turnMeta = activeAssistantTurnMeta) => {
   if (turnMeta && !turnMeta.cancellationRecorded) {
     const missingToolMessages = buildMissingToolAbortMessages();
     if (missingToolMessages.length > 0) {
-      history.value.push(...missingToolMessages);
+      appendFullHistory(...missingToolMessages);
     }
-    history.value.push({
+    appendFullHistory({
       role: 'assistant',
       content: finalContent,
       reasoning_content: finalReasoningContent || null
@@ -1956,6 +1984,11 @@ const onAvatarClick = async (role, event) => {
 };
 
 const handleSubmit = () => {
+  // 自动/手动压缩中：禁止发送与缓冲，避免用户误以为卡死
+  if (compacting.value) {
+    showDismissibleMessage.warning('压缩进行中，暂不可发送');
+    return;
+  }
   // 生成中（或正在准备发送）时，把消息暂存进缓冲区，本轮结束后自动发送
   if (loading.value || isPreparingSend.value) {
     enqueueInputToBuffer();
@@ -1963,7 +1996,14 @@ const handleSubmit = () => {
   }
   askAI(false);
 };
-const handleCancel = () => cancelAskAI();
+const handleCancel = () => {
+  // 发送按钮在 compacting 时也会进入 loading/取消态，优先取消压缩
+  if (compacting.value) {
+    handleCancelCompact();
+    return;
+  }
+  cancelAskAI();
+};
 const handleClearHistory = () => clearHistory();
 const handleRemoveFile = (index) => fileList.value.splice(index, 1);
 const handleUpload = async ({ fileList: newFiles }) => {
@@ -2136,43 +2176,40 @@ const handleDownloadImageFromViewer = async (url) => {
 };
 
 const handleEditMessage = (index, newContent) => {
-  if (index < 0 || index >= chat_show.value.length) return;
-
-  let history_idx = -1;
-  let show_counter = -1;
-  for (let i = 0; i < history.value.length; i++) {
-    if (history.value[i].role !== 'tool') {
-      show_counter++;
-    }
-    if (show_counter === index) {
-      history_idx = i;
-      break;
-    }
+  if (compacting.value) {
+    showDismissibleMessage.warning('压缩进行中，暂不可编辑历史');
+    return false;
   }
+  if (index < 0 || index >= chat_show.value.length) return false;
+
+  const editedMessageId = chat_show.value[index]?.id;
+  const showIndex = chat_show.value.findIndex((message) => message?.id === editedMessageId);
+  if (showIndex < 0) return false;
 
   const updateContent = (message) => {
     if (!message) return;
     if (typeof message.content === 'string' || message.content === null) {
       message.content = newContent;
     } else if (Array.isArray(message.content)) {
-      const textPart = message.content.find(p => p.type === 'text' && !(p.text && p.text.toLowerCase().startsWith('file name:')));
-      if (textPart) {
-        textPart.text = newContent;
-      } else {
-        message.content.push({ type: 'text', text: newContent });
-      }
+      const textPart = message.content.find((part) => (
+        part?.type === 'text' && !(part.text && part.text.toLowerCase().startsWith('file name:'))
+      ));
+      if (textPart) textPart.text = newContent;
+      else message.content.push({ type: 'text', text: newContent });
     }
   };
 
-  if (chat_show.value[index]) {
-    updateContent(chat_show.value[index]);
-  }
+  const visibleShowIndexes = getVisibleChatShowIndexes();
+  const logicalIndex = visibleShowIndexes.indexOf(showIndex);
+  const fullIndex = logicalIndex >= 0 ? getVisibleFullHistoryIndexes()[logicalIndex] : -1;
+  const uiMessage = chat_show.value[showIndex];
+  const fullMessage = Number.isInteger(fullIndex) ? fullHistory.value[fullIndex] : null;
+  if (!uiMessage || !fullMessage || uiMessage.role !== fullMessage.role) return false;
 
-  if (history_idx !== -1 && history.value[history_idx]) {
-    updateContent(history.value[history_idx]);
-  } else {
-    console.error("错误：无法将 chat_show 索引映射到 history 索引。下次API请求可能会使用旧数据。");
-  }
+  updateContent(uiMessage);
+  updateContent(fullMessage);
+  syncHistoryFromFullHistory();
+  return true;
 };
 
 const handleEditStart = async (index) => {
@@ -2200,10 +2237,16 @@ const handleEditEnd = async ({ id, action, content }) => {
 
   if (currentIndex === -1) return;
 
-  handleEditMessage(currentIndex, content);
+  const updated = handleEditMessage(currentIndex, content);
+  if (!updated) {
+    showDismissibleMessage.warning('消息状态已变化，请重新编辑');
+    return;
+  }
+  const updatedIndex = chat_show.value.findIndex((message) => message?.id === id);
+  scheduleAutoSave({ reason: 'message-edited', immediate: true });
   showDismissibleMessage.success('消息已更新');
 
-  if (currentIndex === chat_show.value.length - 1 && chat_show.value[currentIndex].role === 'user') {
+  if (updatedIndex === chat_show.value.length - 1 && chat_show.value[updatedIndex]?.role === 'user') {
     await nextTick();
     await reaskAI();
   }
@@ -2293,6 +2336,10 @@ const closePage = async (force_save = false) => {
   // 1. 如果是为了打开文件选择器而失去焦点，拦截关闭
   if (isFilePickerOpen.value) return;
 
+  // Do not let a delayed save create a second full serialization while this window is closing.
+  clearScheduledAutoSave();
+  queuedAutoSaveRequest = null;
+
   // 关闭对话前先结束本对话所有运行中 Subagent，避免后台孤儿任务继续占资源
   try {
     await killAllRunningSubAgentsForCurrentConversation();
@@ -2303,7 +2350,22 @@ const closePage = async (force_save = false) => {
   // 条件：配置了本地存储路径 且 当前对话已有名称
   if (currentConfig.value?.webdav?.localChatPath && (defaultConversationName.value || shouldForceSave)) {
     try {
-      await executeAutoSaveRequest({ reason: 'window-close', force: shouldForceSave });
+      const closeVersion = sessionMutationVersion;
+      await executeAutoSaveRequest({
+        reason: 'window-close',
+        force: shouldForceSave,
+        version: closeVersion,
+        skipQueueWhenBusy: true,
+        skipProjectAssignment: true
+      });
+      if (lastPersistedSessionVersion < closeVersion) {
+        await executeAutoSaveRequest({
+          reason: 'window-close-final',
+          force: shouldForceSave,
+          version: closeVersion,
+          skipProjectAssignment: true
+        });
+      }
     } catch (e) {
       console.error("关闭时自动保存失败:", e);
     }
@@ -2575,7 +2637,7 @@ onMounted(async () => {
 
     if (currentPromptConfig.prompt) {
       currentSystemPrompt.value = currentPromptConfig.prompt;
-      history.value = [{ role: "system", content: currentPromptConfig.prompt }];
+      replaceFullHistory([{ role: "system", content: currentPromptConfig.prompt }]);
       chat_show.value = [{
         role: "system",
         content: currentPromptConfig.prompt,
@@ -2583,8 +2645,9 @@ onMounted(async () => {
       }];
     } else {
       currentSystemPrompt.value = "";
-      history.value = [];
+      replaceFullHistory([]);
       chat_show.value = [];
+    compactArchives.value = [];
     }
 
     if (currentPromptConfig.defaultSkills && Array.isArray(currentPromptConfig.defaultSkills)) {
@@ -2619,7 +2682,7 @@ onMounted(async () => {
         const system_time = new Date().toLocaleString('sv-SE');
         const pre_prompt = `## Scheduled Task\n\n**system_time**:${system_time}\n\n`;
         const suffix_prompt = "\n\nScheduled task triggered! This is a task that you need to execute autonomously without human intervention. Please execute immediately and provide correct feedback.";
-        history.value.push({ role: "user", content: pre_prompt + data.payload + suffix_prompt });
+        appendFullHistory({ role: "user", content: pre_prompt + data.payload + suffix_prompt });
         chat_show.value.push({
           id: messageIdCounter.value++,
           role: "user",
@@ -2667,7 +2730,7 @@ onMounted(async () => {
           if (CODE.value.trim().toLowerCase().includes(data.payload.trim().toLowerCase())) { /* do nothing */ }
           else {
             if (currentPromptConfig.isDirectSend_normal) {
-              history.value.push({ role: "user", content: data.payload });
+              appendFullHistory({ role: "user", content: data.payload });
               chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "text", text: data.payload }] });
               shouldDirectSend = true;
             } else { prompt.value = data.payload; }
@@ -2675,7 +2738,7 @@ onMounted(async () => {
         }
       } else if (data.type === "img" && data.payload) {
         if (currentPromptConfig.isDirectSend_image ?? true) {
-          history.value.push({ role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
+          appendFullHistory({ role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
           chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
           shouldDirectSend = true;
         } else {
@@ -2769,10 +2832,10 @@ onMounted(async () => {
 
       // 2. 将收到的数据直接压入聊天历史或文件列表
       if (data.type === "over" && data.payload) {
-        history.value.push({ role: "user", content: data.payload });
+        appendFullHistory({ role: "user", content: data.payload });
         chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "text", text: data.payload }], timestamp: nowTime });
       } else if (data.type === "img" && data.payload) {
-        history.value.push({ role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
+        appendFullHistory({ role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
         chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }], timestamp: nowTime });
       } else if (data.type === "files" && data.payload) {
         try {
@@ -3420,7 +3483,7 @@ const triggerAutoNamingForFirstUserMessage = async ({ force = false, requestSign
   return namingTask;
 };
 
-const autoSaveSession = async (force = false) => {
+const autoSaveSession = async (force = false, { skipProjectAssignment = false, version = sessionMutationVersion } = {}) => {
   if (!currentConfig.value?.webdav?.localChatPath) {
     return false;
   }
@@ -3445,23 +3508,26 @@ const autoSaveSession = async (force = false) => {
   try {
     await persistSessionToLocalJsonFile(defaultConversationName.value);
 
-    try {
-      const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
-      const filename = `${defaultConversationName.value}.json`;
-      const existingProjectId = findProjectIdByFilename(localProjects, filename);
-      if (!existingProjectId && autoSaveProjectId) {
-        const projectName = localProjects.projects.find((p) => p.id === autoSaveProjectId)?.name || '';
-        await reassignLocalProject({
-          projectId: autoSaveProjectId,
-          projectName,
-          addFilename: filename,
-          removeFilenames: []
-        });
+    if (!skipProjectAssignment) {
+      try {
+        const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
+        const filename = `${defaultConversationName.value}.json`;
+        const existingProjectId = findProjectIdByFilename(localProjects, filename);
+        if (!existingProjectId && autoSaveProjectId) {
+          const projectName = localProjects.projects.find((p) => p.id === autoSaveProjectId)?.name || '';
+          await reassignLocalProject({
+            projectId: autoSaveProjectId,
+            projectName,
+            addFilename: filename,
+            removeFilenames: []
+          });
+        }
+      } catch (projectError) {
+        console.warn('[projects] auto-save local project assignment failed:', projectError);
       }
-    } catch (projectError) {
-      console.warn('[projects] auto-save local project assignment failed:', projectError);
     }
 
+    lastPersistedSessionVersion = Math.max(lastPersistedSessionVersion, Number(version) || 0);
     lastAutoSaveAt = Date.now();
     return true;
   } catch (error) {
@@ -3486,16 +3552,23 @@ const executeAutoSaveRequest = async (request = {}) => {
   }
 
   if (autoSaveExecutionPromise) {
+    // Closing only needs the in-flight durable write; never enqueue a duplicate full save.
+    if (request.skipQueueWhenBusy) return autoSaveExecutionPromise;
     queuedAutoSaveRequest = {
       force: queuedAutoSaveRequest?.force || request.force || false,
-      reason: request.reason || queuedAutoSaveRequest?.reason || 'queued'
+      reason: request.reason || queuedAutoSaveRequest?.reason || 'queued',
+      version: Math.max(Number(queuedAutoSaveRequest?.version) || 0, Number(request.version) || sessionMutationVersion),
+      skipProjectAssignment: Boolean(queuedAutoSaveRequest?.skipProjectAssignment && request.skipProjectAssignment)
     };
     return autoSaveExecutionPromise;
   }
 
   autoSaveExecutionPromise = (async () => {
     try {
-      return await autoSaveSession(Boolean(request.force));
+      return await autoSaveSession(Boolean(request.force), {
+        skipProjectAssignment: request.skipProjectAssignment === true,
+        version: Number(request.version) || sessionMutationVersion
+      });
     } finally {
       autoSaveExecutionPromise = null;
       if (queuedAutoSaveRequest) {
@@ -3514,7 +3587,7 @@ const scheduleAutoSave = ({ reason = 'generic', immediate = false, force = false
     return;
   }
 
-  const request = { reason, force };
+  const request = { reason, force, version: ++sessionMutationVersion };
 
   if (immediate || force || delay <= 0) {
     clearScheduledAutoSave();
@@ -3615,18 +3688,24 @@ const saveWindowSize = async () => {
 const getSessionDataAsObject = (options = {}) => {
   const currentPromptConfig = currentConfig.value.prompts[CODE.value] || {};
   const explicitTitle = typeof options?.title === 'string' ? options.title.trim() : '';
+  // Keep the request projection current, but do not rebuild the UI cache while serializing.
+  rehydrateHistoryToolsIfNeeded();
+  syncHistoryFromFullHistory();
+  // Do not reconcile chat_show here: serializing must stay off the close/save hot path.
   return {
     anywhere_history: true, CODE: CODE.value, basic_msg: basic_msg.value, isInit: isInit.value,
     autoCloseOnBlur: autoCloseOnBlur.value, model: model.value,
     sessionMetadata: { title: explicitTitle || getSessionMetadata().title },
-    currentPromptConfig: currentPromptConfig, history: history.value, chat_show: chat_show.value, selectedVoice: selectedVoice.value,
+    currentPromptConfig: currentPromptConfig, fullHistory: fullHistory.value, history: history.value, chat_show: chat_show.value, selectedVoice: selectedVoice.value,
     activeMcpServerIds: sessionMcpServerIds.value || [],
     activeSkillIds: sessionSkillIds.value || [],
     isAutoApproveTools: isAutoApproveTools.value,
     taskList: taskList.value,
     conversationOwnerId: ensureConversationOwnerId(),
     subAgentTasks: subAgentTasks.value.map(normalizeSubAgentSummary).filter(Boolean),
-    subAgentDetails: subAgentDetails.value
+    subAgentDetails: subAgentDetails.value,
+    compactArchives: compactArchives.value,
+    compactConfig: compactConfig.value
   };
 }
 // --- 项目（目录）归属：窗口端 helper ---
@@ -4401,7 +4480,19 @@ const saveSessionAsHtml = async () => {
           .user-body { max-width: 95%; }
           body { padding: 0; }
         }
-      </style>
+      
+.timeline-node.is-compaction,
+.timeline-node.compaction {
+  background: linear-gradient(90deg, #f6c945 0%, #e0a800 100%) !important;
+  box-shadow: 0 0 6px rgba(224, 168, 0, 0.45) !important;
+  height: 3px !important;
+}
+html.dark .timeline-node.is-compaction,
+html.dark .timeline-node.compaction {
+  background: linear-gradient(90deg, #ffd666 0%, #faad14 100%) !important;
+  box-shadow: 0 0 8px rgba(250, 173, 20, 0.5) !important;
+}
+</style>
     `;
 
     return `
@@ -5099,46 +5190,38 @@ const loadSession = async (jsonData) => {
     isInit.value = jsonData.isInit;
     autoCloseOnBlur.value = jsonData.autoCloseOnBlur;
 
-    history.value = jsonData.history;
-    chat_show.value = jsonData.chat_show;
-
-    // 1. 清理 history 末尾因为程序异常中断残留的无效/空 assistant 节点
-    while (
-      history.value.length > 0 &&
-      history.value[history.value.length - 1].role === 'assistant' &&
-      !history.value[history.value.length - 1].content &&
-      !(history.value[history.value.length - 1].tool_calls?.length > 0)
-    ) {
-      history.value.pop();
+    const rawFullHistory = Array.isArray(jsonData.fullHistory) ? jsonData.fullHistory : [];
+    const rawHistory = Array.isArray(jsonData.history) ? jsonData.history : [];
+    const rawChatShow = Array.isArray(jsonData.chat_show) ? jsonData.chat_show : [];
+    compactArchives.value = Array.isArray(jsonData.compactArchives) ? jsonData.compactArchives : [];
+    if (jsonData.compactConfig && typeof jsonData.compactConfig === 'object') {
+      compactConfig.value = normalizeCompactConfigState({ ...compactConfig.value, ...jsonData.compactConfig });
     }
 
-    // 2. 强制对齐 chat_show 和 history
-    // 计算 history 中能够在 UI 显示的节点数量（排除后台隐藏的 'tool' 角色）
-    const visibleHistoryCount = history.value.filter(m => m.role !== 'tool').length;
+    if (rawFullHistory.length > 0) {
+      replaceFullHistory(rawFullHistory);
+    } else if (rawHistory.length > 0 && !rawChatShow.some((message) => message?.role === 'compaction')) {
+      replaceFullHistory(rawHistory);
+    } else if (rawChatShow.length > 0) {
+      replaceFullHistory(projectUiToFullHistoryForLegacyMigration(rawChatShow));
+    } else {
+      replaceFullHistory(rawHistory);
+    }
 
-    // 如果 UI 气泡多于真实历史记录 (通常是因为生成被打断或高频并发发送)，截断尾部脏气泡
-    if (chat_show.value.length > visibleHistoryCount) {
-      console.warn(`[Auto-Heal] 检测到 UI 节点冗余，自动清理了 ${chat_show.value.length - visibleHistoryCount} 条异常显示节点。`);
-      chat_show.value.splice(visibleHistoryCount);
+    if (rawChatShow.length > 0) {
+      chat_show.value = typeof migrateInsertStyleChatShow === 'function' ? migrateInsertStyleChatShow(rawChatShow) : rawChatShow;
+    } else {
+      chat_show.value = fullHistory.value
+        .filter((message) => message?.role !== 'tool')
+        .map((message, index) => ({
+          id: messageIdCounter.value + index + 1,
+          ...deepCloneSafe(message),
+          timestamp: message.timestamp || new Date().toLocaleString('sv-SE')
+        }));
+      messageIdCounter.value += chat_show.value.length + 1;
     }
-    // 如果 UI 气泡少于真实历史记录 (通常是因为旧版本 Bug 导致的历史污染)，反向截断真实的 history
-    else if (chat_show.value.length < visibleHistoryCount) {
-      let visibleCount = 0;
-      let cutIndex = history.value.length;
-      for (let i = 0; i < history.value.length; i++) {
-        if (history.value[i].role !== 'tool') {
-          visibleCount++;
-        }
-        if (visibleCount > chat_show.value.length) {
-          cutIndex = i;
-          break;
-        }
-      }
-      if (cutIndex < history.value.length) {
-        console.warn(`[Auto-Heal] 检测到历史记录污染，自动修复了状态。`);
-        history.value.splice(cutIndex);
-      }
-    }
+    if (typeof markOutermostCanRestore === 'function') markOutermostCanRestore();
+    syncHistoryFromFullHistory();
 
     selectedVoice.value = jsonData.selectedVoice || '';
     tempReasoningEffort.value = jsonData.currentPromptConfig?.reasoning_effort || 'default';
@@ -5199,6 +5282,8 @@ const loadSession = async (jsonData) => {
       const maxId = Math.max(...chat_show.value.map(m => m.id || 0));
       messageIdCounter.value = maxId + 1;
     }
+    // Preserve historical model labels from adjacent assistant bubbles without rebuilding the UI cache.
+    inheritMissingAssistantDisplayNames();
 
     const systemMessageIndex = history.value.findIndex(m => m.role === 'system');
     if (systemMessageIndex !== -1) {
@@ -5761,7 +5846,7 @@ const appendCurrentInputToHistory = async () => {
   const contentForHistory = userContentList.length === 1 && userContentList[0].type === 'text'
     ? userContentList[0].text
     : userContentList;
-  history.value.push({ role: "user", content: contentForHistory });
+  appendFullHistory({ role: "user", content: contentForHistory });
   chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: userContentList, timestamp: userTimestamp });
   scheduleAutoSave({ reason: 'user-message', immediate: true });
   prompt.value = "";
@@ -5807,8 +5892,1186 @@ watch(loading, (now, prev) => {
   }
 });
 
+
+const resolveProviderByModelValue = (modelValue = '') => {
+  const raw = String(modelValue || '');
+  if (!raw.includes('|')) return null;
+  const providerId = raw.split('|')[0];
+  return currentConfig.value?.providers?.[providerId] || null;
+};
+
+const syncEnabledModelCompactCache = async () => {
+  try {
+    const enabled = (modelList.value || []).map((item) => item.value).filter(Boolean);
+    if (window.api?.pruneCompactCache) {
+      await window.api.pruneCompactCache(enabled);
+    }
+  } catch (error) {
+    console.warn('[compact] prune cache failed:', error);
+  }
+};
+
+const normalizeCompactConfigState = (nextConfig = {}) => ({
+  autoCompactEnabled: nextConfig.autoCompactEnabled !== false,
+  triggerRatio: Number.isFinite(Number(nextConfig.triggerRatio)) ? Number(nextConfig.triggerRatio) : 0.9,
+  contextLength: Number.isFinite(Number(nextConfig.contextLength)) ? Number(nextConfig.contextLength) : 262144,
+  contextLengthSource: nextConfig.contextLengthSource || 'default',
+  contextLengthManual: nextConfig.contextLengthManual === true || nextConfig.contextLengthSource === 'manual',
+  keepRecentRounds: Number.isFinite(Number(nextConfig.keepRecentRounds)) ? Number(nextConfig.keepRecentRounds) : 3,
+  compactPrompt: typeof nextConfig.compactPrompt === 'string' ? nextConfig.compactPrompt : '',
+  resolvedId: typeof nextConfig.resolvedId === 'string' ? nextConfig.resolvedId : ''
+});
+
+const loadCompactConfigForCurrentModel = async ({
+  forceRefresh = false,
+  preferManual = true
+} = {}) => {
+  if (!window.api?.getModelCompactConfig) return;
+  const loadVersion = ++compactConfigLoadVersion;
+  const requestedModel = model.value;
+  try {
+    // 优先级：用户手动值最高；其他模型均复用“重新检索”的 API resolve；API 失败才回退默认值。
+    let resolveResult = null;
+    if (window.api.resolveModelContext) {
+      const cached = await window.api.getModelCompactConfig(requestedModel);
+      const cachedConfig = cached?.config || {};
+      const hasManualOverride = cachedConfig.contextLengthManual === true
+        || cachedConfig.contextLengthSource === 'manual';
+
+      // 非手动模型在切换/打开时执行与“重新检索”完全相同的 API resolve；
+      // 只有用户保存过的长度可以跳过刷新并保持最高优先级。
+      resolveResult = await window.api.resolveModelContext(requestedModel, {
+        forceRefresh: forceRefresh || !hasManualOverride,
+        preferManual
+      });
+    }
+
+    const configResult = await window.api.getModelCompactConfig(requestedModel);
+    // A newer load/save or model switch happened while this request was in flight.
+    if (loadVersion !== compactConfigLoadVersion || requestedModel !== model.value) return;
+    // A saved manual value is authoritative unless the user explicitly refreshes from API.
+    if (
+      !forceRefresh
+      && compactConfigModelValue === requestedModel
+      && (compactConfig.value.contextLengthManual === true
+        || compactConfig.value.contextLengthSource === 'manual')
+    ) return;
+
+    const nextConfig = {
+      ...(configResult?.config || {}),
+      ...(resolveResult?.config || {})
+    };
+
+    // 仅在没有 manual 覆盖、或明确 preferManual=false 时，才用 resolve 结果覆盖长度
+    const manualLocked = preferManual && (
+      nextConfig.contextLengthManual === true || nextConfig.contextLengthSource === 'manual'
+    );
+    if (resolveResult?.contextLength && !manualLocked) {
+      nextConfig.contextLength = resolveResult.contextLength;
+      nextConfig.contextLengthSource = resolveResult.source || nextConfig.contextLengthSource;
+      nextConfig.resolvedId = resolveResult.resolvedId || nextConfig.resolvedId;
+      if (resolveResult.source === 'api') {
+        nextConfig.contextLengthManual = false;
+      }
+    }
+
+    compactConfig.value = normalizeCompactConfigState(nextConfig);
+
+    compactConfigModelValue = requestedModel;
+
+  } catch (error) {
+    console.warn('[compact] load model config failed:', error);
+  }
+};
+
+const handleOpenCompactDialog = async () => {
+  // 打开时读缓存；保留用户手动上下文长度，不强制 API 覆盖
+  await loadCompactConfigForCurrentModel({ forceRefresh: false, preferManual: true });
+};
+
+const handleSaveCompactConfig = async (patch = {}) => {
+  // A completed save must win over any older asynchronous config load.
+  const saveVersion = ++compactConfigLoadVersion;
+  try {
+    // Only update compact cache; never touch active chat request/abort controllers.
+    const nextPatch = patch && typeof patch === 'object' ? { ...patch } : {};
+    const nextConfig = normalizeCompactConfigState({
+      ...compactConfig.value,
+      ...nextPatch
+    });
+
+    // 保存时把当前 contextLength 记为手动覆盖，避免下次被 API 冲掉
+    nextConfig.contextLengthManual = true;
+    nextConfig.contextLengthSource = 'manual';
+
+    // Make the new manual value effective immediately, before the async persistence call completes.
+    compactConfig.value = nextConfig;
+    compactConfigModelValue = model.value;
+
+
+
+    if (window.api?.updateModelCompactConfig) {
+      const result = await window.api.updateModelCompactConfig(model.value, {
+        ...nextConfig,
+        contextLength: nextConfig.contextLength,
+        contextLengthSource: 'manual',
+        contextLengthManual: true
+      });
+      if (result?.config) {
+        // Ignore an older save response if a later save/load has superseded it.
+        if (saveVersion !== compactConfigLoadVersion) return false;
+        compactConfig.value = normalizeCompactConfigState({
+          ...nextConfig,
+          ...result.config,
+          contextLength: nextConfig.contextLength,
+          contextLengthManual: true,
+          contextLengthSource: 'manual'
+        });
+      } else {
+        compactConfig.value = nextConfig;
+      }
+    } else {
+      compactConfig.value = nextConfig;
+    }
+    // Use lightweight toast; avoid any side effects that might abort chat streams.
+    showDismissibleMessage.success('压缩参数已保存');
+    return true;
+  } catch (error) {
+    console.error('[compact] save config failed:', error);
+    showDismissibleMessage.error(`保存压缩参数失败: ${error?.message || error}`);
+    return false;
+  }
+};
+
+const handleRefreshCompactContext = async () => {
+  try {
+    // 用户明确点「重新检索」：允许 API 覆盖手动值
+    await loadCompactConfigForCurrentModel({ forceRefresh: true, preferManual: false });
+    showDismissibleMessage.success('已重新检索模型上下文长度');
+  } catch (error) {
+    showDismissibleMessage.error(`检索失败: ${error?.message || error}`);
+  }
+};
+
+const handleResetCompactConfig = async () => {
+  try {
+    // 恢复当前模型的共享参数默认值；上下文长度清掉手动覆盖后重新检索
+    const defaultPatch = {
+      autoCompactEnabled: true,
+      triggerRatio: 0.9,
+      keepRecentRounds: 3,
+      keepRecentRoundsUserSet: true,
+      compactPrompt: '',
+      contextLengthManual: false,
+      contextLengthSource: 'default'
+    };
+
+    if (window.api?.updateModelCompactConfig) {
+      const result = await window.api.updateModelCompactConfig(model.value, defaultPatch);
+      if (result?.config) {
+        compactConfig.value = normalizeCompactConfigState({
+          ...compactConfig.value,
+          ...result.config,
+          ...defaultPatch,
+          // compactPrompt 存库后会被填成完整默认模板
+          compactPrompt: result.config.compactPrompt || '',
+          contextLengthManual: false
+        });
+      } else {
+        compactConfig.value = normalizeCompactConfigState({
+          ...compactConfig.value,
+          ...defaultPatch
+        });
+      }
+    } else {
+      compactConfig.value = normalizeCompactConfigState({
+        ...compactConfig.value,
+        ...defaultPatch
+      });
+    }
+
+    // 重新检索 API 上下文长度（覆盖手动值）
+    await loadCompactConfigForCurrentModel({ forceRefresh: true, preferManual: false });
+    showDismissibleMessage.success('已恢复默认压缩参数');
+  } catch (error) {
+    console.error('[compact] reset config failed:', error);
+    showDismissibleMessage.error(`恢复默认失败: ${error?.message || error}`);
+  }
+};
+
+const handleApplyCompactAdvancedGlobal = async (patch = {}) => {
+  try {
+    // 先保存当前模型参数
+    await handleSaveCompactConfig({
+      ...compactConfig.value,
+      ...(patch || {}),
+      contextLengthManual: true,
+      contextLengthSource: 'manual'
+    });
+
+    if (typeof window.api?.applyAdvancedCompactConfigToAll !== 'function') {
+      showDismissibleMessage.error('全局应用接口未就绪，请重载插件后再试');
+      return;
+    }
+
+    const result = await window.api.applyAdvancedCompactConfigToAll({
+      autoCompactEnabled: patch?.autoCompactEnabled ?? compactConfig.value.autoCompactEnabled,
+      triggerRatio: patch?.triggerRatio ?? compactConfig.value.triggerRatio,
+      keepRecentRounds: patch?.keepRecentRounds ?? compactConfig.value.keepRecentRounds,
+      compactPrompt: patch?.compactPrompt ?? compactConfig.value.compactPrompt
+    });
+
+    if (result?.ok === false) {
+      throw new Error(result?.error?.message || result?.error || 'apply_advanced_failed');
+    }
+
+    const updated = Number(result?.updated) || 0;
+    showDismissibleMessage.success(updated > 0
+      ? `高级参数已应用到 ${updated} 个模型缓存`
+      : '当前没有可更新的模型缓存');
+  } catch (error) {
+    console.error('[compact] apply advanced global failed:', error);
+    const msg = String(error?.message || error || '');
+    if (/No handler registered/i.test(msg)) {
+      showDismissibleMessage.error('压缩接口未就绪，请重载插件后再试');
+      return;
+    }
+    showDismissibleMessage.error(`应用到全局失败: ${msg}`);
+  }
+};
+
+
+const handleRunCompactWithConfig = async (patch = {}) => {
+  const saved = await handleSaveCompactConfig(patch);
+  if (!saved) return false;
+  return runConversationCompact({ manual: true });
+};
+
+const handleCancelCompact = () => {
+  if (compactAbortController) {
+    try {
+      compactAbortController.abort();
+    } catch {
+      // ignore
+    }
+  }
+  // 仅跳过当前回合剩余的自动检测；下一回合必须恢复自动压缩。
+  autoCompactSuppressedForTurn.value = true;
+  compactProgress.value = {
+    percent: compactProgress.value?.percent || 0,
+    message: '正在取消压缩…',
+    stage: 'cancelling'
+  };
+};
+
+const deepCloneSafe = (value) => {
+  try {
+    return JSON.parse(JSON.stringify(value ?? null));
+  } catch {
+    return value;
+  }
+};
+
+const DEFAULT_SUMMARY_PREFIX =
+  'Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:';
+
+const normalizeToolResultContent = (result) => {
+  if (typeof result === 'string') return result;
+  if (result == null) return '';
+  try {
+    return JSON.stringify(result);
+  } catch {
+    return String(result);
+  }
+};
+
+// UI 里 tool 结果挂在 assistant.tool_calls[].result；API history 需要独立 role=tool 消息
+const toApiToolCallsFromUi = (toolCalls = []) => {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+  return toolCalls
+    .map((tc) => {
+      if (!tc || typeof tc !== 'object') return null;
+      // 已是 OpenAI 结构
+      if (tc.function && (tc.id || tc.function.name)) {
+        return {
+          id: tc.id || '',
+          type: tc.type || 'function',
+          function: {
+            name: tc.function.name || '',
+            arguments: typeof tc.function.arguments === 'string'
+              ? tc.function.arguments
+              : JSON.stringify(tc.function.arguments ?? {})
+          }
+        };
+      }
+      // chat_show 结构：{ id, name, args, result, approvalStatus }
+      const id = tc.id || '';
+      const name = tc.name || tc.function?.name || '';
+      if (!id && !name) return null;
+      const args = tc.args ?? tc.arguments ?? tc.function?.arguments ?? '{}';
+      return {
+        id,
+        type: 'function',
+        function: {
+          name,
+          arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {})
+        }
+      };
+    })
+    .filter(Boolean);
+};
+
+const toToolResultMessagesFromUiAssistant = (message = {}) => {
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+  if (!toolCalls.length) return [];
+  return toolCalls
+    .map((tc) => {
+      if (!tc || typeof tc !== 'object') return null;
+      const id = tc.id || tc.tool_call_id || '';
+      // 只有已有结果时才还原为 role=tool；否则 API 会报 tool_calls 未响应
+      const hasResult = Object.prototype.hasOwnProperty.call(tc, 'result')
+        || Object.prototype.hasOwnProperty.call(tc, 'content');
+      if (!id || !hasResult) return null;
+      const content = Object.prototype.hasOwnProperty.call(tc, 'result')
+        ? normalizeToolResultContent(tc.result)
+        : normalizeToolResultContent(tc.content);
+      // 尚未真正执行的占位状态不写入 history，避免脏上下文
+      if (
+        tc.approvalStatus === 'waiting'
+        || tc.approvalStatus === 'executing'
+        || content === '等待批准...'
+        || content === '执行中...'
+      ) {
+        return null;
+      }
+      return {
+        role: 'tool',
+        tool_call_id: id,
+        name: tc.name || tc.function?.name || '',
+        content
+      };
+    })
+    .filter(Boolean);
+};
+
+const toHistoryMessageFromUi = (message) => {
+  if (!message || typeof message !== 'object') return null;
+  if (message.role === 'system') {
+    return { role: 'system', content: typeof message.content === 'string' ? message.content : '' };
+  }
+  if (message.role === 'compaction') {
+    const summary = String(message.summary || message.content || '').trim() || '(no summary available)';
+    const prefix = String(message.summaryPrefix || DEFAULT_SUMMARY_PREFIX);
+    return {
+      role: 'user',
+      content: `${prefix}\n${summary}`
+    };
+  }
+  if (message.role === 'user') {
+    return {
+      role: 'user',
+      content: message.content
+    };
+  }
+  if (message.role === 'assistant') {
+    const next = {
+      role: 'assistant',
+      content: message.content ?? null
+    };
+    if (typeof message.reasoning_content === 'string') next.reasoning_content = message.reasoning_content;
+    const apiToolCalls = toApiToolCallsFromUi(message.tool_calls);
+    if (apiToolCalls.length) next.tool_calls = apiToolCalls;
+    if (message.tokenUsage) next.tokenUsage = deepCloneSafe(message.tokenUsage);
+    return next;
+  }
+  if (message.role === 'tool') {
+    // 兼容：若 chat_show 里已有独立 tool 消息
+    const next = {
+      role: 'tool',
+      content: message.content
+    };
+    if (message.tool_call_id) next.tool_call_id = message.tool_call_id;
+    if (message.name) next.name = message.name;
+    return next;
+  }
+  return null;
+};
+
+
+// Complete API transcript → current request window. The latest compaction checkpoint replaces
+// earlier messages only for outbound context; the earlier messages remain in fullHistory.
+const toRequestMessageFromFullHistory = (message = {}) => {
+  if (!message || typeof message !== 'object') return null;
+  if (message.role === 'compaction') {
+    const summary = String(message.summary || message.content || '').trim() || '(no summary available)';
+    return { role: 'user', content: `${String(message.summaryPrefix || DEFAULT_SUMMARY_PREFIX)}\n${summary}` };
+  }
+  if (!['system', 'user', 'assistant', 'tool'].includes(message.role)) return null;
+  const cloned = deepCloneSafe(message);
+  ['id', 'timestamp', 'aiName', 'voiceName', 'status', 'approvalStatus', 'result', 'canRestore', 'coveredCount'].forEach((key) => delete cloned[key]);
+  return cloned;
+};
+
+const projectFullHistoryToRequestHistory = (messages = fullHistory.value) => {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+  for (const message of list) {
+    if (message?.role === 'system') {
+      const projected = toRequestMessageFromFullHistory(message);
+      if (projected) out.push(projected);
+    }
+  }
+  let lastCompactIndex = -1;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    if (list[index]?.role === 'compaction') { lastCompactIndex = index; break; }
+  }
+  for (let index = lastCompactIndex >= 0 ? lastCompactIndex : 0; index < list.length; index += 1) {
+    const message = list[index];
+    if (!message || message.role === 'system') continue;
+    if (message.role === 'compaction' && index !== lastCompactIndex) continue;
+    const projected = toRequestMessageFromFullHistory(message);
+    if (projected) out.push(projected);
+  }
+  return out;
+};
+
+const syncHistoryFromFullHistory = () => { history.value = projectFullHistoryToRequestHistory(); };
+const appendFullHistory = (...messages) => {
+  const nextMessages = messages.filter((message) => message && typeof message === 'object');
+  if (!nextMessages.length) return;
+  fullHistory.value.push(...nextMessages.map((message) => deepCloneSafe(message)));
+  syncHistoryFromFullHistory();
+};
+const replaceFullHistory = (messages = []) => {
+  fullHistory.value = Array.isArray(messages) ? messages.filter((message) => message && typeof message === 'object').map((message) => deepCloneSafe(message)) : [];
+  syncHistoryFromFullHistory();
+};
+
+
+// Keep edit mapping in terms of visible messages so tool records never shift indexes.
+const getVisibleFullHistoryIndexes = () => fullHistory.value
+  .map((message, fullIndex) => (message?.role === 'tool' ? -1 : fullIndex))
+  .filter((fullIndex) => fullIndex >= 0);
+
+const getVisibleChatShowIndexes = () => chat_show.value
+  .map((message, showIndex) => (message?.role === 'tool' ? -1 : showIndex))
+  .filter((showIndex) => showIndex >= 0);
+
+// UI metadata is not part of fullHistory. Fill only missing assistant names from adjacent UI bubbles.
+// Do not infer a model name when the whole conversation has no recorded assistant name.
+const inheritMissingAssistantDisplayNames = () => {
+  const messages = Array.isArray(chat_show.value) ? chat_show.value : [];
+  let previousAiName = '';
+  messages.forEach((message) => {
+    if (message?.role !== 'assistant') return;
+    const aiName = typeof message.aiName === 'string' ? message.aiName.trim() : '';
+    if (aiName) {
+      previousAiName = aiName;
+    } else if (previousAiName) {
+      message.aiName = previousAiName;
+    }
+  });
+
+  let nextAiName = '';
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'assistant') continue;
+    const aiName = typeof message.aiName === 'string' ? message.aiName.trim() : '';
+    if (aiName) {
+      nextAiName = aiName;
+    } else if (nextAiName) {
+      message.aiName = nextAiName;
+    }
+  }
+};
+
+const projectUiToFullHistoryForLegacyMigration = (messages = []) => {
+  const full = [];
+  for (const message of (Array.isArray(messages) ? messages : [])) {
+    if (!message || typeof message !== 'object') continue;
+    if (message.role === 'compaction') {
+      full.push({ role: 'compaction', content: String(message.summary || message.content || ''), summary: String(message.summary || message.content || ''), summaryPrefix: String(message.summaryPrefix || DEFAULT_SUMMARY_PREFIX), snapshotId: message.snapshotId || message.id || `compact_legacy_${full.length}`, createdAt: message.createdAt || Date.now() });
+      continue;
+    }
+    const projected = toHistoryMessageFromUi(message);
+    if (projected) full.push(projected);
+    if (message.role === 'assistant') full.push(...toToolResultMessagesFromUiAssistant(message));
+  }
+  return full;
+};
+
+const estimateCompactHistoryTokens = async (messages = []) => {
+  if (!window.api?.estimateCompactTokens) return 0;
+  const estimate = await window.api.estimateCompactTokens(messages);
+  return Math.max(0, Number(estimate?.tokens) || 0);
+};
+
+/**
+ * Select one bounded compaction prefix from the current AI-visible window.
+ * The threshold limits the summary input; keepRecentRounds then moves the cut
+ * backwards by complete user rounds so those rounds remain verbatim in the tail.
+ */
+const splitFullHistoryPrefixAndTail = async (
+  messages = fullHistory.value,
+  { maxPrefixTokens = 0, keepRecentRounds = 0 } = {}
+) => {
+  const list = Array.isArray(messages) ? messages : [];
+  let windowStart = 0;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    if (list[index]?.role === 'compaction') {
+      windowStart = index;
+      break;
+    }
+  }
+  if (windowStart === 0) {
+    const first = list.findIndex((message) => message?.role !== 'system');
+    windowStart = first >= 0 ? first : list.length;
+  }
+
+  const systemMessages = list.filter((message) => message?.role === 'system');
+  const windowMessages = list.slice(windowStart);
+  const userStartIndexes = [];
+  windowMessages.forEach((message, index) => {
+    // Cut only before a user message, keeping the previous user/assistant/tool round intact.
+    if (message?.role === 'user' && index > 0) userStartIndexes.push(index);
+  });
+  if (userStartIndexes.length === 0 || !Number.isFinite(Number(maxPrefixTokens)) || maxPrefixTokens <= 0) {
+    return {
+      insertIndex: list.length,
+      prefix: [],
+      tail: windowMessages,
+      prefixTokens: 0,
+      tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...windowMessages]),
+      maxPrefixTokens: Math.max(0, Number(maxPrefixTokens) || 0),
+      tailStartUserOrdinal: 0
+    };
+  }
+
+  const budget = Math.floor(Number(maxPrefixTokens));
+  const estimatePrefixAt = async (cutIndex) => (
+    estimateCompactHistoryTokens([...systemMessages, ...windowMessages.slice(0, cutIndex)])
+  );
+
+  // Token totals are monotonic as complete message rounds are added, so binary-search the largest safe cut.
+  let low = 0;
+  let high = userStartIndexes.length - 1;
+  let bestCandidate = -1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = userStartIndexes[middle];
+    const tokens = await estimatePrefixAt(candidate);
+    if (tokens <= budget) {
+      bestCandidate = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  if (bestCandidate < 0) {
+    return {
+      insertIndex: list.length,
+      prefix: [],
+      tail: windowMessages,
+      prefixTokens: 0,
+      tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...windowMessages]),
+      maxPrefixTokens: budget,
+      tailStartUserOrdinal: 0
+    };
+  }
+
+  const thresholdCutIndex = userStartIndexes[bestCandidate];
+  const requestedKeepRounds = Math.max(0, Math.floor(Number(keepRecentRounds) || 0));
+  // Move the threshold cut backwards by N complete user rounds to keep them verbatim.
+  const tailStartUserOrdinal = Math.max(0, bestCandidate - requestedKeepRounds);
+  let cutIndex = userStartIndexes[tailStartUserOrdinal] ?? thresholdCutIndex;
+
+  // Never summarize only an existing compaction marker: that would not reduce history.
+  const hasRealPrefixMessage = windowMessages
+    .slice(0, cutIndex)
+    .some((message) => message?.role && message.role !== 'system' && message.role !== 'compaction');
+  if (!hasRealPrefixMessage) cutIndex = thresholdCutIndex;
+
+  const prefix = windowMessages.slice(0, cutIndex);
+  const tail = windowMessages.slice(cutIndex);
+  return {
+    insertIndex: windowStart + cutIndex,
+    prefix,
+    tail,
+    prefixTokens: await estimateCompactHistoryTokens([...systemMessages, ...prefix]),
+    tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...tail]),
+    maxPrefixTokens: budget,
+    tailStartUserOrdinal: Math.max(0, userStartIndexes.indexOf(cutIndex))
+  };
+};
+
+
+const getOutermostCompactionIndexIn = (list = []) => {
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (list[i]?.role === 'compaction') return i;
+  }
+  return -1;
+};
+
+// 旧会话可能只有 [compaction{archivedMessages}]；展开为「完整列表 + 摘要插入」
+const migrateInsertStyleChatShow = (messages = []) => {
+  const walk = (list = [], allowExpand = true) => {
+    const result = [];
+    for (const msg of (Array.isArray(list) ? list : [])) {
+      if (
+        allowExpand &&
+        msg?.role === 'compaction' &&
+        Array.isArray(msg.archivedMessages) &&
+        msg.archivedMessages.length > 0
+      ) {
+        const hasVisiblePrefix = result.some((m) => m?.role && m.role !== 'system' && m.role !== 'compaction');
+        if (!hasVisiblePrefix) {
+          result.push(...walk(msg.archivedMessages, true));
+          const { archivedMessages, expanded, collapsed, ...rest } = msg;
+          result.push({
+            ...rest,
+            coveredCount: archivedMessages.length
+          });
+          continue;
+        }
+      }
+      if (msg?.role === 'compaction') {
+        const { archivedMessages, expanded, collapsed, ...rest } = msg;
+        result.push(rest);
+      } else {
+        result.push(msg);
+      }
+    }
+    return result;
+  };
+  return walk(messages, true);
+};
+
+/**
+ * AI 投影规则：
+ * - 系统提示词
+ * - 仅最后一层（最外层）summary
+ * - 该 summary 之后的消息
+ * 关键：assistant.tool_calls[].result 必须还原为独立 role=tool 消息，
+ * 否则保存/换模型/sync 后 tool 结果会丢失。
+ */
+const appendProjectedUiMessage = (out, message) => {
+  if (!message || message.role === 'system' || message.role === 'compaction') return;
+  // 独立 tool 行（少数场景）直接投影
+  if (message.role === 'tool') {
+    const projected = toHistoryMessageFromUi(message);
+    if (projected) out.push(projected);
+    return;
+  }
+  if (message.role === 'user') {
+    const projected = toHistoryMessageFromUi(message);
+    if (projected) out.push(projected);
+    return;
+  }
+  if (message.role === 'assistant') {
+    const projected = toHistoryMessageFromUi(message);
+    if (projected) out.push(projected);
+    // 从 UI 气泡还原 tool 返回
+    const toolMsgs = toToolResultMessagesFromUiAssistant(message);
+    if (toolMsgs.length) out.push(...toolMsgs);
+  }
+};
+
+const projectCascadeToHistory = (messages = []) => {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+
+  for (const message of list) {
+    if (message?.role === 'system') {
+      const projected = toHistoryMessageFromUi(message);
+      if (projected) out.push(projected);
+    }
+  }
+
+  const lastCompactIdx = getOutermostCompactionIndexIn(list);
+  if (lastCompactIdx < 0) {
+    for (const message of list) {
+      appendProjectedUiMessage(out, message);
+    }
+    return out;
+  }
+
+  const summaryProjected = toHistoryMessageFromUi(list[lastCompactIdx]);
+  if (summaryProjected) out.push(summaryProjected);
+
+  for (let i = lastCompactIdx + 1; i < list.length; i += 1) {
+    const message = list[i];
+    if (!message || message.role === 'system') continue;
+    // 只认最后一层 summary；其后若还有旧 compaction 标记，跳过其自身，仍保留后续真实消息
+    if (message.role === 'compaction') continue;
+    appendProjectedUiMessage(out, message);
+  }
+  return out;
+};
+
+const countToolMessages = (messages = []) => (
+  (Array.isArray(messages) ? messages : []).filter((m) => m?.role === 'tool').length
+);
+
+// New sessions never rebuild API history from UI. This remains only for one-time legacy migration.
+const rehydrateHistoryToolsIfNeeded = () => {
+  if (Array.isArray(fullHistory.value) && fullHistory.value.length > 0) {
+    syncHistoryFromFullHistory();
+    return false;
+  }
+  const projected = projectCascadeToHistory(chat_show.value);
+  if (projected.length > 0) {
+    replaceFullHistory(projected);
+    return true;
+  }
+  return false;
+};
+
+const syncHistoryFromChatShow = () => {
+  if (Array.isArray(fullHistory.value) && fullHistory.value.length > 0) {
+    syncHistoryFromFullHistory();
+    return;
+  }
+  replaceFullHistory(projectCascadeToHistory(chat_show.value));
+};
+
+const getOutermostCompactionIndex = () => getOutermostCompactionIndexIn(chat_show.value);
+
+const canRestoreCompact = computed(() => getOutermostCompactionIndex() >= 0);
+
+const canRestoreCompactMarker = (message = null) => {
+  const outermostIndex = getOutermostCompactionIndex();
+  if (outermostIndex < 0) return false;
+  if (!message) return true;
+  const snapshotId = message?.snapshotId || message?.id;
+  const outermost = chat_show.value[outermostIndex];
+  if (!snapshotId) return outermostIndex >= 0;
+  return outermost?.snapshotId === snapshotId || outermost?.id === snapshotId;
+};
+
+const markOutermostCanRestore = () => {
+  const outermost = getOutermostCompactionIndex();
+  chat_show.value = chat_show.value.map((msg, idx) => {
+    if (msg?.role !== 'compaction') return msg;
+    return { ...msg, canRestore: idx === outermost };
+  });
+};
+
+const getCompactTokenSnapshot = async (messagesForAi = history.value) => {
+  // 自动压缩只看本地估算：压缩后对 summary + 尾部原文重新 estimate，
+  // 避免沿用压缩前 assistant.tokenUsage.total_tokens 导致立刻二次压缩。
+  let localTokens = 0;
+  if (window.api?.estimateCompactTokens) {
+    const estimate = await window.api.estimateCompactTokens(messagesForAi);
+    localTokens = Math.max(0, Number(estimate?.tokens) || 0);
+  }
+  return {
+    localTokens,
+    usageTotalTokens: 0,
+    activeTokens: localTokens
+  };
+};
+
+const estimateActiveTokens = async (messagesForAi = history.value) => {
+  const snapshot = await getCompactTokenSnapshot(messagesForAi);
+  return snapshot.activeTokens;
+};
+
+const shouldCompactNow = async (messagesForAi = history.value) => {
+  if (!window.api?.shouldAutoCompact) return false;
+  const tokenSnapshot = await getCompactTokenSnapshot(messagesForAi);
+  const contextLength = Number(compactConfig.value.contextLength) || 0;
+  const triggerRatio = Number(compactConfig.value.triggerRatio) || 0;
+  const decision = await window.api.shouldAutoCompact({
+    activeTokens: tokenSnapshot.activeTokens,
+    contextLength,
+    triggerRatio,
+    autoCompactEnabled: true
+  });
+  return Boolean(decision?.should);
+};
+
+// 当前 AI 可见窗口起点：最后一个 compaction（含），否则第一个非 system。
+const findAiWindowStartIndex = (list = []) => {
+  const lastCompact = getOutermostCompactionIndexIn(list);
+  if (lastCompact >= 0) return lastCompact;
+  for (let i = 0; i < list.length; i += 1) {
+    if (list[i]?.role !== 'system') return i;
+  }
+  return 0;
+};
+
+/**
+ * 在「AI 可见窗口」内切 prefix/tail。
+ * UI 不删除 prefix，只在 prefix 后插入 summary。
+ */
+const splitAiWindowPrefixAndTail = (messages = [], tailStartUserOrdinal = 0) => {
+  const list = Array.isArray(messages) ? messages : [];
+  if (list.length === 0) {
+    return { windowStart: 0, insertIndex: 0, prefix: [], tail: [] };
+  }
+
+  const windowStart = findAiWindowStartIndex(list);
+  const windowMsgs = list.slice(windowStart);
+  const userStartIndexes = [];
+  windowMsgs.forEach((message, index) => {
+    if (message?.role === 'user' && index > 0) userStartIndexes.push(index);
+  });
+  if (userStartIndexes.length === 0) {
+    return { windowStart, insertIndex: list.length, prefix: [], tail: windowMsgs };
+  }
+
+  const safeOrdinal = Math.min(
+    Math.max(0, Math.floor(Number(tailStartUserOrdinal) || 0)),
+    userStartIndexes.length - 1
+  );
+  const cutInWindow = userStartIndexes[safeOrdinal];
+  return {
+    windowStart,
+    insertIndex: windowStart + cutInWindow,
+    prefix: windowMsgs.slice(0, cutInWindow),
+    tail: windowMsgs.slice(cutInWindow)
+  };
+};
+
+// UI：在 insertIndex 插入一条压缩消息；压缩前消息全部保留可见。
+const applyCascadeCompactStep = (marker, insertIndex, prefix, fullInsertIndex = insertIndex) => {
+  const nextMarker = {
+    id: messageIdCounter.value++,
+    role: 'compaction',
+    content: marker?.summary || marker?.content || '',
+    summary: marker?.summary || marker?.content || '',
+    summaryPrefix: marker?.summaryPrefix || DEFAULT_SUMMARY_PREFIX,
+    snapshotId: marker?.snapshotId || `compact_${Date.now()}`,
+    createdAt: marker?.createdAt || Date.now(),
+    canRestore: true,
+    // 仅作备份/调试；UI 已保留原文，还原时删除该 marker 即可
+    coveredCount: Array.isArray(prefix) ? prefix.length : 0,
+    timestamp: new Date().toLocaleString('sv-SE')
+  };
+
+  const safeIndex = Math.max(0, Math.min(Number(insertIndex) || 0, chat_show.value.length));
+  chat_show.value = [
+    ...chat_show.value.slice(0, safeIndex),
+    nextMarker,
+    ...chat_show.value.slice(safeIndex)
+  ];
+  markOutermostCanRestore();
+  const safeFullInsertIndex = Math.max(0, Math.min(Number(fullInsertIndex) || 0, fullHistory.value.length));
+  fullHistory.value.splice(safeFullInsertIndex, 0, {
+    role: 'compaction',
+    content: nextMarker.summary,
+    summary: nextMarker.summary,
+    summaryPrefix: nextMarker.summaryPrefix,
+    snapshotId: nextMarker.snapshotId,
+    createdAt: nextMarker.createdAt
+  });
+  syncHistoryFromFullHistory();
+  compactArchives.value = [...compactArchives.value, {
+    id: nextMarker.snapshotId,
+    createdAt: nextMarker.createdAt,
+    summary: nextMarker.summary,
+    markerId: nextMarker.id,
+    insertIndex: safeIndex
+  }].slice(-50);
+};
+
+const handleRestoreCompact = async (payload = null) => {
+  if (compacting.value) {
+    showDismissibleMessage.warning('压缩进行中，暂不可恢复');
+    return;
+  }
+
+  const outermostIndex = getOutermostCompactionIndex();
+  if (outermostIndex < 0) {
+    showDismissibleMessage.info('没有可恢复的压缩检查点');
+    return;
+  }
+
+  const requestedId = typeof payload === 'string'
+    ? payload
+    : (payload?.snapshotId || payload?.id || '');
+  const outermost = chat_show.value[outermostIndex];
+  if (requestedId && outermost?.snapshotId !== requestedId && outermost?.id !== requestedId) {
+    showDismissibleMessage.warning('请先恢复更外层的压缩，再恢复内层（级联还原）');
+    return;
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      '将移除最外层压缩摘要。压缩前消息本就在列表中，移除后 AI 将重新看到更早的上下文。',
+      '恢复压缩前',
+      {
+        type: 'warning',
+        confirmButtonText: '恢复',
+        cancelButtonText: '取消'
+      }
+    );
+  } catch {
+    return;
+  }
+
+  // UI 原文一直在，只需删除最外层 summary 标记
+  chat_show.value = [
+    ...chat_show.value.slice(0, outermostIndex),
+    ...chat_show.value.slice(outermostIndex + 1)
+  ];
+  markOutermostCanRestore();
+  fullHistory.value = fullHistory.value.filter((message) => (
+    message?.role !== 'compaction' || (message?.snapshotId || message?.id) !== outermost.snapshotId
+  ));
+  syncHistoryFromFullHistory();
+  compactArchives.value = compactArchives.value.filter((item) => item?.id !== outermost.snapshotId);
+  scheduleAutoSave({ reason: 'compact-restored', immediate: true });
+  showDismissibleMessage.success('已还原最外层压缩');
+};
+
+const runConversationCompact = async ({
+  manual = true,
+  // 工具循环中：允许在 loading 时压缩，避免 tool 轮次撞上下文上限
+  allowDuringLoading = false,
+  quiet = false
+} = {}) => {
+  if (compacting.value) return false;
+  if (loading.value && !allowDuringLoading) {
+    if (!quiet) showDismissibleMessage.warning('请等待当前回复完成后再压缩');
+    return false;
+  }
+  if (!window.api?.runConversationCompact) {
+    if (!quiet) showDismissibleMessage.error('压缩能力不可用');
+    return false;
+  }
+  if (!Array.isArray(chat_show.value) || chat_show.value.length === 0) {
+    if (!quiet && manual) showDismissibleMessage.info('当前没有可压缩的会话内容');
+    return false;
+  }
+
+  // Full API history is the compression source; UI is only updated after summary succeeds.
+  rehydrateHistoryToolsIfNeeded();
+  syncHistoryFromFullHistory();
+
+  compacting.value = true;
+  compactProgress.value = { percent: 2, message: '准备级联压缩…', stage: 'prepare' };
+  compactAbortController = new AbortController();
+  // 发送区仅 loading 时用户不易感知原因；气泡提示当前在做会话压缩
+  showDismissibleMessage({
+    message: manual ? '正在进行会话压缩，请稍候…' : '上下文将超限，正在自动压缩会话…',
+    type: 'info',
+    duration: 2500
+  });
+
+  try {
+    // 无层数上限：每步将超阈值前缀有损压成单条 summary，直到低于阈值、无前缀或用户取消
+    let steps = 0;
+    let didAny = false;
+
+    while (true) {
+      if (compactAbortController?.signal?.aborted) {
+        const abortError = new Error('Aborted');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
+
+      steps += 1;
+      const projected = projectFullHistoryToRequestHistory();
+
+      // 手动首步强制压一次；工具轮/自动轮只按阈值判断
+      const need = manual && steps === 1 && !allowDuringLoading
+        ? true
+        : await shouldCompactNow(projected);
+      if (!need) {
+        // 未执行任何压缩时 steps 回退，避免成功文案显示虚高步数
+        if (!didAny) steps = 0;
+        else steps -= 1;
+        break;
+      }
+
+      const maxPrefixTokens = Math.floor(
+        Number(compactConfig.value.contextLength || 0)
+        * Number(compactConfig.value.triggerRatio || 0)
+      );
+      const fullSplit = await splitFullHistoryPrefixAndTail(fullHistory.value, {
+        maxPrefixTokens,
+        keepRecentRounds: compactConfig.value.keepRecentRounds
+      });
+      const {
+        insertIndex: fullInsertIndex,
+        prefix,
+        tailStartUserOrdinal
+      } = fullSplit;
+      const uiSplit = splitAiWindowPrefixAndTail(chat_show.value, tailStartUserOrdinal);
+      if (!prefix.length) {
+        if (manual && steps === 1 && !quiet) {
+          showDismissibleMessage.info('可压缩前缀不足，已跳过');
+        }
+        if (!didAny) steps = 0;
+        else steps -= 1;
+        break;
+      }
+
+      // 无限级联：进度按步渐进，上限 96%，避免依赖固定层数
+      const progressBase = Math.min(88, 4 + (steps - 1) * 6);
+      const progressSpan = 8;
+      compactProgress.value = {
+        percent: progressBase + 1,
+        message: `级联压缩第 ${steps} 层…`,
+        stage: 'cascade'
+      };
+
+      // Summary is an ordinary request over the exact API-level prefix being covered.
+      const result = await window.api.runConversationCompact({
+        messages: [
+          ...fullHistory.value.filter((message) => message?.role === 'system'),
+          ...prefix
+        ],
+        modelValue: model.value,
+        provider: resolveProviderByModelValue(model.value),
+        config: compactConfig.value,
+        stream: (currentConfig.value.prompts?.[CODE.value]?.stream ?? true) && !selectedVoice.value,
+        signal: compactAbortController.signal,
+        progressBase,
+        progressSpan,
+        onProgress: (payload) => {
+          compactProgress.value = {
+            percent: Number(payload?.percent) || compactProgress.value.percent || 0,
+            message: payload?.message || compactProgress.value.message || '',
+            stage: payload?.stage || ''
+          };
+        }
+      });
+
+      if (result?.ok === false) {
+        throw new Error(result?.error?.message || 'compact_failed');
+      }
+
+      const marker = result.marker || {
+        summary: result.summary,
+        snapshotId: result.snapshotId,
+        summaryPrefix: result.summaryPrefix
+      };
+      // UI keeps the original messages; fullHistory receives the checkpoint at the same logical cut.
+      applyCascadeCompactStep(marker, uiSplit.insertIndex, uiSplit.prefix, fullInsertIndex);
+      didAny = true;
+
+      if (result.modelConfig) {
+        const currentConfig = compactConfig.value;
+        const preserveManualContext = currentConfig.contextLengthManual === true
+          || currentConfig.contextLengthSource === 'manual';
+        compactConfig.value = {
+          ...currentConfig,
+          ...result.modelConfig,
+          ...(preserveManualContext
+            ? {
+                contextLength: currentConfig.contextLength,
+                contextLengthManual: true,
+                contextLengthSource: 'manual',
+                triggerRatio: currentConfig.triggerRatio
+              }
+            : {})
+        };
+      }
+      // 继续循环：若仍超阈值则再压一层，直至阈值以下
+    }
+
+    if (!didAny) {
+      if (manual && !quiet) showDismissibleMessage.info('当前上下文未超过阈值，无需压缩');
+      return false;
+    }
+
+    autoCompactSuppressedForTurn.value = false;
+    scheduleAutoSave({ reason: 'conversation-compacted', immediate: true });
+    if (!quiet) {
+      showDismissibleMessage.success(manual ? `手动级联压缩完成（${steps} 步）` : `自动级联压缩完成（${steps} 步）`);
+    }
+    return true;
+  } catch (error) {
+    // 仅认定本地压缩控制器已真实中止为用户取消；网关返回的 abort 文案仍是请求失败。
+    const cancelledByUser = compactAbortController?.signal?.aborted === true;
+    if (cancelledByUser) {
+      if (!manual) autoCompactSuppressedForTurn.value = true;
+      if (!quiet) showDismissibleMessage.info('已取消压缩');
+      return false;
+    }
+    if (!quiet) showDismissibleMessage.error(`压缩失败: ${error?.message || error}`);
+    return false;
+  } finally {
+    compacting.value = false;
+    compactAbortController = null;
+    compactProgress.value = { percent: 0, message: '', stage: '' };
+  }
+};
+
+// 工具循环内：tool 结果写回后、下一轮 AI 请求前检测并压缩
+const maybeAutoCompactBeforeNextRequest = async ({ reason = 'pre-request' } = {}) => {
+  if (autoCompactSuppressedForTurn.value) {
+    autoCompactSuppressedForTurn.value = false;
+    return false;
+  }
+  if (compacting.value) return false;
+  if (compactConfig.value.autoCompactEnabled === false) return false;
+  try {
+    rehydrateHistoryToolsIfNeeded();
+    // 不在这里 sync 掉内存 history 的 tool 细节；rehydrate 已保证 tool 完整
+    const need = await shouldCompactNow(history.value);
+    if (!need) return false;
+    const ok = await runConversationCompact({
+      manual: false,
+      allowDuringLoading: true,
+      quiet: true
+    });
+    if (ok) {
+      // 压缩后投影会变短；确保 tool 仍完整
+      rehydrateHistoryToolsIfNeeded();
+      scheduleAutoSave({ reason: `compacted-${reason}`, immediate: true });
+      showDismissibleMessage.success('上下文已自动压缩，继续处理…');
+    }
+    return ok;
+  } catch (error) {
+    console.warn('[compact] pre-request compact failed:', error);
+    return false;
+  }
+};
+
+const maybeAutoCompactAfterTurn = async () => {
+  if (autoCompactSuppressedForTurn.value) {
+    autoCompactSuppressedForTurn.value = false;
+    return;
+  }
+  if (compacting.value) return;
+  // 回合结束后 loading 通常已 false；若仍 true 也允许压缩
+  if (compactConfig.value.autoCompactEnabled === false) return;
+  try {
+    rehydrateHistoryToolsIfNeeded();
+    const need = await shouldCompactNow(history.value);
+    if (need) {
+      await runConversationCompact({
+        manual: false,
+        allowDuringLoading: true
+      });
+    }
+  } catch (error) {
+    console.warn('[compact] auto compact after turn failed:', error);
+  } finally {
+    autoCompactSuppressedForTurn.value = false;
+  }
+};
+
+
+
+// 单条 tool 结果进入 history 的硬顶，防止第三方 MCP / 意外大输出瞬间撑爆上下文
+const MAX_TOOL_RESULT_CHARS = 48 * 1000;
+
+const truncateToolResultForHistory = (text = '') => {
+  const value = String(text ?? '');
+  if (value.length <= MAX_TOOL_RESULT_CHARS) return value;
+  const head = Math.floor(MAX_TOOL_RESULT_CHARS * 0.2);
+  const tail = MAX_TOOL_RESULT_CHARS - head - 160;
+  return `${value.slice(0, head)}\n\n--- [SYSTEM NOTE: TOOL RESULT TRUNCATED] ---\nOriginal characters: ${value.length}. Kept head ${head} + tail ${Math.max(0, tail)} chars to protect conversation context.\n\n${value.slice(-Math.max(0, tail))}`;
+};
+
+
 const askAI = async (forceSend = false) => {
-  if (loading.value || isPreparingSend.value) return;
+  if (loading.value || isPreparingSend.value || compacting.value) return;
   if (isMcpLoading.value) {
     showDismissibleMessage.info('正在加载工具，请稍后再试...');
     return;
@@ -5817,12 +7080,21 @@ const askAI = async (forceSend = false) => {
   // --- 1. 处理用户输入 ---
   if (!forceSend) {
     isPreparingSend.value = true;
+    let added = false;
     try {
-      const added = await appendCurrentInputToHistory();
-      if (!added) return;
+      added = await appendCurrentInputToHistory();
     } finally {
       isPreparingSend.value = false;
     }
+    if (!added) return;
+  }
+
+  // 用户消息写入后、进入 AI 请求前：若已超阈值，先压缩再开跑
+  // 覆盖 ask / reask / 强制发送等同一入口，避免直接超上下文请求。
+  try {
+    await maybeAutoCompactBeforeNextRequest({ reason: 'before-askAI' });
+  } catch (error) {
+    console.warn('[compact] before-askAI compact failed:', error);
   }
 
   // --- 2. 初始化 AI 回合 ---
@@ -6271,7 +7543,7 @@ const askAI = async (forceSend = false) => {
         delete responseMessage.tokenUsage;
       }
 
-      history.value.push(responseMessage);
+      appendFullHistory(responseMessage);
       throwIfTurnAborted();
 
       // --- 更新 UI 气泡 ---
@@ -6464,12 +7736,30 @@ const askAI = async (forceSend = false) => {
         );
 
         throwIfTurnAborted();
-        history.value.push(...toolMessages);
+        // 统一硬截断 tool 结果（覆盖 Skill/BetterWork 等未走 formatToolResult 的路径）
+        const safeToolMessages = toolMessages.map((msg) => ({
+          ...msg,
+          content: truncateToolResultForHistory(msg?.content)
+        }));
+        // UI 气泡同步截断，避免显示与 history 不一致的超长结果
+        if (Array.isArray(currentBubble?.tool_calls)) {
+          currentBubble.tool_calls.forEach((tc) => {
+            if (tc && Object.prototype.hasOwnProperty.call(tc, 'result')) {
+              tc.result = truncateToolResultForHistory(tc.result);
+            }
+          });
+        }
+        appendFullHistory(...safeToolMessages);
         // 工具调用完成本质也会向 AI 续发请求，此处保存一次
         scheduleAutoSave({ reason: 'tool-calls-completed', immediate: true });
         // 工具调用完成后，把缓冲区消息插入历史，使下一轮请求即可纳入
         throwIfTurnAborted();
         await drainBufferIntoHistory();
+        throwIfTurnAborted();
+
+        // 关键：tool 结果与缓冲消息写回后、进入下一轮 AI 请求前做上下文检测。
+        // 超限则先压缩，压缩完成后再 continue 循环发送。
+        await maybeAutoCompactBeforeNextRequest({ reason: 'after-tool-results' });
         throwIfTurnAborted();
       } else {
         // EdgeTTS: 收到文本回复后，单独调用 EdgeTTS 生成语音
@@ -6563,7 +7853,7 @@ const askAI = async (forceSend = false) => {
       currentBubble.reasoning_content = finalReasoningContent;
       currentBubble.status = 'error';
 
-      history.value.push({
+      appendFullHistory({
         role: 'assistant',
         content: finalContent,
         reasoning_content: finalReasoningContent || null
@@ -6641,6 +7931,7 @@ const askAI = async (forceSend = false) => {
       currentTaskConfig.value = null; // 清空标记，避免后续手动问答也触发
     } else {
       scheduleAutoSave({ reason: 'assistant-turn-finalized', immediate: true }); // 普通对话的自动保存
+      await maybeAutoCompactAfterTurn();
     }
     if (stillOwnsTurn) {
       activeAssistantTurnMeta = null;
@@ -6720,7 +8011,11 @@ const reaskAI = async () => {
     const showItemsToRemove = history.value.slice(lastVisibleMessageIndexInHistory)
       .filter(m => m.role !== 'tool').length;
 
-    history.value.splice(lastVisibleMessageIndexInHistory, historyItemsToRemove);
+    const lastVisibleMessageIndexInFullHistory = fullHistory.value.findLastIndex((message) => message?.role === 'assistant');
+    if (lastVisibleMessageIndexInFullHistory >= 0) {
+      fullHistory.value.splice(lastVisibleMessageIndexInFullHistory);
+      syncHistoryFromFullHistory();
+    }
     if (showItemsToRemove > 0) {
       chat_show.value.splice(chat_show.value.length - showItemsToRemove);
     }
@@ -6737,74 +8032,45 @@ const reaskAI = async () => {
 };
 
 const deleteMessage = (index) => {
-  if (loading.value) {
-    showDismissibleMessage.warning('请等待当前回复完成后再操作');
+  if (loading.value || compacting.value) {
+    showDismissibleMessage.warning(compacting.value ? '压缩进行中，暂不可编辑历史' : '请等待当前回复完成后再操作');
     return;
   }
   if (index < 0 || index >= chat_show.value.length) return;
-
-  const msgToDeleteInShow = chat_show.value[index];
-  if (msgToDeleteInShow?.role === 'system') {
+  const messageToDelete = chat_show.value[index];
+  if (messageToDelete?.role === 'system') {
     showDismissibleMessage.info('系统提示词不能被删除');
     return;
   }
 
-  let history_idx = -1;
-  let show_counter = -1;
-  for (let i = 0; i < history.value.length; i++) {
-    if (history.value[i].role !== 'tool') {
-      show_counter++;
+  const fullVisibleIndexes = fullHistory.value
+    .map((message, fullIndex) => (message?.role === 'tool' ? -1 : fullIndex))
+    .filter((fullIndex) => fullIndex >= 0);
+  const fullStartIndex = fullVisibleIndexes[index];
+  if (Number.isInteger(fullStartIndex)) {
+    let fullDeleteCount = 1;
+    if (fullHistory.value[fullStartIndex]?.role === 'assistant') {
+      const calledIds = new Set((fullHistory.value[fullStartIndex]?.tool_calls || []).map((call) => call?.id).filter(Boolean));
+      let cursor = fullStartIndex + 1;
+      while (cursor < fullHistory.value.length && fullHistory.value[cursor]?.role === 'tool') {
+        if (calledIds.size === 0 || calledIds.has(fullHistory.value[cursor]?.tool_call_id)) fullDeleteCount += 1;
+        cursor += 1;
+      }
     }
-    if (show_counter === index) {
-      history_idx = i;
-      break;
-    }
+    fullHistory.value.splice(fullStartIndex, fullDeleteCount);
   }
+  chat_show.value.splice(index, 1);
+  markOutermostCanRestore();
+  syncHistoryFromFullHistory();
 
-  if (history_idx === -1) {
-    console.error("关键错误: 无法将 chat_show 索引映射到 history 索引。中止删除。");
-    showDismissibleMessage.error("删除失败：消息状态不一致。");
-    return;
+  const nextCollapsed = new Set();
+  for (const collapsedIndex of collapsedMessages.value) {
+    if (collapsedIndex < index) nextCollapsed.add(collapsedIndex);
+    else if (collapsedIndex > index) nextCollapsed.add(collapsedIndex - 1);
   }
-
-  const messageToDeleteInHistory = history.value[history_idx];
-  let history_start_idx = history_idx;
-  let history_end_idx = history_idx;
-
-  if (
-    messageToDeleteInHistory.role === 'assistant' &&
-    messageToDeleteInHistory.tool_calls &&
-    messageToDeleteInHistory.tool_calls.length > 0
-  ) {
-    while (history.value[history_end_idx + 1]?.role === 'tool') {
-      history_end_idx++;
-    }
-  }
-
-  const history_delete_count = history_end_idx - history_start_idx + 1;
-  const show_delete_count = 1;
-  const show_start_idx = index;
-
-  if (history_delete_count > 0) {
-    history.value.splice(history_start_idx, history_delete_count);
-  }
-
-  if (show_delete_count > 0) {
-    chat_show.value.splice(show_start_idx, show_delete_count);
-  }
-
-  const deletedIndexInShow = index;
-  const newCollapsedMessages = new Set();
-  for (const collapsedIdx of collapsedMessages.value) {
-    if (collapsedIdx < deletedIndexInShow) {
-      newCollapsedMessages.add(collapsedIdx);
-    } else if (collapsedIdx > deletedIndexInShow) {
-      newCollapsedMessages.add(collapsedIdx - 1);
-    }
-  }
-  collapsedMessages.value = newCollapsedMessages;
-
+  collapsedMessages.value = nextCollapsed;
   focusedMessageIndex.value = null;
+  scheduleAutoSave({ reason: 'message-deleted', immediate: true });
 };
 
 const clearHistory = async () => {
@@ -6824,10 +8090,10 @@ const clearHistory = async () => {
   const systemPromptToKeep = systemPromptFromConfig ? { role: "system", content: systemPromptFromConfig } : systemPromptFromHistory;
 
   if (systemPromptToKeep) {
-    history.value = [systemPromptToKeep];
+    replaceFullHistory([systemPromptToKeep]);
     chat_show.value = [{ ...systemPromptToKeep, id: messageIdCounter.value++ }];
   } else {
-    history.value = [];
+    replaceFullHistory([]);
     chat_show.value = [];
   }
 
@@ -7117,7 +8383,7 @@ const scrollToMessageByIndex = (index) => {
             :is-dark-mode="currentConfig.isDarkMode" @delete-message="handleDeleteMessage" @copy-text="handleCopyText"
             @re-ask="handleReAsk" @toggle-collapse="handleToggleCollapse" @show-system-prompt="handleShowSystemPrompt"
             @avatar-click="onAvatarClick" @edit-message-requested="handleEditStart" @edit-finished="handleEditEnd"
-            @edit-message="handleEditMessage" @cancel-tool-call="handleCancelToolCall" @submit-choice="handleChoiceSubmit" />
+            @edit-message="handleEditMessage" @cancel-tool-call="handleCancelToolCall" @submit-choice="handleChoiceSubmit" @restore-compact="handleRestoreCompact" />
         </el-main>
 
         <div class="unified-nav-sidebar" v-if="chat_show.length > 0">
@@ -7153,7 +8419,7 @@ const scrollToMessageByIndex = (index) => {
                   @click="scrollToMessageByIndex(msg.originalIndex)">
                   <div class="timeline-node" :class="[
                     msg.role,
-                    { 'active': focusedMessageIndex === msg.originalIndex }
+                    { 'active': focusedMessageIndex === msg.originalIndex, 'is-compaction': msg.role === 'compaction' }
                   ]">
                   </div>
                 </div>
@@ -7187,11 +8453,24 @@ const scrollToMessageByIndex = (index) => {
 
         </div>
 
-        <ChatInput ref="chatInputRef" v-model:prompt="prompt" v-model:fileList="fileList"
-          v-model:selectedVoice="selectedVoice" v-model:tempReasoningEffort="tempReasoningEffort" :loading="loading"
+        <ChatInput
+            :compacting="compacting"
+            :compact-progress="compactProgress"
+            :compact-config="compactConfig"
+            :can-restore-compact="canRestoreCompact"
+ ref="chatInputRef" v-model:prompt="prompt" v-model:fileList="fileList"
+          v-model:selectedVoice="selectedVoice" v-model:tempReasoningEffort="tempReasoningEffort" :loading="loading || compacting"
           :ctrlEnterToSend="currentConfig.CtrlEnterToSend" :layout="inputLayout" :voiceList="currentConfig.voiceList"
           :is-mcp-active="isMcpActive" :all-mcp-servers="availableMcpServers" :active-mcp-ids="sessionMcpServerIds"
-          :active-skill-ids="sessionSkillIds" :all-skills="allSkillsList" :append-buffer="pendingAppendBuffer" :sub-agent-tasks="subAgentTasks" @submit="handleSubmit" @cancel="handleCancel"
+          :active-skill-ids="sessionSkillIds" :all-skills="allSkillsList" :append-buffer="pendingAppendBuffer" :sub-agent-tasks="subAgentTasks" @open-compact-dialog="handleOpenCompactDialog"
+            @run-compact="handleRunCompactWithConfig"
+            @cancel-compact="handleCancelCompact"
+            @save-compact-config="handleSaveCompactConfig"
+            @apply-compact-advanced-global="handleApplyCompactAdvancedGlobal"
+            @reset-compact-config="handleResetCompactConfig"
+            @refresh-compact-context="handleRefreshCompactContext"
+            @restore-compact="handleRestoreCompact"
+            @submit="handleSubmit" @cancel="handleCancel"
           @clear-history="handleClearHistory" @remove-file="handleRemoveFile" @upload="handleUpload"
           @send-audio="handleSendAudio" @open-mcp-dialog="handleOpenMcpDialog" @pick-file-start="handlePickFileStart"
           @toggle-mcp="handleQuickMcpToggle" @toggle-skill="handleQuickSkillToggle"
@@ -8434,6 +9713,12 @@ html.dark .app-container {
     background: rgba(0, 0, 0, 0.96);
   }
 
+  &.compaction {
+    background: linear-gradient(90deg, #f6c945 0%, #e0a800 100%);
+    height: 3px;
+    box-shadow: 0 0 6px rgba(224, 168, 0, 0.45);
+  }
+
   &.active {
     width: 15px;
     height: 3px;
@@ -8489,6 +9774,11 @@ html.dark {
 
   .timeline-node.assistant {
     background: rgba(255, 255, 255, 0.96);
+  }
+
+  .timeline-node.compaction {
+    background: linear-gradient(90deg, #ffd666 0%, #faad14 100%);
+    box-shadow: 0 0 8px rgba(250, 173, 20, 0.5);
   }
 
   .node-tooltip {
