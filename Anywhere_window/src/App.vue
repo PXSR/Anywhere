@@ -2231,10 +2231,8 @@ const handleEditMessage = (index, newContent) => {
     }
   };
 
-  const visibleShowIndexes = getVisibleChatShowIndexes();
-  const logicalIndex = visibleShowIndexes.indexOf(showIndex);
-  const fullIndex = logicalIndex >= 0 ? getVisibleFullHistoryIndexes()[logicalIndex] : -1;
   const uiMessage = chat_show.value[showIndex];
+  const fullIndex = resolveEditableFullHistoryIndex(showIndex);
   const fullMessage = Number.isInteger(fullIndex) ? fullHistory.value[fullIndex] : null;
   if (!uiMessage || !fullMessage || uiMessage.role !== fullMessage.role) return false;
 
@@ -6436,6 +6434,75 @@ const getComparableRenderableSignature = (message = {}, { fromUi = false } = {})
     role: source.role,
     content: normalizeRenderableContent(source.content)
   });
+};
+
+
+// Historical sessions preserve chat_show as a UI cache, so it may not be a one-to-one
+// projection of fullHistory. Keep the index lookup fast path, then use only stable
+// renderable anchors to resolve a mismatched cached bubble. Ambiguous matches are rejected.
+const EDIT_FALLBACK_ANCHOR_LIMIT = 3;
+
+const getEditFallbackAnchorSignatures = (startIndex, step) => {
+  const anchors = [];
+  for (
+    let index = startIndex;
+    index >= 0 && index < chat_show.value.length && anchors.length < EDIT_FALLBACK_ANCHOR_LIMIT;
+    index += step
+  ) {
+    const signature = getComparableRenderableSignature(chat_show.value[index], { fromUi: true });
+    if (signature) anchors.push(signature);
+  }
+  return anchors;
+};
+
+const matchesEditFallbackAnchors = (fullIndex, previousAnchors, nextAnchors) => {
+  let cursor = fullIndex - 1;
+  for (const signature of previousAnchors) {
+    while (cursor >= 0 && getComparableRenderableSignature(fullHistory.value[cursor]) !== signature) {
+      cursor -= 1;
+    }
+    if (cursor < 0) return false;
+    cursor -= 1;
+  }
+
+  cursor = fullIndex + 1;
+  for (const signature of nextAnchors) {
+    while (cursor < fullHistory.value.length && getComparableRenderableSignature(fullHistory.value[cursor]) !== signature) {
+      cursor += 1;
+    }
+    if (cursor >= fullHistory.value.length) return false;
+    cursor += 1;
+  }
+  return true;
+};
+
+const resolveEditableFullHistoryIndex = (showIndex) => {
+  const visibleShowIndexes = getVisibleChatShowIndexes();
+  const logicalIndex = visibleShowIndexes.indexOf(showIndex);
+  const fastIndex = logicalIndex >= 0 ? getVisibleFullHistoryIndexes()[logicalIndex] : -1;
+  const uiMessage = chat_show.value[showIndex];
+  const targetSignature = getComparableRenderableSignature(uiMessage, { fromUi: true });
+  const fastMessage = Number.isInteger(fastIndex) ? fullHistory.value[fastIndex] : null;
+  const fastSignature = getComparableRenderableSignature(fastMessage);
+  if (
+    uiMessage
+    && fastMessage
+    && uiMessage.role === fastMessage.role
+    && (!targetSignature || targetSignature === fastSignature)
+  ) return fastIndex;
+
+
+  if (!targetSignature) return -1;
+
+  const previousAnchors = getEditFallbackAnchorSignatures(showIndex - 1, -1);
+  const nextAnchors = getEditFallbackAnchorSignatures(showIndex + 1, 1);
+  const candidates = [];
+  for (let index = 0; index < fullHistory.value.length; index += 1) {
+    if (getComparableRenderableSignature(fullHistory.value[index]) !== targetSignature) continue;
+    if (matchesEditFallbackAnchors(index, previousAnchors, nextAnchors)) candidates.push(index);
+    if (candidates.length > 1) return -1;
+  }
+  return candidates.length === 1 ? candidates[0] : -1;
 };
 
 const getTailFullHistoryStartIndex = () => {
