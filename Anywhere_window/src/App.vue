@@ -2623,12 +2623,7 @@ onMounted(async () => {
       showDismissibleMessage.error('加载用户配置失败，使用默认配置。');
     }
 
-    try {
-      const userInfo = await window.api.getUser();
-      UserAvart.value = userInfo.avatar;
-    } catch (err) {
-      UserAvart.value = "user.png";
-    }
+    UserAvart.value = "user.png";
 
     if (data?.os) {
       currentOS.value = data.os;
