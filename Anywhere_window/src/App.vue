@@ -471,6 +471,25 @@ const getMessageElementByIndex = (index) => {
   return target?.$el?.nodeType === 1 ? target.$el : null;
 };
 
+let navigationScrollRequestId = 0;
+const NAVIGATION_SCROLL_ALIGNMENT_TOLERANCE = 3;
+
+// ChatMessage is nested in flex wrappers with margins, so offsetTop is not reliably relative
+// to the el-main scrollport. Use viewport rectangles to derive the actual scroll-container target.
+const getContainerRelativeScrollTop = (container, messageElement) => {
+  const containerRect = container.getBoundingClientRect();
+  const messageRect = messageElement.getBoundingClientRect();
+  const desired = container.scrollTop + messageRect.top - containerRect.top;
+  return Math.max(0, Math.min(desired, container.scrollHeight - container.clientHeight));
+};
+
+const getMessageViewportOffset = (container, messageElement) => (
+  messageElement.getBoundingClientRect().top - container.getBoundingClientRect().top
+);
+
+const nextAnimationFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+
+
 const getLastMessageElement = () => {
   const lastIndex = getLastNavigableMessageIndex();
   return lastIndex === null || lastIndex === undefined
@@ -687,6 +706,7 @@ const compactConfig = ref({
   contextLengthSource: 'default',
   contextLengthManual: false,
   keepRecentRounds: 3,
+  hideCompactedMessages: true,
   compactPrompt: '',
   resolvedId: ''
 });
@@ -1589,21 +1609,18 @@ const forceScrollToBottom = () => {
 const findFocusedMessageIndex = () => {
   const container = chatContainerRef.value?.$el;
   if (!container) return;
-  const scrollTop = container.scrollTop;
+  const containerRect = container.getBoundingClientRect();
   let closestIndex = -1;
   let smallestDistance = Infinity;
-  for (let i = chat_show.value.length - 1; i >= 0; i--) {
-    const el = getMessageElementByIndex(i);
-    if (el) {
-      const elTop = el.offsetTop;
-      const elBottom = elTop + el.clientHeight;
-      if (elTop < scrollTop + container.clientHeight && elBottom > scrollTop) {
-        const distance = Math.abs(elTop - scrollTop);
-        if (distance < smallestDistance) {
-          smallestDistance = distance;
-          closestIndex = i;
-        }
-      }
+  for (let index = chat_show.value.length - 1; index >= 0; index -= 1) {
+    const element = getMessageElementByIndex(index);
+    if (!element) continue;
+    const messageRect = element.getBoundingClientRect();
+    if (messageRect.top >= containerRect.bottom || messageRect.bottom <= containerRect.top) continue;
+    const distance = Math.abs(messageRect.top - containerRect.top);
+    if (distance < smallestDistance) {
+      smallestDistance = distance;
+      closestIndex = index;
     }
   }
   if (closestIndex !== -1) focusedMessageIndex.value = closestIndex;
@@ -1661,12 +1678,11 @@ const handleScroll = (event) => {
 const navigateToPreviousMessage = () => {
   findFocusedMessageIndex();
   const currentIndex = focusedMessageIndex.value;
-  if (currentIndex === null) return;
-  const element = getMessageElementByIndex(currentIndex);
+  if (currentIndex === null || currentIndex === undefined) return;
   const container = chatContainerRef.value?.$el;
-  if (!element || !container) return;
-  const scrollDifference = container.scrollTop - element.offsetTop;
-  if (scrollDifference > 5) {
+  const element = getMessageElementByIndex(currentIndex);
+  if (!container || !element) return;
+  if (getMessageViewportOffset(container, element) < -NAVIGATION_SCROLL_ALIGNMENT_TOLERANCE) {
     scrollChatContainerToMessage(currentIndex);
   } else if (currentIndex > 0) {
     scrollChatContainerToMessage(currentIndex - 1);
@@ -1852,22 +1868,39 @@ const scheduleStickyScrollFrames = () => {
   stickyScrollRafIds.push(firstFrameId);
 };
 
-const scrollChatContainerToMessage = (index, behavior = 'smooth') => {
-  const chatContainer = chatContainerRef.value?.$el;
-  const targetElement = getMessageElementByIndex(index);
-  if (!chatContainer || !targetElement) return false;
+const scrollChatContainerToMessage = async (index) => {
+  const targetId = chat_show.value[index]?.id;
+  if (targetId === undefined || targetId === null) return false;
 
-  isSticky.value = false;
-  isAtBottom.value = false;
-  showScrollToBottomButton.value = true;
-
-  chatContainer.scrollTo({
-    top: Math.max(0, targetElement.offsetTop),
-    behavior
-  });
-  focusedMessageIndex.value = index;
-  centerActiveNavNode(index);
-  return true;
+  const requestId = ++navigationScrollRequestId;
+  let didResolveTarget = false;
+  // Explicit navigation only: compute against the actual scrollport and correct layout shifts
+  // across two subsequent frames. No background polling survives this click.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (requestId !== navigationScrollRequestId) return false;
+    const currentIndex = chat_show.value.findIndex((message) => message?.id === targetId);
+    const chatContainer = chatContainerRef.value?.$el;
+    const targetElement = currentIndex >= 0 ? getMessageElementByIndex(currentIndex) : null;
+    if (chatContainer && targetElement) {
+      didResolveTarget = true;
+      isSticky.value = false;
+      isAtBottom.value = false;
+      showScrollToBottomButton.value = true;
+      const viewportOffset = getMessageViewportOffset(chatContainer, targetElement);
+      if (Math.abs(viewportOffset) > NAVIGATION_SCROLL_ALIGNMENT_TOLERANCE) {
+        withTemporaryAutoScroll(chatContainer, () => {
+          chatContainer.scrollTop = getContainerRelativeScrollTop(chatContainer, targetElement);
+          lastKnownChatScrollTop = chatContainer.scrollTop;
+        });
+      }
+      focusedMessageIndex.value = currentIndex;
+      centerActiveNavNode(currentIndex);
+    }
+    if (attempt === 2) break;
+    await nextTick();
+    await nextAnimationFrame();
+  }
+  return didResolveTarget;
 };
 
 const keepMessageAnchor = async (messageElement, updater, fallbackToBottom = false) => {
@@ -2199,10 +2232,8 @@ const handleEditMessage = (index, newContent) => {
     }
   };
 
-  const visibleShowIndexes = getVisibleChatShowIndexes();
-  const logicalIndex = visibleShowIndexes.indexOf(showIndex);
-  const fullIndex = logicalIndex >= 0 ? getVisibleFullHistoryIndexes()[logicalIndex] : -1;
   const uiMessage = chat_show.value[showIndex];
+  const fullIndex = resolveEditableFullHistoryIndex(showIndex);
   const fullMessage = Number.isInteger(fullIndex) ? fullHistory.value[fullIndex] : null;
   if (!uiMessage || !fullMessage || uiMessage.role !== fullMessage.role) return false;
 
@@ -2243,6 +2274,11 @@ const handleEditEnd = async ({ id, action, content }) => {
     return;
   }
   const updatedIndex = chat_show.value.findIndex((message) => message?.id === id);
+
+
+  // Keep the edited user bubble renderable before automatic reask. This is a single-message
+  // operation and deliberately avoids the old full-history/UI-cache reconciliation.
+  ensureLatestTailUserBubble(chat_show.value[updatedIndex]);
   scheduleAutoSave({ reason: 'message-edited', immediate: true });
   showDismissibleMessage.success('消息已更新');
 
@@ -3626,6 +3662,12 @@ const scheduleLoadingAutoSave = (reason = 'loading-progress') => {
 
 
 onBeforeUnmount(async () => {  // 15s 轮询自动保存已移除；当前仅保留显式业务触发的保存链路。
+
+  if (tailBubbleRecoveryRafId !== null) {
+    cancelAnimationFrame(tailBubbleRecoveryRafId);
+    tailBubbleRecoveryRafId = null;
+  }
+
 
 
   closeSubAgentDetailFromInput();
@@ -5327,6 +5369,11 @@ const loadSession = async (jsonData) => {
     await nextTick();
     scrollToBottom();
 
+    // Deferred and bounded: recover only a missing latest user bubble after the UI is visible.
+    // It never runs in auto-save, serialization, or close paths.
+    scheduleLatestTailUserBubbleRecovery();
+
+
     let mcpServersToLoad = [];
     if (jsonData.activeMcpServerIds && Array.isArray(jsonData.activeMcpServerIds)) {
       mcpServersToLoad = jsonData.activeMcpServerIds;
@@ -5918,6 +5965,7 @@ const normalizeCompactConfigState = (nextConfig = {}) => ({
   contextLengthSource: nextConfig.contextLengthSource || 'default',
   contextLengthManual: nextConfig.contextLengthManual === true || nextConfig.contextLengthSource === 'manual',
   keepRecentRounds: Number.isFinite(Number(nextConfig.keepRecentRounds)) ? Number(nextConfig.keepRecentRounds) : 3,
+  hideCompactedMessages: nextConfig.hideCompactedMessages !== false,
   compactPrompt: typeof nextConfig.compactPrompt === 'string' ? nextConfig.compactPrompt : '',
   resolvedId: typeof nextConfig.resolvedId === 'string' ? nextConfig.resolvedId : ''
 });
@@ -6060,6 +6108,7 @@ const handleResetCompactConfig = async () => {
       autoCompactEnabled: true,
       triggerRatio: 0.9,
       keepRecentRounds: 3,
+      hideCompactedMessages: true,
       keepRecentRoundsUserSet: true,
       compactPrompt: '',
       contextLengthManual: false,
@@ -6118,6 +6167,7 @@ const handleApplyCompactAdvancedGlobal = async (patch = {}) => {
       autoCompactEnabled: patch?.autoCompactEnabled ?? compactConfig.value.autoCompactEnabled,
       triggerRatio: patch?.triggerRatio ?? compactConfig.value.triggerRatio,
       keepRecentRounds: patch?.keepRecentRounds ?? compactConfig.value.keepRecentRounds,
+      hideCompactedMessages: patch?.hideCompactedMessages ?? compactConfig.value.hideCompactedMessages,
       compactPrompt: patch?.compactPrompt ?? compactConfig.value.compactPrompt
     });
 
@@ -6357,6 +6407,210 @@ const getVisibleChatShowIndexes = () => chat_show.value
   .map((message, showIndex) => (message?.role === 'tool' ? -1 : showIndex))
   .filter((showIndex) => showIndex >= 0);
 
+
+// Bounded recovery for a stale UI cache after compaction. It only inspects the latest compacted tail
+// and inserts one missing user bubble; never call this from save, serialization, or close paths.
+const TAIL_BUBBLE_RECOVERY_LIMIT = 80;
+let tailBubbleRecoveryRafId = null;
+
+const normalizeRenderableContent = (content) => {
+  if (!Array.isArray(content)) return content ?? null;
+  const parts = content.filter((part) => part && !part.isTranscript);
+  if (parts.length > 0 && parts.every((part) => part?.type === 'text')) {
+    return parts.map((part) => part.text ?? '').join('');
+  }
+  return parts.map((part) => (
+    part?.type === 'text' ? { type: 'text', text: part.text ?? '' } : part
+  ));
+};
+
+// Recovery aligns visible bubbles, not API/tool metadata. Assistant tool_calls use different
+// storage shapes in fullHistory and chat_show, so they must not affect the visual anchor.
+const getComparableRenderableSignature = (message = {}, { fromUi = false } = {}) => {
+  const source = fromUi ? toHistoryMessageFromUi(message) : toRequestMessageFromFullHistory(message);
+  if (!source || !['user', 'assistant'].includes(source.role)) return '';
+  return JSON.stringify({
+    role: source.role,
+    content: normalizeRenderableContent(source.content)
+  });
+};
+
+
+// Historical sessions preserve chat_show as a UI cache, so it may not be a one-to-one
+// projection of fullHistory. Keep the index lookup fast path, then use only stable
+// renderable anchors to resolve a mismatched cached bubble. Ambiguous matches are rejected.
+const EDIT_FALLBACK_ANCHOR_LIMIT = 3;
+
+const getEditFallbackAnchorSignatures = (startIndex, step) => {
+  const anchors = [];
+  for (
+    let index = startIndex;
+    index >= 0 && index < chat_show.value.length && anchors.length < EDIT_FALLBACK_ANCHOR_LIMIT;
+    index += step
+  ) {
+    const signature = getComparableRenderableSignature(chat_show.value[index], { fromUi: true });
+    if (signature) anchors.push(signature);
+  }
+  return anchors;
+};
+
+const matchesEditFallbackAnchors = (fullIndex, previousAnchors, nextAnchors) => {
+  let cursor = fullIndex - 1;
+  for (const signature of previousAnchors) {
+    while (cursor >= 0 && getComparableRenderableSignature(fullHistory.value[cursor]) !== signature) {
+      cursor -= 1;
+    }
+    if (cursor < 0) return false;
+    cursor -= 1;
+  }
+
+  cursor = fullIndex + 1;
+  for (const signature of nextAnchors) {
+    while (cursor < fullHistory.value.length && getComparableRenderableSignature(fullHistory.value[cursor]) !== signature) {
+      cursor += 1;
+    }
+    if (cursor >= fullHistory.value.length) return false;
+    cursor += 1;
+  }
+  return true;
+};
+
+const resolveEditableFullHistoryIndex = (showIndex) => {
+  const visibleShowIndexes = getVisibleChatShowIndexes();
+  const logicalIndex = visibleShowIndexes.indexOf(showIndex);
+  const fastIndex = logicalIndex >= 0 ? getVisibleFullHistoryIndexes()[logicalIndex] : -1;
+  const uiMessage = chat_show.value[showIndex];
+  const targetSignature = getComparableRenderableSignature(uiMessage, { fromUi: true });
+  const fastMessage = Number.isInteger(fastIndex) ? fullHistory.value[fastIndex] : null;
+  const fastSignature = getComparableRenderableSignature(fastMessage);
+  if (
+    uiMessage
+    && fastMessage
+    && uiMessage.role === fastMessage.role
+    && (!targetSignature || targetSignature === fastSignature)
+  ) return fastIndex;
+
+
+  if (!targetSignature) return -1;
+
+  const previousAnchors = getEditFallbackAnchorSignatures(showIndex - 1, -1);
+  const nextAnchors = getEditFallbackAnchorSignatures(showIndex + 1, 1);
+  const candidates = [];
+  for (let index = 0; index < fullHistory.value.length; index += 1) {
+    if (getComparableRenderableSignature(fullHistory.value[index]) !== targetSignature) continue;
+    if (matchesEditFallbackAnchors(index, previousAnchors, nextAnchors)) candidates.push(index);
+    if (candidates.length > 1) return -1;
+  }
+  return candidates.length === 1 ? candidates[0] : -1;
+};
+
+const getTailFullHistoryStartIndex = () => {
+  const full = Array.isArray(fullHistory.value) ? fullHistory.value : [];
+  return Math.max(getOutermostCompactionIndexIn(full) + 1, full.length - TAIL_BUBBLE_RECOVERY_LIMIT);
+};
+
+const getTailChatShowStartIndex = () => {
+  const ui = Array.isArray(chat_show.value) ? chat_show.value : [];
+  return Math.max(0, getOutermostCompactionIndexIn(ui) + 1, ui.length - TAIL_BUBBLE_RECOVERY_LIMIT);
+};
+
+const findTailUiMessageIndexBySignature = (signature, occurrenceFromEnd = 1) => {
+  if (!signature) return -1;
+  const ui = Array.isArray(chat_show.value) ? chat_show.value : [];
+  let seen = 0;
+  for (let index = ui.length - 1; index >= getTailChatShowStartIndex(); index -= 1) {
+    if (getComparableRenderableSignature(ui[index], { fromUi: true }) !== signature) continue;
+    seen += 1;
+    if (seen === occurrenceFromEnd) return index;
+  }
+  return -1;
+};
+
+const countTailUiMessageSignatures = (signature) => {
+  if (!signature) return 0;
+  let count = 0;
+  for (let index = getTailChatShowStartIndex(); index < chat_show.value.length; index += 1) {
+    if (getComparableRenderableSignature(chat_show.value[index], { fromUi: true }) === signature) count += 1;
+  }
+  return count;
+};
+
+const getTailFullSignatureOccurrence = (targetIndex, signature) => {
+  if (!signature) return 0;
+  let count = 0;
+  for (let index = getTailFullHistoryStartIndex(); index <= targetIndex; index += 1) {
+    if (getComparableRenderableSignature(fullHistory.value[index]) === signature) count += 1;
+  }
+  return count;
+};
+
+const recoverTailUserBubbleAt = (targetIndex) => {
+  const full = fullHistory.value;
+  const target = full[targetIndex];
+  if (target?.role !== 'user') return false;
+  const signature = getComparableRenderableSignature(target);
+  if (!signature) return false;
+
+  // Preserve duplicate user turns: a matching signature is only present when its full-history
+  // occurrence count is already represented in the bounded UI tail.
+  const occurrence = getTailFullSignatureOccurrence(targetIndex, signature);
+  if (countTailUiMessageSignatures(signature) >= occurrence) return false;
+
+  let insertIndex = -1;
+  for (let index = targetIndex + 1; index < full.length && index < targetIndex + TAIL_BUBBLE_RECOVERY_LIMIT; index += 1) {
+    if (full[index]?.role === 'tool' || full[index]?.role === 'compaction') continue;
+    const nextUiIndex = findTailUiMessageIndexBySignature(getComparableRenderableSignature(full[index]));
+    if (nextUiIndex >= 0) {
+      insertIndex = nextUiIndex;
+      break;
+    }
+  }
+  if (insertIndex < 0) {
+    for (let index = targetIndex - 1; index >= getTailFullHistoryStartIndex(); index -= 1) {
+      if (full[index]?.role === 'tool' || full[index]?.role === 'compaction') continue;
+      const previousUiIndex = findTailUiMessageIndexBySignature(getComparableRenderableSignature(full[index]));
+      if (previousUiIndex >= 0) {
+        insertIndex = previousUiIndex + 1;
+        break;
+      }
+    }
+  }
+  if (insertIndex < 0) insertIndex = chat_show.value.length;
+
+  chat_show.value.splice(insertIndex, 0, {
+    ...deepCloneSafe(target),
+    id: messageIdCounter.value++,
+    timestamp: target.timestamp || new Date().toLocaleString('sv-SE')
+  });
+  return true;
+};
+
+// Recover every missing user bubble in the bounded compacted tail, preserving full-history order.
+// This intentionally does not rebuild existing UI bubbles or inspect save/close hot paths.
+const ensureLatestTailUserBubble = (preferredUiMessage = null) => {
+  const preferredSignature = preferredUiMessage?.role === 'user'
+    ? getComparableRenderableSignature(preferredUiMessage, { fromUi: true })
+    : '';
+  let recovered = false;
+  for (let index = getTailFullHistoryStartIndex(); index < fullHistory.value.length; index += 1) {
+    const message = fullHistory.value[index];
+    if (message?.role !== 'user') continue;
+    const signature = getComparableRenderableSignature(message);
+    if (preferredSignature && signature !== preferredSignature) continue;
+    recovered = recoverTailUserBubbleAt(index) || recovered;
+  }
+  return recovered;
+};
+
+const scheduleLatestTailUserBubbleRecovery = () => {
+  if (tailBubbleRecoveryRafId !== null) cancelAnimationFrame(tailBubbleRecoveryRafId);
+  tailBubbleRecoveryRafId = requestAnimationFrame(() => {
+    tailBubbleRecoveryRafId = null;
+    ensureLatestTailUserBubble();
+  });
+};
+
+
 // UI metadata is not part of fullHistory. Fill only missing assistant names from adjacent UI bubbles.
 // Do not infer a model name when the whole conversation has no recorded assistant name.
 const inheritMissingAssistantDisplayNames = () => {
@@ -6512,6 +6766,19 @@ const getOutermostCompactionIndexIn = (list = []) => {
   }
   return -1;
 };
+
+const renderedChatMessages = computed(() => {
+  const messages = Array.isArray(chat_show.value) ? chat_show.value : [];
+  const outermostIndex = compactConfig.value.hideCompactedMessages === false
+    ? -1
+    : getOutermostCompactionIndexIn(messages);
+  const startIndex = outermostIndex >= 0 ? outermostIndex : 0;
+  return messages.slice(startIndex).map((message, index) => ({
+    message,
+    index: startIndex + index
+  }));
+});
+
 
 // 旧会话可能只有 [compaction{archivedMessages}]；展开为「完整列表 + 摘要插入」
 const migrateInsertStyleChatShow = (messages = []) => {
@@ -7997,30 +8264,29 @@ const copyText = async (content, index) => { if (loading.value && index === chat
 const reaskAI = async () => {
   if (loading.value) return;
 
-  const lastVisibleMessageIndexInHistory = history.value.findLastIndex(msg => msg.role !== 'tool');
-
-  if (lastVisibleMessageIndexInHistory === -1) {
+  // fullHistory remains the authoritative transcript after compaction. history is only the shorter
+  // outbound projection, so it must never decide how many UI bubbles to remove.
+  const lastVisibleMessageIndexInFullHistory = fullHistory.value.findLastIndex((message) => (
+    message?.role === 'user' || message?.role === 'assistant'
+  ));
+  if (lastVisibleMessageIndexInFullHistory < 0) {
     showDismissibleMessage.warning('没有可以重新提问的用户消息');
     return;
   }
 
-  const lastVisibleMessage = history.value[lastVisibleMessageIndexInHistory];
-
+  const lastVisibleMessage = fullHistory.value[lastVisibleMessageIndexInFullHistory];
   if (lastVisibleMessage.role === 'assistant') {
-    const historyItemsToRemove = history.value.length - lastVisibleMessageIndexInHistory;
-    const showItemsToRemove = history.value.slice(lastVisibleMessageIndexInHistory)
-      .filter(m => m.role !== 'tool').length;
+    const assistantSignature = getComparableRenderableSignature(lastVisibleMessage);
+    fullHistory.value.splice(lastVisibleMessageIndexInFullHistory);
+    syncHistoryFromFullHistory();
 
-    const lastVisibleMessageIndexInFullHistory = fullHistory.value.findLastIndex((message) => message?.role === 'assistant');
-    if (lastVisibleMessageIndexInFullHistory >= 0) {
-      fullHistory.value.splice(lastVisibleMessageIndexInFullHistory);
-      syncHistoryFromFullHistory();
-    }
-    if (showItemsToRemove > 0) {
-      chat_show.value.splice(chat_show.value.length - showItemsToRemove);
-    }
-
+    // Remove only the matching trailing assistant bubble. Never infer a UI deletion count from
+    // the compacted request projection, which could otherwise remove the preceding user bubble.
+    const showIndex = findTailUiMessageIndexBySignature(assistantSignature);
+    if (showIndex >= 0) chat_show.value.splice(showIndex, 1);
   } else if (lastVisibleMessage.role === 'user') {
+    // A stale persisted cache can omit this bubble although the outgoing request has it.
+    ensureLatestTailUserBubble();
   } else {
     showDismissibleMessage.warning('无法从此消息类型重新提问。');
     return;
@@ -8375,7 +8641,7 @@ const scrollToMessageByIndex = (index) => {
         <el-main ref="chatContainerRef" class="chat-main custom-scrollbar" @click="handleMainClick"
           @wheel.passive="markUserScrollIntent" @touchstart.passive="markUserScrollIntent"
           @pointerdown="markUserScrollIntent" @scroll="handleScroll">
-          <ChatMessage v-for="(message, index) in chat_show" :key="message.id" :is-auto-approve="isAutoApproveTools"
+          <ChatMessage v-for="{ message, index } in renderedChatMessages" :key="message.id" :is-auto-approve="isAutoApproveTools"
             @update-auto-approve="handleToggleAutoApprove" @confirm-tool="handleToolApproval"
             @reject-tool="handleToolApproval" :ref="el => setMessageRef(el, message.id)" :message="message"
             :index="index" :is-last-message="index === chat_show.length - 1" :is-loading="loading"

@@ -94,23 +94,32 @@ function normalizeBatchTestError(error, fallbackStatus = 0) {
 }
 
 function extractBatchTestText(response = {}, apiType = 'chat_completions') {
-    if (apiType === 'responses' || apiType === 'codex') {
-        if (typeof response?.output_text === 'string' && response.output_text.trim()) {
-            return response.output_text.trim();
+    const responseCandidates = [response, response?.data]
+        .filter((candidate) => candidate && typeof candidate === 'object');
+
+    for (const candidate of responseCandidates) {
+        if (apiType === 'responses' || apiType === 'codex') {
+            if (typeof candidate.output_text === 'string' && candidate.output_text.trim()) {
+                return candidate.output_text.trim();
+            }
+
+            if (Array.isArray(candidate.output)) {
+                const text = candidate.output
+                    .flatMap((item) => Array.isArray(item?.content) ? item.content : [])
+                    .map((content) => content?.type === 'output_text' ? String(content.text || '') : '')
+                    .join('')
+                    .trim();
+                if (text) return text;
+            }
+
+            continue;
         }
 
-        if (Array.isArray(response?.output)) {
-            return response.output
-                .flatMap((item) => Array.isArray(item?.content) ? item.content : [])
-                .map((content) => content?.type === 'output_text' ? String(content.text || '') : '')
-                .join('')
-                .trim();
-        }
-
-        return '';
+        const text = String(candidate.choices?.[0]?.message?.content || '').trim();
+        if (text) return text;
     }
 
-    return String(response?.choices?.[0]?.message?.content || '').trim();
+    return '';
 }
 
 async function batchTestProviderKeys(params = {}) {
@@ -126,8 +135,8 @@ async function batchTestProviderKeys(params = {}) {
     if (rawKeys.length === 0) return { ok: true, total: 0, results: [] };
 
     const promptMessages = [
-        { role: 'system', content: 'You are a connectivity probe. Always reply with exactly: pong' },
-        { role: 'user', content: 'ping' }
+        { role: 'system', content: 'You are a helpful assistant. Keep your response concise.' },
+        { role: 'user', content: '请用一句简短的话介绍你的主要能力。' }
     ];
 
     const results = new Array(rawKeys.length);
