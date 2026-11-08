@@ -111,19 +111,28 @@ async function textToSpeech(text, voice = 'zh-CN-XiaoxiaoNeural', outputFormat =
   console.log('[TTS] 缓存未命中,开始生成语音:', { textLength: text.length, voice, rate, pitch, volume });
 
   try {
+    // 从 voice 名称中提取语言代码（例如 zh-CN-XiaoxiaoNeural -> zh-CN）
+    const lang = String(voice).split('-').slice(0, 2).join('-') || 'zh-CN';
+    const rateValue = rate === 1.0 ? 'default' : (rate > 1.0 ? `+${Math.round((rate - 1) * 100)}%` : `${Math.round((rate - 1) * 100)}%`);
+    const pitchValue = pitch === 1.0 ? 'default' : (pitch > 1.0 ? `+${Math.round((pitch - 1) * 100)}%` : `${Math.round((pitch - 1) * 100)}%`);
+    const volumeValue = volume === 1.0 ? 'default' : `${Math.round(volume * 100)}%`;
+
     // 创建 EdgeTTS 实例
     const communicate = new EdgeTTS({
-      voice: voice,
-      rate: `${rate}+0%`,
-      pitch: `${pitch}Hz`,
-      volume: `${volume * 100}%`,
+      voice,
+      lang,
+      outputFormat,
+      rate: rateValue,
+      pitch: pitchValue,
+      volume: volumeValue,
+      timeout: 60000
     });
 
-    // 生成音频
+    // 生成音频（streamAudio 返回 Buffer 分片与字幕对象，没有 stream 方法）
     const audioChunks = [];
-    for await (const chunk of communicate.stream()) {
-      if (chunk.type === 'audio') {
-        audioChunks.push(chunk.data);
+    for await (const chunk of communicate.streamAudio(text)) {
+      if (Buffer.isBuffer(chunk)) {
+        audioChunks.push(chunk);
       }
     }
 

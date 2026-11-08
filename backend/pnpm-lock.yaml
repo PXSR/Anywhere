@@ -36,7 +36,7 @@ importers:
         specifier: ^0.0.14
         version: 0.0.14(typescript@5.9.3)
       node-edge-tts:
-        specifier: ^1.2.10
+        specifier: ^1.2.12
         version: 1.2.12
       node-machine-id:
         specifier: ^1.1.12
