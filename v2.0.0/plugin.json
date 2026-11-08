@@ -57,7 +57,6 @@
     },
     {
       "code": "Conference Mode",
-      "explain": "多模型会议讨论",
       "cmds": [
         "Conference Mode",
         "会议讨论",
