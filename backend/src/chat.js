@@ -243,6 +243,25 @@ function shouldIncludeAssistantReasoningContent(reasoningEffort) {
     return typeof reasoningEffort === 'string' && !['', 'default', 'none'].includes(reasoningEffort);
 }
 
+
+function stripLocalTokenEstimateFromContent(content) {
+    if (!Array.isArray(content)) return content;
+    return content.map((item) => {
+        if (!item || typeof item !== 'object') return item;
+        const nextItem = { ...item };
+        delete nextItem.tokenEstimate;
+        if (nextItem.image_url && typeof nextItem.image_url === 'object') {
+            nextItem.image_url = { ...nextItem.image_url };
+            delete nextItem.image_url.tokenEstimate;
+        }
+        if (nextItem.file && typeof nextItem.file === 'object') {
+            nextItem.file = { ...nextItem.file };
+            delete nextItem.file.tokenEstimate;
+        }
+        return nextItem;
+    });
+}
+
 function normalizeMessagesForChatCompletions(messages = [], reasoningEffort) {
     if (!Array.isArray(messages)) return [];
 
@@ -251,7 +270,7 @@ function normalizeMessagesForChatCompletions(messages = [], reasoningEffort) {
     return messages.map((msg) => {
         if (!msg || typeof msg !== 'object') return msg;
 
-        const nextMsg = { ...msg };
+        const nextMsg = { ...msg, content: stripLocalTokenEstimateFromContent(msg.content) };
         if (nextMsg.role === 'assistant') {
             const hasReasoningContent = typeof nextMsg.reasoning_content === 'string';
             if (hasReasoningContent) {
@@ -309,9 +328,11 @@ function convertMessagesToResponsesInput(messages) {
                     else if (role !== 'assistant') {
                         if (item.type === 'image_url') {
                             const url = item.image_url?.url || item.image_url;
+                            const detail = item.image_url?.detail;
                             contentList.push({
                                 type: "input_image",
-                                image_url: url
+                                image_url: url,
+                                ...(typeof detail === 'string' ? { detail } : {})
                             });
                         } 
                         else if (item.type === 'file' || item.type === 'input_file') {

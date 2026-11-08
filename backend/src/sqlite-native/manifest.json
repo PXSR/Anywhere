@@ -1,0 +1,14 @@
+{
+  "format": 2,
+  "package": "better-sqlite3",
+  "profiles": {
+    "u7": {
+      "moduleAbi": 110,
+      "manifest": "u7/manifest.json"
+    },
+    "u8": {
+      "moduleAbi": 132,
+      "manifest": "u8/manifest.json"
+    }
+  }
+}

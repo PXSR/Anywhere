@@ -25,6 +25,7 @@ const props = defineProps({
   isLastMessage: Boolean,
   isLoading: Boolean,
   userAvatar: String,
+  userNickname: String,
   aiAvatar: String,
   isCollapsed: Boolean,
   isDarkMode: Boolean,
@@ -310,6 +311,12 @@ const onCopyImage = async () => {
 
 
 // 如果是最后一条消息 && 正在加载 && 没有正在进行的思考内容
+const preparingStatusText = computed(() => {
+  if (props.message?.status === 'retrying') return props.message?.retryMessage || '网络异常，正在自动重试…';
+  return '';
+});
+
+
 const showBubbleLoading = computed(() => {
   if (!props.isLastMessage || !props.isLoading) return false;
 
@@ -386,7 +393,8 @@ const preprocessKatex = (text) => {
 
   let processedText = preprocessKatexPlainText(protectedText);
   protectedMap.forEach((segment, placeholder) => {
-    processedText = processedText.replaceAll(placeholder, segment);
+    // Protected code may contain `$&`, `$'`, `$$`, etc.; restore it literally.
+    processedText = processedText.replaceAll(placeholder, () => segment);
   });
 
   return processedText;
@@ -415,7 +423,8 @@ const normalizeWindowsLocalMarkdownImagePaths = (markdown) => {
   });
 
   protectedMap.forEach((segment, placeholder) => {
-    protectedText = protectedText.replaceAll(placeholder, segment);
+    // Keep protected Markdown literally intact; never interpret replacement tokens.
+    protectedText = protectedText.replaceAll(placeholder, () => segment);
   });
   return protectedText;
 };
@@ -480,7 +489,7 @@ const formatMessageFile = (content) => {
 };
 
 const isEditable = computed(() => {
-  if (props.message.role === 'user') return true;
+  if (props.message.role === 'user') return props.message.origin !== 'view_image';
   const content = props.message.content;
   if (typeof content === 'string') return true;
   if (Array.isArray(content)) {
@@ -685,7 +694,7 @@ const onCopy = () => {
   if (props.isLoading && props.isLastMessage) return;
   emit('copy-text', formatMessageText(props.message.content), props.index);
 };
-const onReAsk = () => emit('re-ask');
+const onReAsk = () => emit('re-ask', props.message?.id);
 const onDelete = () => emit('delete-message', props.index);
 const onToggleCollapse = (event) => emit('toggle-collapse', props.index, event);
 const onAvatarClick = (role, event) => emit('avatar-click', role, event);
@@ -764,7 +773,12 @@ const truncateFilename = (filename, maxLength = 30) => {
     <!-- 用户消息 -->
     <div v-if="message.role === 'user'" class="message-wrapper user-wrapper" ref="messageWrapperRef">
       <div class="message-meta-header user-meta-header">
-        <span class="timestamp" v-if="message.timestamp">{{ formatTimestamp(message.timestamp) }}</span>
+        <div class="meta-info-column user-meta-info-column">
+          <div class="meta-name-row user-meta-name-row">
+            <span class="user-name">{{ userNickname || 'User' }}</span>
+          </div>
+          <span class="timestamp-row" v-if="message.timestamp">{{ formatTimestamp(message.timestamp) }}</span>
+        </div>
         <img :src="userAvatar" alt="User Avatar" @click="onAvatarClick('user', $event)"
           class="chat-avatar-top user-avatar">
       </div>
@@ -836,8 +850,9 @@ const truncateFilename = (filename, maxLength = 30) => {
             :content="(message.reasoning_content || '').trim()" :modelValue="false" :status="message.status">
           </Thinking>
         </template>
-        <template #content v-if="hasContentToShow">
-          <div v-if="!isEditing" ref="markdownRootRef" class="markdown-wrapper" :class="{ 'collapsed': isCollapsed }">
+        <template #content v-if="hasContentToShow || preparingStatusText">
+          <div v-if="preparingStatusText" class="preparing-status-text">{{ preparingStatusText }}</div>
+          <div v-else-if="!isEditing" ref="markdownRootRef" class="markdown-wrapper" :class="{ 'collapsed': isCollapsed }">
             <XMarkdown :markdown="renderedMarkdownContent" :is-dark="isDarkMode" :enable-latex="true"
               :mermaid-config="mermaidConfig" :default-theme-mode="isDarkMode ? 'dark' : 'light'"
               :themes="{ light: 'one-light', dark: 'vesper' }" :allow-html="true" />
@@ -1073,7 +1088,15 @@ html.dark .chat-message .user-bubble {
   }
 }
 
-.chat-message .ai-bubble {
+.chat-message .preparing-status-text {
+  color: var(--el-text-color-secondary, #667085);
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 4px 0;
+}
+
+
+.ai-bubble {
   :deep(.el-bubble-content-wrapper .el-bubble-content) {
     border-radius: var(--bubble-radius);
     background-color: transparent;

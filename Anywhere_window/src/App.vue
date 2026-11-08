@@ -13,6 +13,12 @@ import TaskPanel from './components/TaskPanel.vue';
 
 import TextSearchUI from './utils/TextSearchUI.js';
 import { formatTimestamp, formatToolResult, sanitizeToolArgs, sanitizeToolFunctionName } from './utils/formatters.js';
+import { resolveSafeConversationMutationTarget } from './utils/conversationMessageTarget.js';
+import { createConversationDeleteRecovery } from './utils/conversationDeleteRecovery.js';
+import { prepareViewImagePayload } from './utils/viewImageCompression.js';
+import { createLinkedUserMessagePair } from './utils/linkedUserMessage.js';
+import { completeConversationClose, createConversationMutationQueue, createConversationPersistenceTracker, mergeConversationMutationRequests as mergeAutoSaveRequests } from './utils/conversationMutationQueue.js';
+import { MAX_AUTOMATIC_NETWORK_RETRIES, createNetworkRetryingStream, runWithNetworkRetries } from './utils/conversationNetworkRetry.js';
 
 const conversationOwnerId = ref('');
 
@@ -441,14 +447,17 @@ const STICKY_SCROLL_GUARD_MS = 220;
 const USER_SCROLL_INTENT_MS = 260;
 
 const AUTO_SAVE_INPUT_DEBOUNCE_MS = 800;
+const AUTO_SAVE_REQUEST_CONFIG_DEBOUNCE_MS = 250;
 const AUTO_SAVE_LOADING_THROTTLE_MS = 2500;
 let autoSaveTimer = null;
 let scheduledAutoSaveRequest = null;
-let queuedAutoSaveRequest = null;
 let autoSaveExecutionPromise = null;
+let conversationMetadataMutationPromise = null;
+
 let sessionMutationVersion = 0;
-let lastPersistedSessionVersion = 0;
+const conversationPersistenceTracker = createConversationPersistenceTracker();
 let lastAutoSaveAt = 0;
+let lastAutoSaveError = null;
 
 
 
@@ -612,6 +621,7 @@ if (isDarkInit) {
 
 const defaultConfig = window.api.defaultConfig;
 const UserAvart = ref("user.png");
+const userNickname = ref('User');
 const AIAvart = ref("ai.svg");
 const favicon = ref("favicon.png");
 const CODE = ref("");
@@ -682,6 +692,7 @@ const modelDialogProviderCollapseStates = ref({});
 const isAlwaysOnTop = ref(true);
 const currentOS = ref('win');
 const currentTaskConfig = ref(null);
+const isClosingWindow = ref(false);
 
 const currentProviderID = ref(defaultConfig.config.providerOrder[0]);
 const base_url = ref("");
@@ -711,6 +722,16 @@ const compactConfig = ref({
   resolvedId: ''
 });
 const compactArchives = ref([]);
+const promptTokenBreakdown = ref({
+  loading: false,
+  error: '',
+  systemTokens: 0,
+  conversationTokens: 0,
+  toolTokens: 0,
+  effectiveTokens: 0,
+  updatedAt: 0
+});
+
 const autoCompactSuppressedForTurn = ref(false);
 let compactAbortController = null;
 const prompt = ref("");
@@ -735,8 +756,198 @@ const resolveWindowZoomLevel = (...candidates) => {
 
 const collapsedMessages = ref(new Set());
 const defaultConversationName = ref("");
+
+const sessionCreatedAt = ref(new Date().toISOString());
+const currentConversationStorage = ref(null);
+const conversationReadOnly = ref(false);
+const conversationLeasePending = ref(false);
+const conversationLease = ref(null);
+const conversationInstanceId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+  ? crypto.randomUUID()
+  : `plugin_window_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+let conversationLeaseHeartbeatTimer = null;
+
+const appendLinkedUserMessage = ({ historyContent, uiContent = historyContent, timestamp = '', historyExtras = {}, uiExtras = {} } = {}) => {
+  const pair = createLinkedUserMessagePair({
+    storageId: createConversationStorageId(),
+    uiId: messageIdCounter.value++,
+    historyContent,
+    uiContent,
+    timestamp,
+    historyExtras,
+    uiExtras
+  });
+  appendFullHistory(pair.historyMessage);
+  chat_show.value.push(pair.uiMessage);
+  return pair;
+};
+
+
+const createConversationStorageId = () => (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+  ? crypto.randomUUID()
+  : `msg_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+
+
+const stopConversationLeaseHeartbeat = () => {
+  if (conversationLeaseHeartbeatTimer) {
+    clearInterval(conversationLeaseHeartbeatTimer);
+    conversationLeaseHeartbeatTimer = null;
+  }
+};
+
+const releaseCurrentConversationLease = async () => {
+  stopConversationLeaseHeartbeat();
+  const storage = currentConversationStorage.value;
+  const lease = conversationLease.value;
+  conversationLease.value = null;
+  const dirPath = currentConversationStorage.value?.dirPath || currentConfig.value?.webdav?.localChatPath || '';
+  if (!storage?.conversationId || !lease?.leaseEpoch || !dirPath) {
+    window.api.clearRegisteredConversationWriteLease?.();
+    return;
+  }
+  const released = await window.api.releaseConversationWriteLease({
+    dirPath,
+    conversationId: storage.conversationId,
+    holderInstanceId: conversationInstanceId,
+    leaseEpoch: lease.leaseEpoch
+  }).then(() => true).catch(() => false);
+  if (released) window.api.clearRegisteredConversationWriteLease?.();
+};
+
+const ensureConversationWriteAccess = (message = '') => {
+  const storage = currentConversationStorage.value;
+  if (!storage?.conversationId) return true;
+  const confirmedExpiry = Date.parse(conversationLease.value?.expiresAt);
+  if (Number.isFinite(confirmedExpiry) && confirmedExpiry <= Date.now()) conversationLeasePending.value = true;
+  if (conversationLeasePending.value) {
+    if (message) showDismissibleMessage.warning('正在确认会话编辑权，请稍后再试');
+    return false;
+  }
+  if (conversationReadOnly.value || !conversationLease.value?.leaseEpoch) {
+    if (message) showDismissibleMessage.warning('当前会话正在其他客户端编辑，本窗口为只读模式');
+    return false;
+  }
+  return true;
+};
+
+const acquireCurrentConversationLease = async () => {
+  stopConversationLeaseHeartbeat();
+  const storage = currentConversationStorage.value;
+  const dirPath = storage?.dirPath || currentConfig.value?.webdav?.localChatPath || '';
+  if (!storage?.conversationId || !dirPath) {
+    conversationLeasePending.value = false;
+    return;
+  }
+  conversationLeasePending.value = true;
+  conversationLease.value = null;
+  try {
+    const lease = await window.api.acquireConversationWriteLease({
+      dirPath,
+      conversationId: storage.conversationId,
+      holderInstanceId: conversationInstanceId,
+      holderApp: 'utools'
+    });
+    conversationReadOnly.value = lease?.readonly === true || lease?.ok === false;
+    if (conversationReadOnly.value) {
+      showDismissibleMessage.warning(`该会话正在由${lease?.holderApp || '另一个客户端'}编辑，当前以只读模式打开`);
+      return;
+    }
+    conversationLease.value = lease;
+    const authoritativeRevision = Number(lease.revision);
+    currentConversationStorage.value = {
+      ...storage,
+      revision: Number.isFinite(authoritativeRevision) ? authoritativeRevision : storage.revision
+    };
+    const repaired = await window.api.repairConversationUiLinks({
+      dirPath,
+      conversationId: storage.conversationId,
+      expectedRevision: currentConversationStorage.value.revision,
+      holderInstanceId: conversationInstanceId,
+      leaseEpoch: lease.leaseEpoch
+    });
+    window.api.registerConversationWriteLease?.({
+      dirPath,
+      conversationId: storage.conversationId,
+      holderInstanceId: conversationInstanceId,
+      leaseEpoch: lease.leaseEpoch
+    });
+    const repairedRevision = Number(repaired?.revision);
+    currentConversationStorage.value = {
+      ...currentConversationStorage.value,
+      revision: Number.isFinite(repairedRevision) ? repairedRevision : currentConversationStorage.value.revision
+    };
+    if (Number(repaired?.changed) > 0) {
+      await reloadConversationWindowFromStore({ activeOnly: true, pageSize: Number(storage.pageSize) || 200 });
+      showDismissibleMessage.info('已安全修复历史会话的消息索引映射');
+    }
+    let heartbeatInFlight = false;
+    conversationLeaseHeartbeatTimer = setInterval(async () => {
+      const currentLease = conversationLease.value;
+      const currentStorage = currentConversationStorage.value;
+      if (!currentLease?.leaseEpoch || !currentStorage?.conversationId) return;
+      if (!(Date.parse(currentLease.expiresAt) > Date.now())) conversationLeasePending.value = true;
+      if (heartbeatInFlight) return;
+      const dirPath = currentStorage.dirPath || currentConfig.value?.webdav?.localChatPath || '';
+      const isCurrent = () => conversationLease.value === currentLease
+        && currentConversationStorage.value?.conversationId === currentStorage.conversationId
+        && (currentConversationStorage.value?.dirPath || currentConfig.value?.webdav?.localChatPath || '') === dirPath;
+      heartbeatInFlight = true;
+      try {
+        const result = await window.api.heartbeatConversationWriteLease({
+          dirPath,
+          conversationId: currentStorage.conversationId,
+          holderInstanceId: conversationInstanceId,
+          leaseEpoch: currentLease.leaseEpoch
+        });
+        if (!isCurrent()) return;
+        if (result?.ok === false) {
+          conversationReadOnly.value = true;
+          conversationLeasePending.value = false;
+          conversationLease.value = null;
+          stopConversationLeaseHeartbeat();
+          showDismissibleMessage.warning('会话编辑权已失效，已切换为只读模式');
+        } else if (result?.ok === true && Number.isFinite(Date.parse(result.expiresAt))) {
+          currentLease.expiresAt = result.expiresAt;
+          conversationLeasePending.value = false;
+        } else {
+          throw new Error('conversation_heartbeat_response_invalid');
+        }
+      } catch {
+        if (!isCurrent()) return;
+        // Transport/SQLite errors are not evidence that another writer owns the lease.
+        // Keep retrying this exact holder/epoch, but never write past its confirmed expiry.
+        if (!(Date.parse(currentLease.expiresAt) > Date.now())) {
+          if (!conversationLeasePending.value) showDismissibleMessage.warning('暂时无法确认会话编辑权，已暂停写入，正在重试；未保存内容仍保留在窗口中');
+          conversationLeasePending.value = true;
+        }
+      } finally {
+        heartbeatInFlight = false;
+      }
+    }, 5000);
+  } catch (error) {
+    const failedLease = conversationLease.value;
+    if (failedLease?.leaseEpoch) {
+      await window.api.releaseConversationWriteLease({
+        dirPath,
+        conversationId: storage.conversationId,
+        holderInstanceId: conversationInstanceId,
+        leaseEpoch: failedLease.leaseEpoch
+      }).catch(() => {});
+    }
+    window.api.clearRegisteredConversationWriteLease?.();
+    conversationReadOnly.value = true;
+    conversationLease.value = null;
+    showDismissibleMessage.warning(`确认或修复会话编辑状态失败，当前以只读模式打开: ${error?.message || error}`);
+  } finally {
+    conversationLeasePending.value = false;
+  }
+};
 const selectedVoice = ref(null);
+const REASONING_EFFORT_VALUES = new Set(['default', 'none', 'low', 'medium', 'high', 'xhigh', 'max']);
+const normalizeReasoningEffort = (value) => REASONING_EFFORT_VALUES.has(value) ? value : 'default';
 const tempReasoningEffort = ref('default');
+
+let isRestoringSessionSnapshot = false;
 const messageIdCounter = ref(0);
 const sourcePromptConfig = ref(null);
 const cachedBackgroundBlobUrl = ref("");
@@ -807,11 +1018,30 @@ const normalizeSessionTimestamp = (value) => {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 };
 
+
+const resolveSessionCreatedAt = (sessionData) => {
+  const metadataCreatedAt = normalizeSessionTimestamp(sessionData?.sessionMetadata?.createdAt);
+  if (metadataCreatedAt) return metadataCreatedAt;
+
+  const timestamps = [];
+  [sessionData?.fullHistory, sessionData?.history, sessionData?.chat_show].forEach((messages) => {
+    if (!Array.isArray(messages)) return;
+    messages.forEach((message) => {
+      [message?.createdAt, message?.timestamp, message?.updatedAt, message?.completedTimestamp].forEach((candidate) => {
+        const normalized = normalizeSessionTimestamp(candidate);
+        if (normalized) timestamps.push(normalized);
+      });
+    });
+  });
+  timestamps.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+  return timestamps[0] || '';
+};
+
 const getConversationDisplayName = () => {
   const title = defaultConversationName.value || '';
   if (title.trim()) return title.trim();
 
-  const firstUserMsg = chat_show.value.find(msg => msg.role === 'user');
+  const firstUserMsg = chat_show.value.find(isUserAuthoredMessage);
   if (!firstUserMsg) return CODE.value || 'AI';
 
   const content = firstUserMsg.content;
@@ -827,8 +1057,13 @@ const getConversationDisplayName = () => {
 };
 
 const getSessionMetadata = () => {
+  const updatedAt = new Date().toISOString();
+  const createdAt = normalizeSessionTimestamp(sessionCreatedAt.value) || updatedAt;
+  sessionCreatedAt.value = createdAt;
   return {
     title: getConversationDisplayName(),
+    createdAt,
+    updatedAt
   };
 };
 
@@ -843,6 +1078,12 @@ const currentImageViewerIndex = ref(0);
 
 const toolCallControllers = ref(new Map());
 let activeAssistantTurnMeta = null;
+// Must be initialized before reask/buffer guards and MCP completion watchers reference it.
+const isMcpLoading = ref(false);
+
+const isModelIterationConfigLocked = ref(false);
+let isFlushingAppendBuffer = false;
+let isReasking = false;
 const tempSessionMcpServerIds = ref([]);
 
 const isAutoApproveTools = ref(true);
@@ -898,6 +1139,19 @@ const createAbortError = () => {
   error.name = 'AbortError';
   return error;
 };
+
+
+const hasMeaningfulAssistantStreamOutput = (part) => {
+  const delta = part?.choices?.[0]?.delta;
+  if (delta && (delta.content || delta.reasoning_content || delta.reasoning || delta.tool_calls?.length || delta.extra_content || delta.thought_signature)) return true;
+  return Boolean(
+    (part?.type === 'response.output_text.delta' && part.delta)
+    || (part?.type === 'response.reasoning_summary_text.delta' && part.delta)
+    || (part?.type === 'response.output_item.added' && part.item?.type === 'function_call')
+    || (part?.type === 'response.function_call_arguments.delta' && part.delta)
+  );
+};
+
 
 const normalizeAssistantMessageContent = (content) => {
   if (Array.isArray(content)) return content.filter(part => part && typeof part === 'object');
@@ -1000,6 +1254,7 @@ const finalizeCancelledAssistantTurn = (turnMeta = activeAssistantTurnMeta) => {
   if (assistantBubbleIndex === -1) {
     chat_show.value.push({
       id: messageIdCounter.value++,
+      storageId: createConversationStorageId(),
       role: 'assistant',
       content: [],
       reasoning_content: "",
@@ -1016,6 +1271,7 @@ const finalizeCancelledAssistantTurn = (turnMeta = activeAssistantTurnMeta) => {
   }
 
   const currentBubble = chat_show.value[assistantBubbleIndex];
+  currentBubble.storageId = currentBubble.storageId || createConversationStorageId();
   const finalContent = appendTerminalNoticeToAssistantContent(currentBubble.content, ASSISTANT_CANCELLED_NOTICE_MARKDOWN);
   const finalReasoningContent = typeof currentBubble.reasoning_content === 'string'
     ? currentBubble.reasoning_content
@@ -1035,6 +1291,7 @@ const finalizeCancelledAssistantTurn = (turnMeta = activeAssistantTurnMeta) => {
     }
     appendFullHistory({
       role: 'assistant',
+      storageId: currentBubble.storageId || createConversationStorageId(),
       content: finalContent,
       reasoning_content: finalReasoningContent || null
     });
@@ -1049,6 +1306,28 @@ const pendingChoices = ref(new Map());
 const taskList = ref([]);
 const taskPanelVisible = ref(false);
 const pendingAppendBuffer = ref([]);
+
+
+const normalizePendingInputBuffer = (items) => (Array.isArray(items) ? items : [])
+  .filter((item) => item?.kind === 'input' || item?.kind === 'agent')
+  .map((item) => {
+    if (item.kind === 'agent') {
+      const text = typeof item.text === 'string' ? item.text : '';
+      const filePaths = Array.isArray(item.filePaths) ? item.filePaths.filter((path) => typeof path === 'string' && path.trim()) : [];
+      if (!text.trim() && !filePaths.length) return null;
+      return { kind: 'agent', text, filePaths, source: 'continue_agent_chats', preview: text || `[${filePaths.length} files]` };
+    }
+    const text = typeof item.text === 'string' ? item.text : '';
+    const files = Array.isArray(item.files) ? item.files.filter((file) => file && typeof file === 'object') : [];
+    if (!text.trim() && files.length === 0) return null;
+    return {
+      kind: 'input',
+      text,
+      files: files.slice(),
+      preview: typeof item.preview === 'string' && item.preview ? item.preview : (text || `[${files.length} 个文件]`)
+    };
+  })
+  .filter(Boolean);
 const BETTERWORK_FRONTEND_TOOLS = new Set(['ask_user_choice', 'task_write', 'task_read']);
 
 const resolvePendingChoices = (payload = null) => {
@@ -1172,7 +1451,6 @@ const isMcpDialogVisible = ref(false);
 const sessionMcpServerIds = ref([]);
 const openaiFormattedTools = ref([]);
 const mcpSearchQuery = ref('');
-const isMcpLoading = ref(false);
 const mcpFilter = ref('all');
 const isRefreshingMcp = ref(false);
 const mcpToolCache = ref({});
@@ -1360,6 +1638,10 @@ const filteredMcpServers = computed(() => {
     servers = servers.filter(server => tempSessionMcpServerIds.value.includes(server.id));
   } else if (mcpFilter.value === 'unselected') {
     servers = servers.filter(server => !tempSessionMcpServerIds.value.includes(server.id));
+  } else if (mcpFilter.value === 'preset') {
+    const presetMcpServerIds = currentConfig.value?.prompts?.[CODE.value]?.defaultMcpServers;
+    const presetMcpServerIdSet = new Set(Array.isArray(presetMcpServerIds) ? presetMcpServerIds : []);
+    servers = servers.filter(server => presetMcpServerIdSet.has(server.id));
   }
   if (mcpSearchQuery.value) {
     const query = mcpSearchQuery.value.toLowerCase();
@@ -1632,12 +1914,63 @@ const markUserScrollIntent = () => {
 };
 
 
+let isLoadingOlderConversationPage = false;
+const loadOlderConversationPage = async (scrollElement) => {
+  const storage = currentConversationStorage.value;
+  if (!storage?.isPaged || storage.hasMore === false || isLoadingOlderConversationPage) return;
+  if (!storage.loadedFromOrdinal && !storage.loadedFromUiOrder) return;
+  isLoadingOlderConversationPage = true;
+  const previousHeight = scrollElement?.scrollHeight || 0;
+  try {
+    const page = await window.api.loadConversationPage({
+      dirPath: storage.dirPath,
+      conversationId: storage.conversationId,
+      beforeOrdinal: storage.loadedFromOrdinal || null,
+      beforeUiOrder: storage.loadedFromUiOrder || null,
+      pageSize: storage.pageSize || 200
+    });
+    const knownMessageIds = new Set(fullHistory.value.map((message) => message?.storageId).filter(Boolean));
+    const olderMessages = (page.messages || []).filter((message) => message?.role !== 'system' && !knownMessageIds.has(message?.storageId));
+    const knownUiIds = new Set(chat_show.value.map((message) => message?.uiStorageId).filter(Boolean));
+    const olderUi = (page.uiMessages || []).filter((message) => message?.role !== 'system' && !knownUiIds.has(message?.uiStorageId));
+    if (olderMessages.length) {
+      fullHistory.value = [
+        ...fullHistory.value.filter((message) => message?.role === 'system'),
+        ...olderMessages,
+        ...fullHistory.value.filter((message) => message?.role !== 'system')
+      ];
+    }
+    if (olderUi.length) {
+      chat_show.value = [
+        ...chat_show.value.filter((message) => message?.role === 'system'),
+        ...olderUi,
+        ...chat_show.value.filter((message) => message?.role !== 'system')
+      ];
+    }
+    syncHistoryFromFullHistory();
+    currentConversationStorage.value = {
+      ...storage,
+      loadedFromOrdinal: Number(page.loadedFromOrdinal) || storage.loadedFromOrdinal,
+      loadedFromUiOrder: Number(page.loadedFromUiOrder) || storage.loadedFromUiOrder,
+      hasMore: page.hasMore !== false
+    };
+    await nextTick();
+    if (scrollElement) scrollElement.scrollTop += Math.max(0, scrollElement.scrollHeight - previousHeight);
+  } catch (error) {
+    console.warn('[conversation] load older page failed:', error);
+  } finally {
+    isLoadingOlderConversationPage = false;
+  }
+};
+
+
 // 滚动监听：仅负责更新 isSticky 状态和 UI 按钮显示
 const handleScroll = (event) => {
   if (isForcingScroll.value) return;
 
   const el = event.target;
   if (!el) return;
+  if (el.scrollTop <= 80) void loadOlderConversationPage(el);
 
   // 计算距离底部的距离
   const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -1984,7 +2317,7 @@ const syncStickyScrollAfterRender = () => {
 const handleSaveSession = () => handleSaveAction();
 const handleDeleteMessage = (index) => deleteMessage(index);
 const handleCopyText = (content, index) => copyText(content, index);
-const handleReAsk = () => reaskAI();
+const handleReAsk = (assistantMessageId) => reaskAI(assistantMessageId);
 const handleShowSystemPrompt = () => {
   systemPromptContent.value = currentSystemPrompt.value;
   systemPromptDialogVisible.value = true;
@@ -2017,14 +2350,10 @@ const onAvatarClick = async (role, event) => {
 };
 
 const handleSubmit = () => {
-  // 自动/手动压缩中：禁止发送与缓冲，避免用户误以为卡死
-  if (compacting.value) {
-    showDismissibleMessage.warning('压缩进行中，暂不可发送');
-    return;
-  }
-  // 生成中（或正在准备发送）时，把消息暂存进缓冲区，本轮结束后自动发送
-  if (loading.value || isPreparingSend.value) {
-    enqueueInputToBuffer();
+  if (!ensureConversationWriteAccess(true)) return;
+
+  if (compacting.value || loading.value || isPreparingSend.value) {
+    enqueueInputToBuffer(compacting.value ? '正在压缩，消息已加入缓冲区，将在压缩结束后自动发送' : '正在生成，消息已加入缓冲区，将在本轮结束后自动发送');
     return;
   }
   askAI(false);
@@ -2046,6 +2375,7 @@ const handleUpload = async ({ fileList: newFiles }) => {
 const handleOpenMcpDialog = () => toggleMcpDialog();
 
 const handleSendAudio = async (audioFile) => {
+  if (!ensureConversationWriteAccess(true)) return;
   fileList.value = [];
   await file2fileList(audioFile, 0);
   await askAI(false);
@@ -2209,6 +2539,8 @@ const handleDownloadImageFromViewer = async (url) => {
 };
 
 const handleEditMessage = (index, newContent) => {
+  if (!ensureConversationWriteAccess(true)) return false;
+
   if (compacting.value) {
     showDismissibleMessage.warning('压缩进行中，暂不可编辑历史');
     return false;
@@ -2316,7 +2648,7 @@ const saveSystemPrompt = async () => {
     if (promptExists) {
       await window.api.saveSetting(`prompts.${CODE.value}.prompt`, newPromptContent);
       currentConfig.value.prompts[CODE.value].prompt = newPromptContent;
-      showDismissibleMessage.success('快捷助手提示词已更新');
+      showDismissibleMessage.success('智能体提示词已更新');
     } else {
       const latestConfigData = await window.api.getConfig();
       const baseConfig = sourcePromptConfig.value || defaultConfig.config.prompts.AI;
@@ -2348,7 +2680,7 @@ const saveSystemPrompt = async () => {
       await window.api.updateConfig(latestConfigData);
       currentConfig.value = latestConfigData.config;
       sourcePromptConfig.value = newPrompt;
-      showDismissibleMessage.success(`已为您创建并保存新的快捷助手: "${CODE.value}"`);
+      showDismissibleMessage.success(`已为您创建并保存新的智能体: "${CODE.value}"`);
     }
   } catch (error) {
     console.error("保存系统提示词失败:", error);
@@ -2361,54 +2693,140 @@ const saveSystemPrompt = async () => {
 const handleAutoCloseOnBlur = () => closePage(false);
 const syncAutoCloseOnBlurListener = () => {
   window.removeEventListener('blur', handleAutoCloseOnBlur);
-  if (autoCloseOnBlur.value && !loading.value) {
+  if (autoCloseOnBlur.value && !loading.value && !compacting.value) {
     window.addEventListener('blur', handleAutoCloseOnBlur);
   }
 };
 
-const closePage = async (force_save = false) => {
-  const shouldForceSave = force_save === true;
-
-  // 1. 如果是为了打开文件选择器而失去焦点，拦截关闭
-  if (isFilePickerOpen.value) return;
-
-  // Do not let a delayed save create a second full serialization while this window is closing.
-  clearScheduledAutoSave();
-  queuedAutoSaveRequest = null;
-
-  // 关闭对话前先结束本对话所有运行中 Subagent，避免后台孤儿任务继续占资源
-  try {
-    await killAllRunningSubAgentsForCurrentConversation();
-  } catch (e) {
-    console.warn('[Sub-Agent] Kill-on-close failed:', e);
-  }
-
-  // 条件：配置了本地存储路径 且 当前对话已有名称
-  if (currentConfig.value?.webdav?.localChatPath && (defaultConversationName.value || shouldForceSave)) {
-    try {
-      const closeVersion = sessionMutationVersion;
-      await executeAutoSaveRequest({
-        reason: 'window-close',
-        force: shouldForceSave,
-        version: closeVersion,
-        skipQueueWhenBusy: true,
-        skipProjectAssignment: true
-      });
-      if (lastPersistedSessionVersion < closeVersion) {
-        await executeAutoSaveRequest({
-          reason: 'window-close-final',
-          force: shouldForceSave,
-          version: closeVersion,
-          skipProjectAssignment: true
-        });
-      }
-    } catch (e) {
-      console.error("关闭时自动保存失败:", e);
+const waitForPendingWindowMutationsBeforeClose = async (timeoutMs = 15_000) => {
+  const startedAt = Date.now();
+  while (isPreparingSend.value || isMcpLoading.value || isApplyMcpRunning.value || pendingApplyMcpRequest.value) {
+    if (Date.now() - startedAt >= timeoutMs) throw new Error('conversation_runtime_mutations_close_timeout');
+    if (pendingApplyMcpRequest.value && !isApplyMcpRunning.value && !isModelIterationConfigLocked.value) {
+      await requestApplyMcpTools(false, 'window-close-settle');
+      continue;
     }
+    if (activeApplyMcpPromise) {
+      await activeApplyMcpPromise;
+      continue;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
+
+
+const waitForAssistantTurnToSettleBeforeClose = async (settlementPromise, timeoutMs = 15_000) => {
+  if (!settlementPromise || typeof settlementPromise.then !== 'function') return;
+  let timeoutId;
+  try {
+    await Promise.race([
+      settlementPromise,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('conversation_assistant_close_timeout')), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+};
+
+
+const waitForCompactionToSettleBeforeClose = async (timeoutMs = 10_000) => {
+  const startedAt = Date.now();
+  while (compacting.value) {
+    if (Date.now() - startedAt >= timeoutMs) throw new Error('conversation_compaction_close_timeout');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
+
+
+const persistLatestSessionBeforeClose = async (shouldForceSave) => {
+  const pendingScheduledRequest = scheduledAutoSaveRequest;
+  clearScheduledAutoSave();
+  let request = mergeAutoSaveRequests(pendingScheduledRequest, {
+    reason: 'window-close-final',
+    force: shouldForceSave,
+    version: ++sessionMutationVersion,
+    skipProjectAssignment: true,
+    stateOnly: false
+  });
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const targetVersion = Number(request.version) || sessionMutationVersion;
+    const saved = await executeAutoSaveRequest(request);
+    await autoSaveMutationQueue.whenIdle();
+    const persistenceState = conversationPersistenceTracker.getState();
+    if (persistenceState.persistedFullSnapshotVersion < targetVersion && saved !== true) {
+      throw lastAutoSaveError || new Error('conversation_close_save_incomplete');
+    }
+    if (
+      sessionMutationVersion <= targetVersion
+      && persistenceState.persistedMutationVersion >= targetVersion
+      && persistenceState.persistedFullSnapshotVersion >= targetVersion
+    ) return true;
+    request = {
+      reason: 'window-close-final-latest',
+      force: shouldForceSave,
+      version: ++sessionMutationVersion,
+      skipProjectAssignment: true,
+      stateOnly: false
+    };
   }
 
-  // 3. 关闭窗口
-  window.api.windowControl('close-window');
+  throw new Error('conversation_close_mutations_unstable');
+};
+
+
+const closePage = async (force_save = false) => {
+  if (isClosingWindow.value || isFilePickerOpen.value) return false;
+
+  const shouldForceSave = force_save === true;
+  isClosingWindow.value = true;
+
+  try {
+    const assistantSettlementPromise = activeAssistantTurnMeta?.settlementPromise || null;
+    if (loading.value) {
+      cancelAskAI();
+      await waitForAssistantTurnToSettleBeforeClose(assistantSettlementPromise);
+    }
+    await waitForPendingWindowMutationsBeforeClose();
+    if (compacting.value) {
+      handleCancelCompact();
+      await waitForCompactionToSettleBeforeClose();
+    }
+
+    try {
+      await killAllRunningSubAgentsForCurrentConversation();
+    } catch (error) {
+      console.warn('[Sub-Agent] Kill-on-close failed:', error);
+    }
+
+    const dirPath = currentConversationStorage.value?.dirPath || currentConfig.value?.webdav?.localChatPath || '';
+    const persistenceState = conversationPersistenceTracker.getState();
+    const hasUnpersistedSession = persistenceState.hasUnpersistedMutations || persistenceState.hasUnpersistedFullSnapshot;
+    const canWriteCurrentConversation = !currentConversationStorage.value?.conversationId || ensureConversationWriteAccess(false);
+    if (hasUnpersistedSession && !canWriteCurrentConversation) {
+      throw lastAutoSaveError || new Error('conversation_unpersisted_changes_without_write_access');
+    }
+    const shouldPersistOnClose = Boolean(
+      dirPath &&
+      (defaultConversationName.value || shouldForceSave) &&
+      canWriteCurrentConversation &&
+      (hasUnpersistedSession || shouldForceSave)
+    );
+    return await completeConversationClose({
+      persist: async () => shouldPersistOnClose
+        ? await persistLatestSessionBeforeClose(shouldForceSave)
+        : true,
+      release: releaseCurrentConversationLease,
+      close: () => window.api.windowControl('close-window')
+    });
+  } catch (error) {
+    isClosingWindow.value = false;
+    console.error('关闭窗口失败:', error);
+    showDismissibleMessage.error(`会话保存失败，窗口已保持打开: ${getErrorMessage(error)}`);
+    return false;
+  }
 };
 
 const handlePickFileStart = () => {
@@ -2458,7 +2876,7 @@ onMounted(async () => {
   // 暴露给后台MCP调用的 Agent API
 
   window.__AGENT_API__ = {
-    isBusy: () => loading.value,
+    isBusy: () => isAgentMessageBusy(),
 
     getChatLength: () => chat_show.value.length,
 
@@ -2580,25 +2998,7 @@ onMounted(async () => {
       }
       return "Unknown message format.";
     },
-    sendMessage: async (text, filePaths) => {
-      if (loading.value) {
-        return Promise.reject("Error: This agent is currently busy generating a response. Please wait until it becomes Idle.");
-      }
-      if (text) prompt.value = text;
-
-      let fileMsg = "";
-      if (filePaths && Array.isArray(filePaths) && filePaths.length > 0) {
-        let success = 0;
-        for (const p of filePaths) {
-          try { await processFilePath(p); success++; } catch (e) { }
-        }
-        await nextTick();
-        fileMsg = ` (${success} files attached)`;
-      }
-
-      askAI(false).catch(err => console.error("Background generation error:", err));
-      return `Message sent successfully${fileMsg}. Agent is now generating response...`;
-    },
+    sendMessage: async (text, filePaths) => sendAgentToolMessage({ text, filePaths, source: 'continue_agent_chats' }),
     closeWindow: async () => {
       await closePage(true);
       return "Window closing initiated.";
@@ -2610,6 +3010,35 @@ onMounted(async () => {
   window.addEventListener('blur', handleWindowBlur);
 
   const initializeWindow = async (data = null) => {
+    if (data && typeof data.payload === 'string') {
+      try {
+        const redirectPayload = JSON.parse(data.payload);
+        if (redirectPayload && typeof redirectPayload === 'object') {
+          if (redirectPayload.conversationId) {
+            data = {
+              ...data,
+              type: 'conversation',
+              payload: '',
+              conversationId: redirectPayload.conversationId,
+              conversationTitle: redirectPayload.conversationTitle || '',
+              worktreeDir: redirectPayload.worktreeDir || '',
+              storageMode: redirectPayload.storageMode || 'local',
+              format: redirectPayload.format || 'sqlite'
+            };
+          } else if (typeof redirectPayload.sessionData === 'string') {
+            data = {
+              ...data,
+              type: 'over',
+              payload: redirectPayload.sessionData,
+              filename: redirectPayload.filename || data.filename
+            };
+          }
+        }
+      } catch {
+        // Ordinary prompt payloads are not JSON and keep their original behavior.
+      }
+    }
+
     try {
       const configData = await window.api.getConfig();
       currentConfig.value = configData.config;
@@ -2661,7 +3090,7 @@ onMounted(async () => {
     if (data?.type === "task" || data?.type === "summon") {
       autoCloseOnBlur.value = false;
     }
-    tempReasoningEffort.value = currentPromptConfig.reasoning_effort || 'default';
+    tempReasoningEffort.value = normalizeReasoningEffort(currentPromptConfig.reasoning_effort);
     model.value = currentPromptConfig.model || modelList.value[0]?.value || '';
     selectedVoice.value = currentPromptConfig.voice || null;
 
@@ -2700,7 +3129,49 @@ onMounted(async () => {
 
     if (data) {
       basic_msg.value = { code: data.code, type: data.type, payload: data.payload };
-      if (data.filename) defaultConversationName.value = data.filename.replace(/\.json$/i, '');
+      const embeddedConversation = data.conversation?.descriptor && data.conversation?.sessionData
+        ? data.conversation
+        : null;
+      if (embeddedConversation || data.conversationId) {
+        const conversationDirPath = embeddedConversation?.worktreeDir || embeddedConversation?.dirPath || data.worktreeDir || currentConfig.value?.webdav?.localChatPath || '';
+        conversationLeasePending.value = true;
+        conversationReadOnly.value = false;
+        conversationLease.value = null;
+        const opened = embeddedConversation
+          ? { descriptor: embeddedConversation.descriptor, sessionData: embeddedConversation.sessionData }
+          : await window.api.openConversation({
+              dirPath: conversationDirPath,
+              reference: data.conversationId,
+              activeOnly: true
+            });
+        const descriptor = opened?.descriptor;
+        if (!descriptor || !opened?.sessionData) throw new Error('conversation_open_failed');
+        currentConversationStorage.value = {
+          format: 'sqlite',
+          conversationId: descriptor.conversationId,
+          dbFile: descriptor.dbFile,
+          title: descriptor.title,
+          revision: Number(descriptor.revision) || 0,
+          dirPath: conversationDirPath,
+          storageMode: embeddedConversation?.storageMode || data.storageMode || descriptor.storageMode || 'local',
+          isPaged: opened.sessionData?.conversationStorage?.isPaged === true,
+          loadedFromOrdinal: Number(opened.sessionData?.conversationStorage?.loadedFromOrdinal) || 0,
+          loadedFromUiOrder: Number(opened.sessionData?.conversationStorage?.loadedFromUiOrder) || 0,
+          pageSize: Number(opened.sessionData?.conversationStorage?.pageSize) || 0,
+          hasMore: opened.sessionData?.conversationStorage?.isPaged === true
+        };
+        defaultConversationName.value = descriptor.title || data.conversationTitle || '';
+        isSessionRestored = true;
+        await loadSession(opened.sessionData);
+        // 历史会话必须保持打开；不能继承智能体的失焦即关闭配置。
+        autoCloseOnBlur.value = false;
+        syncAutoCloseOnBlurListener();
+        await acquireCurrentConversationLease();
+      } else if (data.conversationTitle) {
+        defaultConversationName.value = data.conversationTitle;
+      } else if (data.filename) {
+        defaultConversationName.value = data.filename.replace(/\.json$/i, '');
+      }
       if (data.type === "task") {
         currentTaskConfig.value = data.taskConfig;
 
@@ -2718,11 +3189,10 @@ onMounted(async () => {
         const system_time = new Date().toLocaleString('sv-SE');
         const pre_prompt = `## Scheduled Task\n\n**system_time**:${system_time}\n\n`;
         const suffix_prompt = "\n\nScheduled task triggered! This is a task that you need to execute autonomously without human intervention. Please execute immediately and provide correct feedback.";
-        appendFullHistory({ role: "user", content: pre_prompt + data.payload + suffix_prompt });
-        chat_show.value.push({
-          id: messageIdCounter.value++,
-          role: "user",
-          content: [{ type: "text", text: pre_prompt + data.payload + suffix_prompt }],
+        const scheduledTaskContent = pre_prompt + data.payload + suffix_prompt;
+        appendLinkedUserMessage({
+          historyContent: scheduledTaskContent,
+          uiContent: [{ type: "text", text: scheduledTaskContent }],
           timestamp: new Date().toLocaleString('sv-SE')
         });
 
@@ -2766,16 +3236,15 @@ onMounted(async () => {
           if (CODE.value.trim().toLowerCase().includes(data.payload.trim().toLowerCase())) { /* do nothing */ }
           else {
             if (currentPromptConfig.isDirectSend_normal) {
-              appendFullHistory({ role: "user", content: data.payload });
-              chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "text", text: data.payload }] });
+              appendLinkedUserMessage({ historyContent: data.payload, uiContent: [{ type: "text", text: data.payload }] });
               shouldDirectSend = true;
             } else { prompt.value = data.payload; }
           }
         }
       } else if (data.type === "img" && data.payload) {
         if (currentPromptConfig.isDirectSend_image ?? true) {
-          appendFullHistory({ role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
-          chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
+          const imageContent = [{ type: "image_url", image_url: { url: String(data.payload) } }];
+          appendLinkedUserMessage({ historyContent: imageContent, uiContent: imageContent });
           shouldDirectSend = true;
         } else {
           fileList.value.push({ uid: 1, name: "截图.png", size: 0, type: "image/png", url: String(data.payload) });
@@ -2855,6 +3324,7 @@ onMounted(async () => {
   // 监听来自 uTools 的"追问"内容追加事件
   if (window.preload && typeof window.preload.onAppendMessage === 'function') {
     window.preload.onAppendMessage(async (data) => {
+      if (!ensureConversationWriteAccess(true)) return;
       // 1. 如果 AI 正在生成，立刻中断当前生成
       if (loading.value) {
         cancelAskAI();
@@ -2868,11 +3338,10 @@ onMounted(async () => {
 
       // 2. 将收到的数据直接压入聊天历史或文件列表
       if (data.type === "over" && data.payload) {
-        appendFullHistory({ role: "user", content: data.payload });
-        chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "text", text: data.payload }], timestamp: nowTime });
+        appendLinkedUserMessage({ historyContent: data.payload, uiContent: [{ type: "text", text: data.payload }], timestamp: nowTime });
       } else if (data.type === "img" && data.payload) {
-        appendFullHistory({ role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }] });
-        chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: [{ type: "image_url", image_url: { url: String(data.payload) } }], timestamp: nowTime });
+        const imageContent = [{ type: "image_url", image_url: { url: String(data.payload) } }];
+        appendLinkedUserMessage({ historyContent: imageContent, uiContent: imageContent, timestamp: nowTime });
       } else if (data.type === "files" && data.payload) {
         try {
           const fileProcessingPromises = data.payload.map((fileInfo) => processFilePath(fileInfo.path));
@@ -3137,7 +3606,7 @@ const isCurrentPromptAutoSaveEnabled = () => {
 };
 
 const isNamedLocalConversationAvailable = () => Boolean(
-  currentConfig.value?.webdav?.localChatPath &&
+  (currentConversationStorage.value?.dirPath || currentConfig.value?.webdav?.localChatPath) &&
   typeof defaultConversationName.value === 'string' &&
   defaultConversationName.value.trim()
 );
@@ -3403,7 +3872,7 @@ const generateSuggestedConversationBasename = async ({
   firstUserMsg = null,
   allowFastModel = true
 } = {}) => {
-  const targetFirstUserMsg = firstUserMsg || chat_show.value.find(msg => msg.role === 'user') || null;
+  const targetFirstUserMsg = firstUserMsg || chat_show.value.find(isUserAuthoredMessage) || null;
   const fallbackNamePrefix = getFallbackConversationNamePrefix(targetFirstUserMsg) || CODE.value || 'AI';
   let generatedBaseTitle = '';
 
@@ -3423,8 +3892,7 @@ const generateSuggestedConversationBasename = async ({
   return resolveUniqueConversationFileName(generatedBaseTitle, uniqueDirPath);
 };
 
-const renderFilenameAutoNamingButton = ({ canUseAutoNaming = false, isAutoNaming, onClick }) => {
-  if (!canUseAutoNaming) return null;
+const renderFilenameAutoNamingButton = ({ isAutoNaming, onClick }) => {
   return h(ElButton, {
     class: 'filename-auto-name-button',
     size: 'small',
@@ -3434,18 +3902,19 @@ const renderFilenameAutoNamingButton = ({ canUseAutoNaming = false, isAutoNaming
   }, () => isAutoNaming?.value ? '命名中...' : '自动命名');
 };
 
-const renderFilenamePromptTitleRow = ({ text = '请输入文件名。', canUseAutoNaming = false, isAutoNaming, onClick }) => h(
+const renderFilenamePromptTitleRow = ({ text = '请输入文件名。', isAutoNaming, onClick }) => h(
   'div',
   { class: 'filename-prompt-title-row' },
   [
     h('p', { class: 'filename-prompt-title-text' }, text),
-    renderFilenameAutoNamingButton({ canUseAutoNaming, isAutoNaming, onClick })
+    renderFilenameAutoNamingButton({ isAutoNaming, onClick })
   ].filter(Boolean)
 );
 
 const createManualAutoNamingHandler = ({ inputValue, isAutoNaming, uniqueDirPath = '', fallbackBasename = '' }) => async () => {
   if (isAutoNaming.value) return;
   isAutoNaming.value = true;
+  const hasFastModel = isConfiguredFastModelAvailable(currentConfig.value?.defaultFastModel);
   try {
     const generatedName = await generateSuggestedConversationBasename({
       uniqueDirPath,
@@ -3454,6 +3923,9 @@ const createManualAutoNamingHandler = ({ inputValue, isAutoNaming, uniqueDirPath
     const nextName = sanitizeConversationTitlePart(generatedName || fallbackBasename || CODE.value || 'AI', 80);
     if (nextName) {
       inputValue.value = nextName;
+      if (!hasFastModel) {
+        showDismissibleMessage.warning('未配置可用的默认快速模型，已使用本地规则生成名称');
+      }
     } else {
       showDismissibleMessage.warning('当前对话内容不足，无法自动命名');
     }
@@ -3477,7 +3949,7 @@ const triggerAutoNamingForFirstUserMessage = async ({ force = false, requestSign
     return defaultConversationName.value || '';
   }
 
-  const firstUserMsg = chat_show.value.find(msg => msg.role === 'user');
+  const firstUserMsg = chat_show.value.find(isUserAuthoredMessage);
   if (!firstUserMsg) return '';
 
   cancelAutoNamingRequest();
@@ -3520,14 +3992,15 @@ const triggerAutoNamingForFirstUserMessage = async ({ force = false, requestSign
 };
 
 const autoSaveSession = async (force = false, { skipProjectAssignment = false, version = sessionMutationVersion } = {}) => {
-  if (!currentConfig.value?.webdav?.localChatPath) {
+  if (!currentConversationStorage.value?.dirPath && !currentConfig.value?.webdav?.localChatPath) {
+    lastAutoSaveError = new Error('conversation_local_dir_required');
     return false;
   }
 
   const promptConfig = currentConfig.value?.prompts?.[CODE.value] || {};
   const autoSaveProjectId = typeof promptConfig.autoSaveProjectId === 'string' ? promptConfig.autoSaveProjectId : '';
 
-  // 2. 获取当前快捷助手的配置
+  // 2. 获取当前智能体的配置
   const shouldAutoSave = shouldPersistCurrentSessionAutomatically();
 
   if (!shouldAutoSave && !force) {
@@ -3537,40 +4010,150 @@ const autoSaveSession = async (force = false, { skipProjectAssignment = false, v
 
   // 5. 如果经过尝试后仍然没有对话名称（例如空对话），则不保存
   if (!defaultConversationName.value) {
+    lastAutoSaveError = new Error('conversation_title_required');
     return false;
   }
 
-  // 6. 执行写入操作
+  // 6. 执行数据库活动快照写入；随机 dbFile 不参与会话命名。
   try {
-    await persistSessionToLocalJsonFile(defaultConversationName.value);
-
-    if (!skipProjectAssignment) {
-      try {
-        const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
-        const filename = `${defaultConversationName.value}.json`;
-        const existingProjectId = findProjectIdByFilename(localProjects, filename);
-        if (!existingProjectId && autoSaveProjectId) {
-          const projectName = localProjects.projects.find((p) => p.id === autoSaveProjectId)?.name || '';
-          await reassignLocalProject({
-            projectId: autoSaveProjectId,
-            projectName,
-            addFilename: filename,
-            removeFilenames: []
-          });
-        }
-      } catch (projectError) {
-        console.warn('[projects] auto-save local project assignment failed:', projectError);
-      }
+    if (!ensureConversationWriteAccess(false)) {
+      lastAutoSaveError = new Error('conversation_write_access_unavailable');
+      return false;
+    }
+    let storage = currentConversationStorage.value;
+    const dirPath = storage?.dirPath || currentConfig.value.webdav.localChatPath;
+    const sessionData = getSessionDataAsObject();
+    if (!storage?.conversationId) {
+      const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(dirPath));
+      const projectName = localProjects.projects.find((p) => p.id === autoSaveProjectId)?.name || '';
+      const created = await window.api.createConversation({
+        dirPath,
+        title: defaultConversationName.value,
+        sessionData,
+        projectId: skipProjectAssignment ? '' : autoSaveProjectId,
+        projectName
+      });
+      storage = {
+        format: 'sqlite',
+        conversationId: created.descriptor.conversationId,
+        dbFile: created.descriptor.dbFile,
+        title: created.descriptor.title,
+        revision: Number(created.descriptor.revision) || 0,
+        dirPath,
+        storageMode: 'local'
+      };
+      currentConversationStorage.value = storage;
+      await acquireCurrentConversationLease();
+    } else {
+      const saved = await window.api.saveConversationSnapshot({
+        dirPath,
+        conversationId: storage.conversationId,
+        expectedRevision: storage.revision,
+        holderInstanceId: conversationInstanceId,
+        leaseEpoch: conversationLease.value?.leaseEpoch,
+        title: defaultConversationName.value,
+        sessionData
+      });
+      currentConversationStorage.value = {
+        ...storage,
+        title: saved.title || defaultConversationName.value,
+        revision: Number(saved.revision) || storage.revision
+      };
     }
 
-    lastPersistedSessionVersion = Math.max(lastPersistedSessionVersion, Number(version) || 0);
+    conversationPersistenceTracker.markPersisted({ version, stateOnly: false });
     lastAutoSaveAt = Date.now();
+    lastAutoSaveError = null;
     return true;
   } catch (error) {
+    if (/conversation_(revision_conflict|write_lease_lost)/.test(String(error?.message || ''))) {
+      conversationReadOnly.value = true;
+      showDismissibleMessage.warning('会话已在其他客户端更新，当前窗口已切换为只读模式');
+    }
+    lastAutoSaveError = error;
     console.error('Auto-save failed:', error);
     return false;
   }
 };
+
+
+const getSessionTransientStatePatch = () => ({
+  promptDraft: prompt.value,
+  draftFileList: fileList.value,
+  pendingAppendBuffer: normalizePendingInputBuffer(pendingAppendBuffer.value)
+});
+
+const getSessionRequestConfigStatePatch = () => {
+  const currentPromptConfig = {
+    ...(currentConfig.value.prompts?.[CODE.value] || {}),
+    ...(sourcePromptConfig.value || {}),
+    model: model.value || '',
+    reasoning_effort: normalizeReasoningEffort(tempReasoningEffort.value),
+    voice: selectedVoice.value || null,
+    window_height: window.outerHeight,
+    window_width: window.outerWidth,
+    zoom: zoomLevel.value,
+    position_x: window.screenX,
+    position_y: window.screenY,
+    isAlwaysOnTop: isAlwaysOnTop.value,
+    autoCloseOnBlur: autoCloseOnBlur.value
+  };
+  sourcePromptConfig.value = { ...currentPromptConfig };
+  return {
+    model: model.value || '',
+    currentPromptConfig,
+    selectedVoice: selectedVoice.value || '',
+    activeMcpServerIds: [...(sessionMcpServerIds.value || [])],
+    activeSkillIds: [...(sessionSkillIds.value || [])],
+    isAutoApproveTools: isAutoApproveTools.value === true
+  };
+};
+
+const autoSaveSessionRequestConfig = async (force = false, { version = sessionMutationVersion } = {}) => {
+  const storage = currentConversationStorage.value;
+  if (!storage?.conversationId) {
+    // A new conversation still needs one full snapshot to create its SQLite transcript.
+    return autoSaveSession(force, { version });
+  }
+  if (!force && !shouldPersistCurrentSessionAutomatically()) return false;
+  if (!ensureConversationWriteAccess(false)) {
+    lastAutoSaveError = new Error('conversation_write_access_unavailable');
+    return false;
+  }
+
+  try {
+    const saved = await window.api.saveConversationState({
+      dirPath: storage.dirPath || currentConfig.value.webdav?.localChatPath || '',
+      conversationId: storage.conversationId,
+      expectedRevision: storage.revision,
+      holderInstanceId: conversationInstanceId,
+      leaseEpoch: conversationLease.value?.leaseEpoch,
+      title: defaultConversationName.value,
+      state: {
+        ...getSessionRequestConfigStatePatch(),
+        ...getSessionTransientStatePatch()
+      }
+    });
+    currentConversationStorage.value = {
+      ...storage,
+      title: saved.title || storage.title,
+      revision: Number(saved.revision) || storage.revision
+    };
+    conversationPersistenceTracker.markPersisted({ version, stateOnly: true });
+    lastAutoSaveAt = Date.now();
+    lastAutoSaveError = null;
+    return true;
+  } catch (error) {
+    if (/conversation_(revision_conflict|write_lease_lost)/.test(String(error?.message || ''))) {
+      conversationReadOnly.value = true;
+      showDismissibleMessage.warning('会话已在其他客户端更新，当前窗口已切换为只读模式');
+    }
+    lastAutoSaveError = error;
+    console.error('Request-config state save failed:', error);
+    return false;
+  }
+};
+
 
 const clearScheduledAutoSave = () => {
   if (autoSaveTimer) {
@@ -3580,75 +4163,68 @@ const clearScheduledAutoSave = () => {
   scheduledAutoSaveRequest = null;
 };
 
+const autoSaveMutationQueue = createConversationMutationQueue(async (request = {}) => {
+  if (conversationMetadataMutationPromise) await conversationMetadataMutationPromise;
+  if ((!request || !request.force) && !shouldPersistCurrentSessionAutomatically()) return false;
+
+  const saveOptions = {
+    skipProjectAssignment: request.skipProjectAssignment === true,
+    version: Number(request.version) || sessionMutationVersion
+  };
+  return request.stateOnly === true
+    ? await autoSaveSessionRequestConfig(Boolean(request.force), saveOptions)
+    : await autoSaveSession(Boolean(request.force), saveOptions);
+});
+
 const executeAutoSaveRequest = async (request = {}) => {
-  if (!request || !request.force) {
-    if (!shouldPersistCurrentSessionAutomatically()) {
-      return false;
-    }
-  }
-
-  if (autoSaveExecutionPromise) {
-    // Closing only needs the in-flight durable write; never enqueue a duplicate full save.
-    if (request.skipQueueWhenBusy) return autoSaveExecutionPromise;
-    queuedAutoSaveRequest = {
-      force: queuedAutoSaveRequest?.force || request.force || false,
-      reason: request.reason || queuedAutoSaveRequest?.reason || 'queued',
-      version: Math.max(Number(queuedAutoSaveRequest?.version) || 0, Number(request.version) || sessionMutationVersion),
-      skipProjectAssignment: Boolean(queuedAutoSaveRequest?.skipProjectAssignment && request.skipProjectAssignment)
-    };
-    return autoSaveExecutionPromise;
-  }
-
-  autoSaveExecutionPromise = (async () => {
-    try {
-      return await autoSaveSession(Boolean(request.force), {
-        skipProjectAssignment: request.skipProjectAssignment === true,
-        version: Number(request.version) || sessionMutationVersion
-      });
-    } finally {
-      autoSaveExecutionPromise = null;
-      if (queuedAutoSaveRequest) {
-        const nextRequest = queuedAutoSaveRequest;
-        queuedAutoSaveRequest = null;
-        await executeAutoSaveRequest(nextRequest);
-      }
-    }
-  })();
-
-  return autoSaveExecutionPromise;
+  const normalizedRequest = { ...request, version: Math.max(0, Number(request.version) || sessionMutationVersion) };
+  conversationPersistenceTracker.markRequired(normalizedRequest);
+  const completionPromise = autoSaveMutationQueue.enqueue(normalizedRequest);
+  const idlePromise = autoSaveMutationQueue.whenIdle();
+  autoSaveExecutionPromise = idlePromise;
+  void idlePromise.finally(() => {
+    if (autoSaveExecutionPromise === idlePromise) autoSaveExecutionPromise = null;
+  });
+  return await completionPromise;
 };
 
-const scheduleAutoSave = ({ reason = 'generic', immediate = false, force = false, delay = 0 } = {}) => {
-  if (!force && !shouldPersistCurrentSessionAutomatically()) {
-    return;
-  }
+const scheduleAutoSave = ({ reason = 'generic', immediate = false, force = false, delay = 0, stateOnly = false } = {}) => {
+  if (!force && !shouldPersistCurrentSessionAutomatically()) return null;
+  if (isClosingWindow.value) immediate = true;
 
-  const request = { reason, force, version: ++sessionMutationVersion };
+  let request = { reason, force, stateOnly: Boolean(stateOnly), version: ++sessionMutationVersion };
+  request = mergeAutoSaveRequests(scheduledAutoSaveRequest, request);
+  conversationPersistenceTracker.markRequired(request);
 
   if (immediate || force || delay <= 0) {
     clearScheduledAutoSave();
-    executeAutoSaveRequest(request);
-    return;
+    return executeAutoSaveRequest(request);
   }
 
-  if (scheduledAutoSaveRequest?.force) {
-    request.force = true;
-  }
   scheduledAutoSaveRequest = request;
-
-  if (autoSaveTimer) {
-    clearTimeout(autoSaveTimer);
-  }
+  if (autoSaveTimer) clearTimeout(autoSaveTimer);
   autoSaveTimer = setTimeout(() => {
-    const pendingRequest = scheduledAutoSaveRequest || request;
+    const pendingRequest = scheduledAutoSaveRequest;
     autoSaveTimer = null;
     scheduledAutoSaveRequest = null;
-    executeAutoSaveRequest(pendingRequest);
+    if (pendingRequest) void executeAutoSaveRequest(pendingRequest);
   }, delay);
+  return null;
 };
 
+watch([model, selectedVoice, tempReasoningEffort, sessionMcpServerIds, sessionSkillIds, isAutoApproveTools], () => {
+  if (isRestoringSessionSnapshot || conversationReadOnly.value || conversationLeasePending.value) return;
+  scheduleAutoSave({
+    reason: 'session-request-config',
+    delay: AUTO_SAVE_REQUEST_CONFIG_DEBOUNCE_MS,
+    stateOnly: true
+  });
+}, { deep: true });
+
+
 const scheduleInputDraftAutoSave = (reason = 'input-draft') => {
-  scheduleAutoSave({ reason, delay: AUTO_SAVE_INPUT_DEBOUNCE_MS });
+  // Draft-only changes belong in session_state and must not rebuild the full transcript/UI snapshot.
+  scheduleAutoSave({ reason, delay: AUTO_SAVE_INPUT_DEBOUNCE_MS, stateOnly: true });
 };
 
 const scheduleLoadingAutoSave = (reason = 'loading-progress') => {
@@ -3661,7 +4237,9 @@ const scheduleLoadingAutoSave = (reason = 'loading-progress') => {
 };
 
 
-onBeforeUnmount(async () => {  // 15s 轮询自动保存已移除；当前仅保留显式业务触发的保存链路。
+onBeforeUnmount(async () => {
+  await releaseCurrentConversationLease();
+  // 15s 轮询自动保存已移除；当前仅保留显式业务触发的保存链路。
 
   if (tailBubbleRecoveryRafId !== null) {
     cancelAnimationFrame(tailBubbleRecoveryRafId);
@@ -3694,7 +4272,7 @@ onBeforeUnmount(async () => {  // 15s 轮询自动保存已移除；当前仅保
 
 const saveWindowSize = async () => {
   if (!CODE.value || !currentConfig.value.prompts[CODE.value]) {
-    showDismissibleMessage.warning('无法保存窗口设置，因为当前不是一个已定义的快捷助手。');
+    showDismissibleMessage.warning('无法保存窗口设置，因为当前不是一个已定义的智能体。');
     return;
   }
 
@@ -3714,7 +4292,7 @@ const saveWindowSize = async () => {
   try {
     const result = await window.api.savePromptWindowSettings(CODE.value, settingsToSave);
     if (result.success) {
-      showDismissibleMessage.success('当前快捷助手的窗口大小、位置与缩放已保存');
+      showDismissibleMessage.success('当前智能体的窗口大小、位置与缩放已保存');
       if (currentConfig.value.prompts[CODE.value]) {
         Object.assign(currentConfig.value.prompts[CODE.value], settingsToSave);
       }
@@ -3728,7 +4306,24 @@ const saveWindowSize = async () => {
 }
 
 const getSessionDataAsObject = (options = {}) => {
-  const currentPromptConfig = currentConfig.value.prompts[CODE.value] || {};
+  const createStorageId = createConversationStorageId;
+  const usedStorageIds = new Set();
+  fullHistory.value.forEach((message) => {
+    if (!message || typeof message !== 'object') return;
+    const storageId = typeof message.storageId === 'string' ? message.storageId.trim() : '';
+    message.storageId = storageId && !usedStorageIds.has(storageId) ? storageId : createStorageId();
+    usedStorageIds.add(message.storageId);
+  });
+  const usedUiStorageIds = new Set();
+  chat_show.value.forEach((message) => {
+    if (!message || typeof message !== 'object') return;
+    const uiStorageId = typeof message.uiStorageId === 'string' ? message.uiStorageId.trim() : '';
+    message.uiStorageId = uiStorageId && !usedUiStorageIds.has(uiStorageId) ? uiStorageId : createStorageId();
+    usedUiStorageIds.add(message.uiStorageId);
+  });
+
+  const requestConfigState = getSessionRequestConfigStatePatch();
+  const currentPromptConfig = requestConfigState.currentPromptConfig;
   const explicitTitle = typeof options?.title === 'string' ? options.title.trim() : '';
   // Keep the request projection current, but do not rebuild the UI cache while serializing.
   rehydrateHistoryToolsIfNeeded();
@@ -3736,18 +4331,27 @@ const getSessionDataAsObject = (options = {}) => {
   // Do not reconcile chat_show here: serializing must stay off the close/save hot path.
   return {
     anywhere_history: true, CODE: CODE.value, basic_msg: basic_msg.value, isInit: isInit.value,
-    autoCloseOnBlur: autoCloseOnBlur.value, model: model.value,
-    sessionMetadata: { title: explicitTitle || getSessionMetadata().title },
-    currentPromptConfig: currentPromptConfig, fullHistory: fullHistory.value, history: history.value, chat_show: chat_show.value, selectedVoice: selectedVoice.value,
-    activeMcpServerIds: sessionMcpServerIds.value || [],
-    activeSkillIds: sessionSkillIds.value || [],
-    isAutoApproveTools: isAutoApproveTools.value,
+    autoCloseOnBlur: autoCloseOnBlur.value, model: requestConfigState.model,
+    sessionMetadata: { ...getSessionMetadata(), ...(explicitTitle ? { title: explicitTitle } : {}) },
+    currentPromptConfig: currentPromptConfig, fullHistory: fullHistory.value, history: history.value, chat_show: chat_show.value, selectedVoice: requestConfigState.selectedVoice,
+    promptDraft: prompt.value,
+    draftFileList: fileList.value,
+    pendingAppendBuffer: normalizePendingInputBuffer(pendingAppendBuffer.value),
+    activeMcpServerIds: requestConfigState.activeMcpServerIds,
+    activeSkillIds: requestConfigState.activeSkillIds,
+    isAutoApproveTools: requestConfigState.isAutoApproveTools,
     taskList: taskList.value,
     conversationOwnerId: ensureConversationOwnerId(),
     subAgentTasks: subAgentTasks.value.map(normalizeSubAgentSummary).filter(Boolean),
     subAgentDetails: subAgentDetails.value,
     compactArchives: compactArchives.value,
-    compactConfig: compactConfig.value
+    compactConfig: compactConfig.value,
+    conversationStorage: currentConversationStorage.value ? {
+      isPaged: currentConversationStorage.value.isPaged === true,
+      loadedFromOrdinal: Number(currentConversationStorage.value.loadedFromOrdinal) || 0,
+      loadedFromUiOrder: Number(currentConversationStorage.value.loadedFromUiOrder) || 0,
+      pageSize: Number(currentConversationStorage.value.pageSize) || 0
+    } : null
   };
 }
 // --- 项目（目录）归属：窗口端 helper ---
@@ -3758,14 +4362,18 @@ const stripJsonName = (value) => {
 
 const normalizeWindowProjects = (data) => {
   const projects = Array.isArray(data?.projects) ? data.projects : [];
+  const conversations = data?.conversations && typeof data.conversations === 'object' && !Array.isArray(data.conversations)
+    ? data.conversations : {};
   return {
-    version: Number(data?.version) || 1,
+    version: Number(data?.version) || 2,
+    conversations,
     projects: projects
       .filter((p) => p && typeof p === 'object')
       .map((p) => ({
         id: String(p.id || '').trim(),
         name: String(p.name || '').trim() || String(p.id || '').trim(),
-        files: Array.isArray(p.files) ? p.files.map((f) => String(f || '').trim()).filter(Boolean) : []
+        files: Array.isArray(p.files) ? p.files.map((f) => String(f || '').trim()).filter(Boolean) : [],
+        conversationIds: Array.isArray(p.conversationIds) ? p.conversationIds.map((id) => String(id || '').trim()).filter(Boolean) : []
       }))
       .filter((p) => p.id)
   };
@@ -3999,7 +4607,6 @@ const saveSessionToCloud = async () => {
   const defaultBasename = defaultConversationName.value || buildConversationTimestampedBasename(CODE.value || 'AI', { force: false, includeCode: false });
   const inputValue = ref(defaultBasename);
   const isAutoNaming = ref(false);
-  const canUseAutoNaming = isConfiguredFastModelAvailable(currentConfig.value?.defaultFastModel);
   const handleManualAutoNaming = createManualAutoNamingHandler({
     inputValue,
     isAutoNaming,
@@ -4014,7 +4621,6 @@ const saveSessionToCloud = async () => {
       message: () => h('div', null, [
         renderFilenamePromptTitleRow({
           text: '请输入要保存到云端的会话名称。',
-          canUseAutoNaming,
           isAutoNaming,
           onClick: handleManualAutoNaming
         }),
@@ -4047,36 +4653,73 @@ const saveSessionToCloud = async () => {
           showDismissibleMessage.info('正在保存到云端...');
           try {
             const sessionData = getSessionDataAsObject({ title: finalBasename });
-            const jsonString = JSON.stringify(sessionData, null, 2);
             const { url, username, password, data_path } = currentConfig.value.webdav;
             const client = createClient(url, { username, password });
             const remoteDir = data_path.endsWith('/') ? data_path.slice(0, -1) : data_path;
-            const remoteFilePath = `${remoteDir}/${filename}`;
             if (!(await client.exists(remoteDir))) await client.createDirectory(remoteDir, { recursive: true });
-            const fileSystemTimes = await resolveWindowCloudSaveFileSystemTimes(filename);
-            const { metadata: previousMetadataIndex, previousEntry } = await upsertWindowCloudChatMetadata(
-              client,
-              remoteDir,
-              filename,
-              buildWindowChatMetadataPayload(filename, {
-                sessionData,
-                createdAt: fileSystemTimes.createdAt,
-                updatedAt: fileSystemTimes.updatedAt
-              })
-            );
-            try {
-              await client.putFileContents(remoteFilePath, jsonString, { overwrite: true });
-            } catch (uploadError) {
-              await restoreWindowCloudChatMetadataEntry(client, remoteDir, filename, previousMetadataIndex, previousEntry);
-              throw uploadError;
+            let storage = currentConversationStorage.value;
+            if (!storage?.conversationId) {
+              const localDir = currentConfig.value?.webdav?.localChatPath || '';
+              const created = localDir
+                ? await window.api.createConversation({ dirPath: localDir, title: finalBasename, sessionData })
+                : await window.api.createCloudConversationWorktree({ title: finalBasename, sessionData });
+              storage = {
+                format: 'sqlite',
+                conversationId: created.descriptor.conversationId,
+                dbFile: created.descriptor.dbFile,
+                title: created.descriptor.title,
+                revision: Number(created.descriptor.revision) || 0,
+                dirPath: created.worktreeDir || localDir,
+                storageMode: created.storageMode || (localDir ? 'local' : 'cloud')
+              };
+              currentConversationStorage.value = storage;
+              await acquireCurrentConversationLease();
+            } else if (finalBasename !== storage.title) {
+              if (!ensureConversationWriteAccess(true)) return;
+              const renamed = await window.api.renameConversation({
+                dirPath: storage.dirPath,
+                conversationId: storage.conversationId,
+                title: finalBasename,
+                expectedRevision: storage.revision,
+                holderInstanceId: conversationInstanceId,
+                leaseEpoch: conversationLease.value?.leaseEpoch
+              });
+              storage = { ...storage, title: renamed.title, revision: Number(renamed.revision) || storage.revision };
+              currentConversationStorage.value = storage;
             }
+            await executeAutoSaveRequest({ reason: 'manual-cloud-save', force: true, version: ++sessionMutationVersion });
+            storage = currentConversationStorage.value;
+            const snapshot = await window.api.readConversationSnapshot({ dirPath: storage.dirPath, conversationId: storage.conversationId });
+            const bytes = snapshot.content?.encoding === 'base64'
+              ? Uint8Array.from(atob(snapshot.content.data), (char) => char.charCodeAt(0))
+              : snapshot.content;
+            await client.putFileContents(`${remoteDir}/${storage.dbFile}`, bytes, { overwrite: true });
+            const cloudProjects = await readCloudProjectsViaWebdav();
+            const descriptor = {
+              conversationId: storage.conversationId,
+              dbFile: storage.dbFile,
+              title: finalBasename,
+              legacyJson: '',
+              storageMode: 'cloud',
+              revision: storage.revision,
+              schemaVersion: 1,
+              updatedAt: new Date().toISOString()
+            };
+            let projects = cloudProjects.projects.map((project) => ({
+              ...project,
+              conversationIds: (project.conversationIds || []).filter((id) => id !== storage.conversationId)
+            }));
+            if (selectedProjectId.value) {
+              projects = projects.map((project) => project.id === selectedProjectId.value
+                ? { ...project, conversationIds: [...project.conversationIds, storage.conversationId] }
+                : project);
+            }
+            await writeCloudProjectsViaWebdav({
+              ...cloudProjects,
+              conversations: { ...cloudProjects.conversations, [storage.conversationId]: descriptor },
+              projects
+            });
             defaultConversationName.value = finalBasename;
-            try {
-              const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
-              await assignCloudProject({ projectId: selectedProjectId.value, projectName, basename: filename });
-            } catch (projectError) {
-              console.warn('[projects] 更新云端项目归属失败:', projectError);
-            }
             showDismissibleMessage.success('会话已成功保存到云端！');
             done();
           } catch (error) {
@@ -4161,11 +4804,22 @@ const saveSessionAsMarkdown = async () => {
   }
 
   const inputValue = ref(defaultBasename);
+  const isAutoNaming = ref(false);
+  const handleManualAutoNaming = createManualAutoNamingHandler({
+    inputValue,
+    uniqueDirPath: currentConfig.value?.webdav?.localChatPath || '',
+    isAutoNaming,
+    fallbackBasename: defaultBasename
+  });
   try {
     await ElMessageBox({
       title: '保存为 Markdown',
       message: () => h('div', null, [
-        h('p', { style: 'margin-bottom: 15px; font-size: 14px; color: var(--el-text-color-regular);' }, '请输入文件名。'),
+        renderFilenamePromptTitleRow({
+          text: '请输入文件名。',
+          isAutoNaming,
+          onClick: handleManualAutoNaming
+        }),
         h(ElInput, {
           modelValue: inputValue.value,
           'onUpdate:modelValue': (val) => { inputValue.value = val; },
@@ -4211,6 +4865,13 @@ const saveSessionAsHtml = async () => {
   const fileTimestamp = `${String(now.getFullYear()).slice(-2)}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
   const defaultBasename = defaultConversationName.value || `${CODE.value || 'AI'}-${fileTimestamp}`;
   const inputValue = ref(defaultBasename);
+  const isAutoNaming = ref(false);
+  const handleManualAutoNaming = createManualAutoNamingHandler({
+    inputValue,
+    uniqueDirPath: currentConfig.value?.webdav?.localChatPath || '',
+    isAutoNaming,
+    fallbackBasename: defaultBasename
+  });
 
   const defaultAiSvg = `<svg width="200" height="200" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="50" fill="#FDA5A5" /><g stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" fill="none"><rect x="25" y="32" width="50" height="42" rx="8" /><line x1="40" y1="63" x2="60" y2="63" /><line x1="35" y1="32" x2="32" y2="22" /><line x1="65" y1="32" x2="68" y2="22" /></g><g fill="white" stroke="none"><circle cx="40" cy="48" r="3.5" /><circle cx="60" cy="48" r="3.5" /><circle cx="32" cy="20" r="3" /><circle cx="68" cy="20" r="3" /></g></svg>`;
 
@@ -4570,7 +5231,11 @@ html.dark .timeline-node.compaction {
     await ElMessageBox({
       title: '保存为 HTML',
       message: () => h('div', null, [
-        h('p', { style: 'margin-bottom: 15px; font-size: 14px; color: var(--el-text-color-regular);' }, '请输入文件名。'),
+        renderFilenamePromptTitleRow({
+          text: '请输入文件名。',
+          isAutoNaming,
+          onClick: handleManualAutoNaming
+        }),
         h(ElInput, {
           modelValue: inputValue.value,
           'onUpdate:modelValue': (val) => { inputValue.value = val; },
@@ -4606,29 +5271,10 @@ html.dark .timeline-node.compaction {
   } catch (error) { if (error !== 'cancel' && error !== 'close') console.error('MessageBox error:', error); }
 };
 
-const persistSessionToLocalJsonFile = async (baseName = defaultConversationName.value, options = {}) => {
-  const localChatPath = currentConfig.value.webdav?.localChatPath;
-  const normalizedBaseName = typeof baseName === 'string' ? baseName.trim() : '';
-
-  if (!localChatPath || !normalizedBaseName) {
-    return false;
-  }
-
-  const separator = currentOS.value === 'win' ? '\\' : '/';
-  const sessionData = getSessionDataAsObject({ title: typeof options?.title === 'string' ? options.title : normalizedBaseName });
-  const jsonString = JSON.stringify(sessionData, null, 2);
-  const fullPath = `${localChatPath}${separator}${normalizedBaseName}.json`;
-
-  await window.api.writeLocalFile(fullPath, jsonString);
-  return true;
-};
-
-
 const saveSessionAsJson = async () => {
   const defaultBasename = defaultConversationName.value || buildConversationTimestampedBasename(CODE.value || 'AI', { force: false, includeCode: false });
   const inputValue = ref(defaultBasename);
   const isAutoNaming = ref(false);
-  const canUseAutoNaming = isConfiguredFastModelAvailable(currentConfig.value?.defaultFastModel);
   const handleManualAutoNaming = createManualAutoNamingHandler({
     inputValue,
     isAutoNaming,
@@ -4639,11 +5285,10 @@ const saveSessionAsJson = async () => {
   const selectedProjectId = ref(findProjectIdByFilename(projectsData, `${defaultBasename}.json`));
   try {
     await ElMessageBox({
-      title: '保存为 JSON',
+      title: '保存到本地',
       message: () => h('div', null, [
         renderFilenamePromptTitleRow({
           text: '请输入文件名。',
-          canUseAutoNaming,
           isAutoNaming,
           onClick: handleManualAutoNaming
         }),
@@ -4676,37 +5321,58 @@ const saveSessionAsJson = async () => {
           try {
             const localChatPath = currentConfig.value.webdav?.localChatPath;
 
-            // 优化逻辑：如果有本地路径，直接写入；否则弹出保存框
             if (localChatPath) {
-              await persistSessionToLocalJsonFile(finalBasename, { title: finalBasename });
-              // 更新项目归属（仅在已配置本地路径时维护 projects.yaml）
-              try {
-                const oldFilename = defaultConversationName.value ? `${defaultConversationName.value}.json` : '';
-                const removeFilenames = oldFilename && oldFilename !== finalFilename ? [oldFilename] : [];
-                const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
-                await reassignLocalProject({
-                  projectId: selectedProjectId.value,
-                  projectName,
-                  addFilename: finalFilename,
-                  removeFilenames
+              const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
+              if (currentConversationStorage.value?.conversationId) {
+                if (!ensureConversationWriteAccess(true)) return;
+                const storage = currentConversationStorage.value;
+                const renamed = await window.api.renameConversation({
+                  dirPath: storage.dirPath || localChatPath,
+                  conversationId: storage.conversationId,
+                  title: finalBasename,
+                  expectedRevision: storage.revision,
+                  holderInstanceId: conversationInstanceId,
+                  leaseEpoch: conversationLease.value?.leaseEpoch
                 });
-              } catch (projectError) {
-                console.warn('[projects] 更新本地项目归属失败:', projectError);
+                currentConversationStorage.value = {
+                  ...storage,
+                  title: renamed.title,
+                  revision: Number(renamed.revision) || storage.revision
+                };
+                defaultConversationName.value = renamed.title;
+                await executeAutoSaveRequest({ reason: 'manual-save', force: true, version: ++sessionMutationVersion });
+              } else {
+                const created = await window.api.createConversation({
+                  dirPath: localChatPath,
+                  title: finalBasename,
+                  sessionData: getSessionDataAsObject({ title: finalBasename }),
+                  projectId: selectedProjectId.value,
+                  projectName
+                });
+                currentConversationStorage.value = {
+                  format: 'sqlite',
+                  conversationId: created.descriptor.conversationId,
+                  dbFile: created.descriptor.dbFile,
+                  title: created.descriptor.title,
+                  revision: Number(created.descriptor.revision) || 0,
+                  dirPath: localChatPath,
+                  storageMode: 'local'
+                };
+                defaultConversationName.value = created.descriptor.title;
+                await acquireCurrentConversationLease();
               }
             } else {
-              // 未配置路径，弹出系统选择框
               const sessionData = getSessionDataAsObject({ title: finalBasename });
               const jsonString = JSON.stringify(sessionData, null, 2);
               await window.api.saveFile({
-                title: '保存聊天会话',
+                title: '导出旧版 JSON 会话',
                 defaultPath: finalFilename,
-                buttonLabel: '保存',
+                buttonLabel: '导出',
                 filters: [{ name: 'JSON 文件', extensions: ['json'] }, { name: '所有文件', extensions: ['*'] }],
                 fileContent: jsonString
               });
+              defaultConversationName.value = finalBasename;
             }
-
-            defaultConversationName.value = finalBasename;
             showDismissibleMessage.success('会话已成功保存！');
             done();
           } catch (error) {
@@ -4767,46 +5433,39 @@ const renameRemoteSessionFileWithMetadata = async (client, remoteDir, oldFilenam
 
 
 const handleRenameSession = async () => {
-  if (autoCloseOnBlur.value) handleTogglePin(); // 暂停失焦关闭，防止弹窗时窗口消失
-
+  if (autoCloseOnBlur.value) handleTogglePin();
   const localPath = currentConfig.value.webdav?.localChatPath;
+  const storage = currentConversationStorage.value;
   if (!localPath) {
     showDismissibleMessage.error('请先在设置中配置本地对话路径');
     return;
   }
-  if (!defaultConversationName.value) {
+  if (!storage?.conversationId) {
     showDismissibleMessage.warning('当前对话尚未保存，无法重命名');
     return;
   }
+  if (!ensureConversationWriteAccess(true)) return;
 
-  const oldBaseName = defaultConversationName.value;
-  const oldFilename = `${oldBaseName}.json`;
-  // 简单拼接路径，electron/node 环境下通常能正确处理
-  const oldFilePath = `${localPath}/${oldFilename}`;
-  const inputValue = ref(oldBaseName);
+  const oldTitle = defaultConversationName.value || storage.title || '';
+  const inputValue = ref(oldTitle);
+  const isAutoNaming = ref(false);
+  const handleManualAutoNaming = createManualAutoNamingHandler({ inputValue, uniqueDirPath: '', isAutoNaming, fallbackBasename: oldTitle });
   const projectsData = await loadProjectsForScope('local');
-  const originalProjectId = findProjectIdByFilename(projectsData, oldFilename);
+  const originalProjectId = (projectsData.projects || []).find((project) =>
+    (project.conversationIds || []).includes(storage.conversationId)
+  )?.id || '';
   const selectedProjectId = ref(originalProjectId);
 
   try {
     await ElMessageBox({
       title: '重命名对话',
       message: () => h('div', null, [
-        renderFilenamePromptTitleRow({
-          text: '请输入新的会话名称',
-          canUseAutoNaming: false,
-          isAutoNaming: null,
-          onClick: null
-        }),
+        renderFilenamePromptTitleRow({ text: '请输入新的会话名称', isAutoNaming, onClick: handleManualAutoNaming }),
         h(ElInput, {
           modelValue: inputValue.value,
           'onUpdate:modelValue': (val) => { inputValue.value = val; },
           placeholder: '会话名称',
-          ref: (elInputInstance) => {
-            if (elInputInstance) {
-              setTimeout(() => elInputInstance.focus(), 100);
-            }
-          },
+          ref: (instance) => { if (instance) setTimeout(() => instance.focus(), 100); },
           onKeydown: (event) => {
             if (event.key === 'Enter') {
               event.preventDefault();
@@ -4821,105 +5480,55 @@ const handleRenameSession = async () => {
       cancelButtonText: '取消',
       customClass: 'filename-prompt-dialog',
       beforeClose: async (action, instance, done) => {
-        if (action !== 'confirm') {
-          done();
-          return;
-        }
-
-        let newBaseName = (inputValue.value || '').trim();
-        if (!newBaseName) {
+        if (action !== 'confirm') return done();
+        const nextTitle = String(inputValue.value || '').trim();
+        if (!nextTitle) {
           showDismissibleMessage.error('名称不能为空');
           return;
         }
-        if (/[\\/:*?"<>|]/.test(newBaseName)) {
-          showDismissibleMessage.error('文件名包含非法字符');
-          return;
-        }
-        if (newBaseName.toLowerCase().endsWith('.json')) newBaseName = newBaseName.slice(0, -5);
-        if (!newBaseName) {
-          showDismissibleMessage.error('名称不能为空');
-          return;
-        }
-
-        const projectChanged = selectedProjectId.value !== originalProjectId;
-        if (newBaseName === oldBaseName) {
-          // 名称未变，仅在项目归属变化时更新 projects.yaml
-          if (projectChanged) {
-            instance.confirmButtonLoading = true;
-            try {
-              const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
-              await reassignLocalProject({
-                projectId: selectedProjectId.value,
-                projectName,
-                addFilename: oldFilename,
-                removeFilenames: []
-              });
-              showDismissibleMessage.success('项目归属已更新');
-            } catch (projectError) {
-              console.warn('[projects] 更新本地项目归属失败:', projectError);
-              showDismissibleMessage.error('更新项目归属失败');
-            } finally {
-              instance.confirmButtonLoading = false;
-            }
-          }
-          done();
-          return;
-        }
-
-        const newFilename = `${newBaseName}.json`;
-        const newFilePath = `${localPath}/${newFilename}`;
-
-        // 检查本地是否存在同名文件
-        const files = await window.api.listJsonFiles(localPath);
-        if (files.some(f => f.basename === newFilename)) {
-          showDismissibleMessage.error(`文件名 "${newFilename}" 已存在，操作取消`);
-          return;
-        }
-
         instance.confirmButtonLoading = true;
         try {
-          // 执行本地重命名
-          await window.api.renameLocalFile(oldFilePath, newFilePath);
-          defaultConversationName.value = newBaseName;
-          // 同步更新项目归属：移除旧名，新名按所选项目归属
-          try {
-            const projectName = projectsData.projects.find((p) => p.id === selectedProjectId.value)?.name || '';
-            await reassignLocalProject({
-              projectId: selectedProjectId.value,
-              projectName,
-              addFilename: newFilename,
-              removeFilenames: [oldFilename]
-            });
-          } catch (projectError) {
-            console.warn('[projects] 重命名后更新本地项目归属失败:', projectError);
-          }
-          showDismissibleMessage.success('本地重命名成功');
-          done();
-
-          // 尝试同步重命名云端文件
-          const { url, username, password, data_path } = currentConfig.value.webdav || {};
-          if (url && data_path) {
+          if (nextTitle !== oldTitle) {
+            if (autoSaveExecutionPromise) await autoSaveExecutionPromise;
+            let releaseMetadataMutation;
+            conversationMetadataMutationPromise = new Promise((resolve) => { releaseMetadataMutation = resolve; });
             try {
-              const client = createClient(url, { username, password });
-              const remoteDir = data_path.endsWith('/') ? data_path.slice(0, -1) : data_path;
-              const oldRemotePath = `${remoteDir}/${oldFilename}`;
-
-              // 检查云端是否存在该文件
-              if (await client.exists(oldRemotePath)) {
-                await ElMessageBox.confirm(
-                  '云端也存在同名文件，是否同步重命名？',
-                  '同步操作提示',
-                  { confirmButtonText: '是', cancelButtonText: '否', type: 'info' }
-                );
-                await renameRemoteSessionFileWithMetadata(client, remoteDir, oldFilename, newFilename);
-                showDismissibleMessage.success('云端同步重命名成功');
-              }
-            } catch (e) {
-              if (e !== 'cancel' && e !== 'close') {
-                console.warn('Cloud rename skipped:', e);
-              }
+              const liveStorage = currentConversationStorage.value || storage;
+              const renamed = await window.api.renameConversation({
+                dirPath: liveStorage.dirPath || localPath,
+                conversationId: liveStorage.conversationId,
+                title: nextTitle,
+                expectedRevision: liveStorage.revision,
+                holderInstanceId: conversationInstanceId,
+                leaseEpoch: conversationLease.value?.leaseEpoch
+              });
+              defaultConversationName.value = renamed.title;
+              currentConversationStorage.value = {
+                ...liveStorage,
+                title: renamed.title,
+                dbFile: liveStorage.dbFile,
+                revision: Number(renamed.revision) || liveStorage.revision
+              };
+            } finally {
+              releaseMetadataMutation?.();
+              conversationMetadataMutationPromise = null;
             }
           }
+          if (selectedProjectId.value !== originalProjectId) {
+            const data = normalizeWindowProjects(await window.api.readLocalProjects(localPath));
+            let projects = data.projects.map((project) => ({
+              ...project,
+              conversationIds: (project.conversationIds || []).filter((id) => id !== storage.conversationId)
+            }));
+            if (selectedProjectId.value) {
+              projects = projects.map((project) => project.id === selectedProjectId.value
+                ? { ...project, conversationIds: [...project.conversationIds, storage.conversationId] }
+                : project);
+            }
+            await window.api.writeLocalProjects(localPath, { ...data, projects });
+          }
+          showDismissibleMessage.success('会话名称已更新');
+          done();
         } catch (error) {
           showDismissibleMessage.error(`操作失败: ${error.message}`);
         } finally {
@@ -4928,9 +5537,7 @@ const handleRenameSession = async () => {
       }
     });
   } catch (error) {
-    if (error !== 'cancel' && error !== 'close') {
-      showDismissibleMessage.error(`操作失败: ${error.message}`);
-    }
+    if (error !== 'cancel' && error !== 'close') showDismissibleMessage.error(`操作失败: ${error.message}`);
   }
 };
 
@@ -4939,12 +5546,23 @@ const saveSessionAsImage = async () => {
   const fileTimestamp = `${String(now.getFullYear()).slice(-2)}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
   const defaultBasename = defaultConversationName.value || `${CODE.value || 'AI'}-${fileTimestamp}`;
   const inputValue = ref(defaultBasename);
+  const isAutoNaming = ref(false);
+  const handleManualAutoNaming = createManualAutoNamingHandler({
+    inputValue,
+    uniqueDirPath: currentConfig.value?.webdav?.localChatPath || '',
+    isAutoNaming,
+    fallbackBasename: defaultBasename
+  });
 
   try {
     await ElMessageBox({
       title: '保存为图片',
       message: () => h('div', null, [
-        h('p', { style: 'margin-bottom: 15px; font-size: 14px; color: var(--el-text-color-regular);' }, '请输入文件名。'),
+        renderFilenamePromptTitleRow({
+          text: '请输入文件名。',
+          isAutoNaming,
+          onClick: handleManualAutoNaming
+        }),
         h(ElInput, {
           modelValue: inputValue.value,
           'onUpdate:modelValue': (val) => { inputValue.value = val; },
@@ -5153,51 +5771,57 @@ const saveSessionAsImage = async () => {
 const handleSaveAction = async () => {
   if (autoCloseOnBlur.value) handleTogglePin();
   const isCloudEnabled = currentConfig.value.webdav?.url && currentConfig.value.webdav?.data_path;
-  const saveOptions = [];
-
-  // 只有当已存在本地文件名（即已保存过）且配置了本地路径时，才显示重命名选项；请求中继续禁用重命名，避免路径竞态。
-  if (currentConfig.value.webdav?.localChatPath && defaultConversationName.value) {
-    saveOptions.push({
-      title: '重命名对话',
-      description: loading.value
-        ? '当前 AI 仍在回复中，请等待本轮回复结束后再重命名，避免与自动保存路径产生竞态。'
-        : '修改当前对话名称，并同步修改本地文件（以及云端文件）。',
-      buttonType: 'warning',
+  const saveOptions = [
+    {
+      title: '重新命名',
+      description: defaultConversationName.value
+        ? '修改当前会话名称和项目归属，请求进行中也可操作。'
+        : '请先保存到本地后再重命名。',
       action: handleRenameSession,
-      disabled: loading.value
-    });
-  }
+      disabled: !defaultConversationName.value,
+      wide: true
+    },
+    {
+      title: '保存到云端',
+      description: isCloudEnabled ? '将当前会话同步到云端，支持跨设备访问。' : '请先在设置中配置 WebDAV。',
+      action: saveSessionToCloud,
+      disabled: !isCloudEnabled,
+      primary: true
+    },
+    {
+      title: '保存到本地',
+      description: '将当前会话保存到本地历史记录。',
+      action: saveSessionAsJson,
+      primary: true
+    },
+    { title: '保存为 Markdown', description: '导出为可读性更强的 .md 文件。', action: saveSessionAsMarkdown },
+    { title: '保存为 HTML', description: '导出带样式的网页文件。', action: saveSessionAsHtml },
+    { title: '保存为图片', description: '将完整聊天记录导出为长图。', action: saveSessionAsImage }
+  ];
 
-  if (isCloudEnabled) {
-    saveOptions.push({ title: '保存到云端', description: '同步到 WebDAV 服务器，支持跨设备访问。', buttonType: 'success', action: saveSessionToCloud });
-  }
-
-  saveOptions.push({ title: '保存为 JSON', description: '保存为可恢复的会話文件，便于下次继续。', buttonType: 'primary', action: saveSessionAsJson, isDefault: true });
-  saveOptions.push({ title: '保存为 Markdown', description: '导出为可读性更强的 .md 文件，适合分享。', buttonType: '', action: saveSessionAsMarkdown });
-  saveOptions.push({ title: '保存为 HTML', description: '导出为带样式的网页文件，保留格式和图片。', buttonType: '', action: saveSessionAsHtml });
-  saveOptions.push({ title: '保存为 图片', description: '将完整聊天记录保存为长图 (.png)。', buttonType: '', action: saveSessionAsImage });
-
-  const messageVNode = h('div', { class: 'save-options-list' }, saveOptions.map(opt => {
+  const messageVNode = h('div', { class: 'save-options-list' }, saveOptions.map((opt, index) => {
     const trigger = () => {
       if (opt.disabled) return;
       ElMessageBox.close();
-      opt.action();
+      void opt.action();
     };
-
     return h('div', {
-      class: ['save-option-item', opt.disabled ? 'is-disabled' : ''],
-      onClick: trigger
+      class: ['save-option-item', opt.wide ? 'is-wide' : '', opt.primary ? 'is-primary' : '', opt.disabled ? 'is-disabled' : ''],
+      role: 'button',
+      tabindex: opt.disabled ? -1 : 0,
+      'aria-disabled': String(Boolean(opt.disabled)),
+      onClick: trigger,
+      onKeydown: (event) => {
+        if (!opt.disabled && (event.key === 'Enter' || event.key === ' ')) {
+          event.preventDefault();
+          trigger();
+        }
+      }
     }, [
       h('div', { class: 'save-option-text' }, [
-        h('h4', null, opt.title), h('p', null, opt.description)
-      ]),
-      h(ElButton, {
-        type: opt.buttonType,
-        plain: true,
-        disabled: Boolean(opt.disabled),
-        class: opt.isDefault ? 'default-save-target' : '',
-        onClick: (e) => { e.stopPropagation(); trigger(); }
-      }, { default: () => '选择' })
+        h('h4', null, opt.title),
+        h('p', null, opt.description)
+      ])
     ]);
   }));
 
@@ -5207,20 +5831,19 @@ const handleSaveAction = async () => {
     showConfirmButton: false,
     showCancelButton: false,
     customClass: 'save-options-dialog no-header-msgbox',
-    width: '450px',
-    showClose: false
+    width: '410px',
+    showClose: true
   }).catch(() => { });
 
   setTimeout(() => {
-    const targetBtn = document.querySelector('.default-save-target');
-    if (targetBtn) {
-      targetBtn.focus();
-    }
+    document.querySelector('.save-option-item[tabindex="0"]')?.focus();
   }, 100);
 };
 
 const loadSession = async (jsonData) => {
   loading.value = true;
+  sessionCreatedAt.value = resolveSessionCreatedAt(jsonData) || sessionCreatedAt.value;
+  isRestoringSessionSnapshot = true;
   collapsedMessages.value.clear();
   messageRefs.clear();
   focusedMessageIndex.value = null;
@@ -5230,7 +5853,9 @@ const loadSession = async (jsonData) => {
     document.title = CODE.value;
     basic_msg.value = jsonData.basic_msg;
     isInit.value = jsonData.isInit;
-    autoCloseOnBlur.value = jsonData.autoCloseOnBlur;
+    if (typeof jsonData.autoCloseOnBlur === 'boolean') {
+      autoCloseOnBlur.value = jsonData.autoCloseOnBlur;
+    }
 
     const rawFullHistory = Array.isArray(jsonData.fullHistory) ? jsonData.fullHistory : [];
     const rawHistory = Array.isArray(jsonData.history) ? jsonData.history : [];
@@ -5265,12 +5890,19 @@ const loadSession = async (jsonData) => {
     if (typeof markOutermostCanRestore === 'function') markOutermostCanRestore();
     syncHistoryFromFullHistory();
 
-    selectedVoice.value = jsonData.selectedVoice || '';
-    tempReasoningEffort.value = jsonData.currentPromptConfig?.reasoning_effort || 'default';
-    isAutoApproveTools.value = jsonData.isAutoApproveTools || true;
+    selectedVoice.value = typeof jsonData.selectedVoice === 'string'
+      ? jsonData.selectedVoice
+      : (jsonData.currentPromptConfig?.voice || '');
+    if (typeof jsonData.promptDraft === 'string') prompt.value = jsonData.promptDraft;
+    if (Array.isArray(jsonData.draftFileList)) fileList.value = deepCloneSafe(jsonData.draftFileList);
+
+    tempReasoningEffort.value = normalizeReasoningEffort(jsonData.currentPromptConfig?.reasoning_effort);
+    isAutoApproveTools.value = typeof jsonData.isAutoApproveTools === 'boolean'
+      ? jsonData.isAutoApproveTools
+      : true;
     taskList.value = Array.isArray(jsonData.taskList) ? normalizeTaskList(jsonData.taskList) : [];
     taskPanelVisible.value = false;
-    pendingAppendBuffer.value = [];
+    pendingAppendBuffer.value = normalizePendingInputBuffer(jsonData.pendingAppendBuffer);
     conversationOwnerId.value = typeof jsonData.conversationOwnerId === 'string' && jsonData.conversationOwnerId.trim()
       ? jsonData.conversationOwnerId.trim()
       : '';
@@ -5291,8 +5923,20 @@ const loadSession = async (jsonData) => {
     if (currentConfig.value.isDarkMode) { document.documentElement.classList.add('dark'); }
     else { document.documentElement.classList.remove('dark'); }
 
-    const currentPromptConfigFromLoad = jsonData.currentPromptConfig || currentConfig.value.prompts[CODE.value];
-    if (currentPromptConfigFromLoad && currentPromptConfigFromLoad.icon) {
+    const currentPromptConfigFromLoad = jsonData.currentPromptConfig || currentConfig.value.prompts[CODE.value] || {};
+    sourcePromptConfig.value = { ...currentPromptConfigFromLoad };
+    if (typeof jsonData.autoCloseOnBlur !== 'boolean' && typeof currentPromptConfigFromLoad.autoCloseOnBlur === 'boolean') {
+      autoCloseOnBlur.value = currentPromptConfigFromLoad.autoCloseOnBlur;
+    }
+    isAlwaysOnTop.value = currentPromptConfigFromLoad.isAlwaysOnTop ?? isAlwaysOnTop.value;
+    if (window.api && typeof window.api.applyConversationWindowState === 'function') {
+      window.api.applyConversationWindowState({
+        window_width: currentPromptConfigFromLoad.window_width,
+        window_height: currentPromptConfigFromLoad.window_height,
+        isAlwaysOnTop: isAlwaysOnTop.value
+      });
+    }
+    if (currentPromptConfigFromLoad.icon) {
       AIAvart.value = currentPromptConfigFromLoad.icon;
       favicon.value = currentPromptConfigFromLoad.icon;
     } else {
@@ -5406,6 +6050,11 @@ const loadSession = async (jsonData) => {
     console.error("加载会话失败:", error);
     showDismissibleMessage.error(`加载会话失败: ${error.message}`);
     loading.value = false;
+  } finally {
+    isRestoringSessionSnapshot = false;
+    if (pendingAppendBuffer.value.length > 0) {
+      nextTick(() => { flushAppendBuffer(); });
+    }
   }
 };
 
@@ -5466,6 +6115,102 @@ const processFilePath = async (filePath) => {
   } catch (error) { console.error('调用 handleFilePath 时发生意外错误:', error); showDismissibleMessage.error('处理文件路径时发生未知错误'); }
 };
 
+const buildAgentToolContentList = async ({ text, filePaths, source = 'agent_tool' } = {}) => {
+  const normalizedText = typeof text === 'string' ? text.trim() : '';
+  const normalizedPaths = Array.isArray(filePaths)
+    ? filePaths.filter((item) => typeof item === 'string' && item.trim())
+    : [];
+
+  const contentList = [];
+  if (normalizedText) {
+    contentList.push({ type: 'text', text: normalizedText });
+  }
+
+  let fileContentList = [];
+  if (normalizedPaths.length > 0) {
+    try {
+      fileContentList = await window.api.sendfileDirect(normalizedPaths.map((path) => ({ path })));
+    } catch (error) {
+      throw new Error(`Failed to attach files. ${error?.message || 'unknown error'}`);
+    }
+  }
+
+  if (normalizedPaths.length && (!Array.isArray(fileContentList) || fileContentList.length !== normalizedPaths.length)) {
+    throw new Error('One or more attachments could not be prepared. The message was not sent.');
+  }
+  if (Array.isArray(fileContentList) && fileContentList.length > 0) {
+    contentList.push(...fileContentList);
+  }
+
+  return {
+    normalizedText,
+    normalizedPaths,
+    attachedFiles: Array.isArray(fileContentList) ? fileContentList : [],
+    contentList
+  };
+};
+
+const AGENT_MESSAGE_QUEUED = 'The other agent is currently responding. Your message has been queued and will be viewed after it finishes its current response.';
+const AGENT_MESSAGE_SENT = 'Message sent successfully. The other agent is now responding to your message.';
+
+const isAgentMessageBusy = () => loading.value || isPreparingSend.value || compacting.value || isMcpLoading.value || Boolean(activeAssistantTurnMeta) || isFlushingAppendBuffer;
+
+const queueAgentToolMessage = (message, prepend = false) => {
+  const item = { kind: 'agent', ...message, preview: message.text || `[${message.filePaths.length} files]` };
+  if (prepend) pendingAppendBuffer.value.unshift(item);
+  else pendingAppendBuffer.value.push(item);
+  scheduleAutoSave({ reason: 'agent-message-buffered', immediate: true });
+  return AGENT_MESSAGE_QUEUED;
+};
+
+const appendAgentToolContent = (contentList) => {
+  if (isClosingWindow.value || !ensureConversationWriteAccess(false)) {
+    throw new Error('The target conversation is closing, read-only, or its write lease is unavailable.');
+  }
+  if (!contentList.length) throw new Error('No text or valid attachments were provided.');
+  appendLinkedUserMessage({
+    historyContent: contentList.length === 1 && contentList[0].type === 'text' ? contentList[0].text : contentList,
+    uiContent: contentList,
+    timestamp: new Date().toLocaleString('sv-SE')
+  });
+  scheduleAutoSave({ reason: 'agent-tool-message', immediate: true });
+};
+
+const sendAgentToolMessage = async ({ text, filePaths, source = 'agent_tool' } = {}) => {
+  if (isClosingWindow.value || !ensureConversationWriteAccess(false)) {
+    throw new Error('The target conversation is closing, read-only, or its write lease is unavailable.');
+  }
+  const message = {
+    text: typeof text === 'string' ? text.trim() : '',
+    filePaths: Array.isArray(filePaths) ? filePaths.filter((path) => typeof path === 'string' && path.trim()) : [],
+    source
+  };
+  if (!message.text && !message.filePaths.length) throw new Error('No text or valid attachments were provided.');
+  if (isAgentMessageBusy() || pendingAppendBuffer.value.length) {
+    const result = queueAgentToolMessage(message);
+    nextTick(() => { flushAppendBuffer(); });
+    return result;
+  }
+
+  // Reserve preparation before awaiting attachments; never use or clear the user's draft.
+  isPreparingSend.value = true;
+  try {
+    const { contentList } = await buildAgentToolContentList(message);
+    if (isClosingWindow.value || !ensureConversationWriteAccess(false)) {
+      throw new Error('The target conversation is closing, read-only, or its write lease is unavailable.');
+    }
+    if (loading.value || compacting.value || isMcpLoading.value || activeAssistantTurnMeta) {
+      // This message reserved the idle slot before later arrivals were queued.
+      return queueAgentToolMessage(message, true);
+    }
+    appendAgentToolContent(contentList);
+  } finally {
+    isPreparingSend.value = false;
+  }
+  askAI(true).catch((err) => console.error('Background generation error:', err));
+  return AGENT_MESSAGE_SENT;
+};
+
 const sendFile = async () => {
   let contentList = [];
   if (fileList.value.length === 0) return contentList;
@@ -5495,6 +6240,8 @@ const sendFile = async () => {
 
 
 const isApplyMcpRunning = ref(false);
+
+let activeApplyMcpPromise = null;
 const pendingApplyMcpRequest = ref(null);
 
 const requestApplyMcpTools = async (show_none = true, reason = 'unknown') => {
@@ -5503,20 +6250,37 @@ const requestApplyMcpTools = async (show_none = true, reason = 'unknown') => {
     reason: typeof reason === 'string' && reason ? reason : 'unknown'
   };
 
-  if (isApplyMcpRunning.value) {
+  if (isModelIterationConfigLocked.value) {
     return;
   }
 
-  isApplyMcpRunning.value = true;
-  try {
-    while (pendingApplyMcpRequest.value) {
-      const currentRequest = pendingApplyMcpRequest.value;
-      pendingApplyMcpRequest.value = null;
-      await applyMcpTools(currentRequest.show_none, currentRequest.reason);
-    }
-  } finally {
-    isApplyMcpRunning.value = false;
+  if (isApplyMcpRunning.value) {
+    return activeApplyMcpPromise;
   }
+
+  isApplyMcpRunning.value = true;
+  activeApplyMcpPromise = (async () => {
+    try {
+      while (pendingApplyMcpRequest.value) {
+        const currentRequest = pendingApplyMcpRequest.value;
+        pendingApplyMcpRequest.value = null;
+        await applyMcpTools(currentRequest.show_none, currentRequest.reason);
+      }
+    } finally {
+      isApplyMcpRunning.value = false;
+    }
+  })();
+  try {
+    return await activeApplyMcpPromise;
+  } finally {
+    activeApplyMcpPromise = null;
+  }
+};
+
+const handleApplyMcpDialog = async () => {
+  sessionMcpServerIds.value = [...tempSessionMcpServerIds.value];
+  isMcpDialogVisible.value = false;
+  await requestApplyMcpTools(true, 'dialog-apply');
 };
 
 async function applyMcpTools(show_none = true, reason = 'unknown') {
@@ -5859,7 +6623,7 @@ const applyTokenUsageToAssistantMessage = (chatShowIndex, tokenUsage) => {
 
 
 // --- 追加消息缓冲区：loading 期间发送的消息暂存于此，本轮结束后自动追加并续请求 ---
-const enqueueInputToBuffer = () => {
+const enqueueInputToBuffer = (notice = '正在生成，消息已加入缓冲区，将在本轮结束后自动发送') => {
   const text = prompt.value.trim();
   const files = Array.isArray(fileList.value) ? fileList.value.slice() : [];
   if (!text && files.length === 0) return;
@@ -5871,12 +6635,14 @@ const enqueueInputToBuffer = () => {
   });
   prompt.value = "";
   fileList.value = [];
-  showDismissibleMessage.info('正在生成，消息已加入缓冲区，将在本轮结束后自动发送');
+  scheduleAutoSave({ reason: 'append-buffer-enqueued', immediate: true });
+  showDismissibleMessage.info(notice);
 };
 
 const removeBufferedMessage = (index) => {
   if (index >= 0 && index < pendingAppendBuffer.value.length) {
     pendingAppendBuffer.value.splice(index, 1);
+    scheduleAutoSave({ reason: 'append-buffer-removed', immediate: true });
   }
 };
 
@@ -5893,52 +6659,95 @@ const appendCurrentInputToHistory = async () => {
   const contentForHistory = userContentList.length === 1 && userContentList[0].type === 'text'
     ? userContentList[0].text
     : userContentList;
-  appendFullHistory({ role: "user", content: contentForHistory });
-  chat_show.value.push({ id: messageIdCounter.value++, role: "user", content: userContentList, timestamp: userTimestamp });
-  scheduleAutoSave({ reason: 'user-message', immediate: true });
+  appendLinkedUserMessage({ historyContent: contentForHistory, uiContent: userContentList, timestamp: userTimestamp });
+  // Clear the consumed draft before taking the immediate snapshot, otherwise the same text is
+  // persisted both as a user message and as promptDraft and reappears after reopening the session.
   prompt.value = "";
+  scheduleAutoSave({ reason: 'user-message', immediate: true });
   return true;
 };
 
-const drainBufferIntoHistory = async () => {
-  if (pendingAppendBuffer.value.length === 0) return false;
+const drainBufferIntoHistory = async ({ toolBoundaryTurn = null } = {}) => {
+  const canDrain = () => !isClosingWindow.value && ensureConversationWriteAccess(false)
+    && !compacting.value && !isMcpLoading.value
+    && (toolBoundaryTurn
+      ? activeAssistantTurnMeta === toolBoundaryTurn && !toolBoundaryTurn.controller?.signal?.aborted
+      : !loading.value && !activeAssistantTurnMeta);
+  if (!canDrain() || pendingAppendBuffer.value.length === 0) return false;
   const items = pendingAppendBuffer.value.splice(0, pendingAppendBuffer.value.length);
   // 还原用户在缓冲期间可能输入但尚未发送的内容
   const savedPrompt = prompt.value;
   const savedFiles = Array.isArray(fileList.value) ? fileList.value.slice() : [];
   let appendedAny = false;
-  for (const item of items) {
-    if (item.kind === 'input') {
-      prompt.value = item.text || '';
-      fileList.value = Array.isArray(item.files) ? item.files : [];
-      isPreparingSend.value = true;
-      try {
-        const added = await appendCurrentInputToHistory();
-        if (added) appendedAny = true;
-      } finally {
-        isPreparingSend.value = false;
+  let consumed = 0;
+  let draftSwapped = false;
+  try {
+    for (const item of items) {
+      if (!canDrain()) break;
+      if (item.kind === 'agent') {
+        isPreparingSend.value = true;
+        try {
+          const { contentList } = await buildAgentToolContentList(item);
+          if (!canDrain()) break;
+          appendAgentToolContent(contentList);
+          appendedAny = true;
+        } finally {
+          isPreparingSend.value = false;
+        }
+      } else if (item.kind === 'input') {
+        draftSwapped = true;
+        prompt.value = item.text || '';
+        fileList.value = Array.isArray(item.files) ? item.files : [];
+        isPreparingSend.value = true;
+        try {
+          const added = await appendCurrentInputToHistory();
+          if (added) appendedAny = true;
+        } finally {
+          isPreparingSend.value = false;
+        }
       }
+      consumed++;
     }
+  } catch (error) {
+    showDismissibleMessage.error(`Buffered message was not sent: ${error?.message || 'Message preparation failed.'}`);
+  } finally {
+    // Keep failed/unconsumed messages ahead of arrivals received during attachment parsing.
+    pendingAppendBuffer.value.unshift(...items.slice(consumed));
+    if (draftSwapped) {
+      prompt.value = savedPrompt;
+      fileList.value = savedFiles;
+    }
+    scheduleAutoSave({ reason: 'append-buffer-drained', immediate: true });
+    if (prompt.value.trim() || fileList.value.length) scheduleInputDraftAutoSave('buffer-restored-draft');
   }
-  prompt.value = savedPrompt;
-  fileList.value = savedFiles;
   return appendedAny;
 };
 
 const flushAppendBuffer = async () => {
-  if (loading.value || isPreparingSend.value) return;
-  const appendedAny = await drainBufferIntoHistory();
-  if (appendedAny) {
-    await askAI(true);
+  // A buffered turn may begin only after the previous turn has fully released ownership.
+  // isMcpLoading is deliberately declared before this function.
+  if (isClosingWindow.value || !ensureConversationWriteAccess(false)) return;
+  if (isFlushingAppendBuffer || loading.value || isPreparingSend.value || compacting.value || isMcpLoading.value || activeAssistantTurnMeta) return;
+  isFlushingAppendBuffer = true;
+  let startedTurn = false;
+  try {
+    const appendedAny = await drainBufferIntoHistory();
+    if (appendedAny) {
+      startedTurn = true;
+      await askAI(true);
+    }
+  } finally {
+    isFlushingAppendBuffer = false;
+    // The turn finalizer cannot drain while this lock is held. Resume later arrivals now.
+    if (startedTurn && pendingAppendBuffer.value.length) nextTick(() => { flushAppendBuffer(); });
   }
 };
 
-watch(loading, (now, prev) => {
-  if (prev && !now) {
+watch([isMcpLoading, compacting, isPreparingSend], (now, prev) => {
+  if (!isFlushingAppendBuffer && prev.some((busy, index) => busy && !now[index])) {
     nextTick(() => { flushAppendBuffer(); });
   }
 });
-
 
 const resolveProviderByModelValue = (modelValue = '') => {
   const raw = String(modelValue || '');
@@ -6035,6 +6844,7 @@ const loadCompactConfigForCurrentModel = async ({
 const handleOpenCompactDialog = async () => {
   // 打开时读缓存；保留用户手动上下文长度，不强制 API 覆盖
   await loadCompactConfigForCurrentModel({ forceRefresh: false, preferManual: true });
+  await refreshPromptTokenBreakdown();
 };
 
 const handleSaveCompactConfig = async (patch = {}) => {
@@ -6095,6 +6905,7 @@ const handleRefreshCompactContext = async () => {
   try {
     // 用户明确点「重新检索」：允许 API 覆盖手动值
     await loadCompactConfigForCurrentModel({ forceRefresh: true, preferManual: false });
+    await refreshPromptTokenBreakdown();
     showDismissibleMessage.success('已重新检索模型上下文长度');
   } catch (error) {
     showDismissibleMessage.error(`检索失败: ${error?.message || error}`);
@@ -6318,10 +7129,13 @@ const toHistoryMessageFromUi = (message) => {
     };
   }
   if (message.role === 'user') {
-    return {
+    const next = {
       role: 'user',
       content: message.content
     };
+    if (message.origin === 'view_image' || message.origin === 'view_pdf') next.origin = message.origin;
+    if (message.sourceToolCallId) next.sourceToolCallId = message.sourceToolCallId;
+    return next;
   }
   if (message.role === 'assistant') {
     const next = {
@@ -6358,7 +7172,7 @@ const toRequestMessageFromFullHistory = (message = {}) => {
   }
   if (!['system', 'user', 'assistant', 'tool'].includes(message.role)) return null;
   const cloned = deepCloneSafe(message);
-  ['id', 'timestamp', 'aiName', 'voiceName', 'status', 'approvalStatus', 'result', 'canRestore', 'coveredCount'].forEach((key) => delete cloned[key]);
+  ['id', 'timestamp', 'aiName', 'voiceName', 'status', 'approvalStatus', 'result', 'canRestore', 'coveredCount', 'origin', 'sourceToolCallId', 'storageId', 'uiStorageId', 'storageOrdinal', 'uiStorageOrder'].forEach((key) => delete cloned[key]);
   return cloned;
 };
 
@@ -6384,6 +7198,61 @@ const projectFullHistoryToRequestHistory = (messages = fullHistory.value) => {
   }
   return out;
 };
+
+const reloadConversationWindowFromStore = async ({ activeOnly = true, pageSize = 200, expectedSnapshotId = '' } = {}) => {
+  const storage = currentConversationStorage.value;
+  if (!storage?.conversationId || !storage?.dirPath) return false;
+  const opened = await window.api.openConversation({ dirPath: storage.dirPath, reference: storage.conversationId, activeOnly, pageSize });
+  if (expectedSnapshotId) {
+    const restoredMarkers = (opened.sessionData?.fullHistory || []).filter((message) => message?.role === 'compaction');
+    const uiMarkers = (opened.sessionData?.chat_show || []).filter((message) => message?.role === 'compaction');
+    if (restoredMarkers[restoredMarkers.length - 1]?.snapshotId !== expectedSnapshotId || uiMarkers[uiMarkers.length - 1]?.snapshotId !== expectedSnapshotId) {
+      throw new Error('压缩检查点保存后校验失败，已保留内存中的压缩结果');
+    }
+  }
+  replaceFullHistory(opened.sessionData?.fullHistory || []);
+  chat_show.value = Array.isArray(opened.sessionData?.chat_show) ? opened.sessionData.chat_show : [];
+  syncHistoryFromFullHistory();
+  const paging = opened.sessionData?.conversationStorage || {};
+  currentConversationStorage.value = {
+    ...storage,
+    title: opened.descriptor?.title || storage.title,
+    revision: Number(opened.descriptor?.revision) || storage.revision,
+    isPaged: paging.isPaged === true,
+    loadedFromOrdinal: Number(paging.loadedFromOrdinal) || 0,
+    loadedFromUiOrder: Number(paging.loadedFromUiOrder) || 0,
+    pageSize: Number(paging.pageSize) || 0,
+    hasMore: paging.isPaged === true
+  };
+  return true;
+};
+
+const hydratePagedConversationForCompaction = async () => {
+  if (!currentConversationStorage.value?.isPaged) return false;
+  await reloadConversationWindowFromStore({ activeOnly: false, pageSize: 0 });
+  return true;
+};
+
+
+const buildRequestHistoryForCurrentConversation = async () => {
+  const storage = currentConversationStorage.value;
+  if (!storage?.isPaged || !storage?.conversationId || !storage?.dirPath) {
+    return projectFullHistoryToRequestHistory();
+  }
+  const result = await window.api.getConversationRequestMessages({
+    dirPath: storage.dirPath,
+    conversationId: storage.conversationId
+  });
+  const persisted = Array.isArray(result?.messages) ? result.messages : [];
+  const loadedFrom = Math.max(1, Number(storage.loadedFromOrdinal) || 1);
+  const prefix = persisted.filter((message) => message?.role !== 'system' && Number(message?.storageOrdinal) < loadedFrom);
+  return projectFullHistoryToRequestHistory([
+    ...fullHistory.value.filter((message) => message?.role === 'system'),
+    ...prefix,
+    ...fullHistory.value.filter((message) => message?.role !== 'system')
+  ]);
+};
+
 
 const syncHistoryFromFullHistory = () => { history.value = projectFullHistoryToRequestHistory(); };
 const appendFullHistory = (...messages) => {
@@ -6656,7 +7525,7 @@ const projectUiToFullHistoryForLegacyMigration = (messages = []) => {
 
 const estimateCompactHistoryTokens = async (messages = []) => {
   if (!window.api?.estimateCompactTokens) return 0;
-  const estimate = await window.api.estimateCompactTokens(messages);
+  const estimate = await window.api.estimateCompactTokens(messages, { modelInput: model.value });
   return Math.max(0, Number(estimate?.tokens) || 0);
 };
 
@@ -6667,7 +7536,7 @@ const estimateCompactHistoryTokens = async (messages = []) => {
  */
 const splitFullHistoryPrefixAndTail = async (
   messages = fullHistory.value,
-  { maxPrefixTokens = 0, keepRecentRounds = 0 } = {}
+  { maxPrefixTokens = 0, preferredMaxTokens = maxPrefixTokens, keepRecentRounds = 0 } = {}
 ) => {
   const list = Array.isArray(messages) ? messages : [];
   let windowStart = 0;
@@ -6684,78 +7553,40 @@ const splitFullHistoryPrefixAndTail = async (
 
   const systemMessages = list.filter((message) => message?.role === 'system');
   const windowMessages = list.slice(windowStart);
-  const userStartIndexes = [];
-  windowMessages.forEach((message, index) => {
-    // Cut only before a user message, keeping the previous user/assistant/tool round intact.
-    if (message?.role === 'user' && index > 0) userStartIndexes.push(index);
+  const dynamicOverheadTokens = await estimateCurrentDynamicRequestOverhead();
+  if (!window.api?.selectCompactionCut || windowMessages.length < 2 || !Number.isFinite(Number(maxPrefixTokens)) || maxPrefixTokens <= 0) {
+    return { insertIndex: list.length, prefix: [], tail: windowMessages, prefixTokens: 0, tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...windowMessages]) + dynamicOverheadTokens, maxPrefixTokens: Math.max(0, Number(maxPrefixTokens) || 0), tailStartUserOrdinal: 0, strategy: 'none' };
+  }
+
+  const selected = await window.api.selectCompactionCut({
+    systemMessages,
+    windowMessages,
+    thresholdTokens: Math.floor(Number(maxPrefixTokens)),
+    preferredMaxTokens: Math.floor(Math.max(Number(maxPrefixTokens), Number(preferredMaxTokens) || 0)),
+    keepRecentRounds,
+    fixedOverheadTokens: dynamicOverheadTokens,
+    modelInput: model.value
   });
-  if (userStartIndexes.length === 0 || !Number.isFinite(Number(maxPrefixTokens)) || maxPrefixTokens <= 0) {
-    return {
-      insertIndex: list.length,
-      prefix: [],
-      tail: windowMessages,
-      prefixTokens: 0,
-      tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...windowMessages]),
-      maxPrefixTokens: Math.max(0, Number(maxPrefixTokens) || 0),
-      tailStartUserOrdinal: 0
-    };
+  const cutIndex = Math.max(0, Math.min(windowMessages.length, Number(selected?.cutIndex) || 0));
+  if (!cutIndex) {
+    return { insertIndex: list.length, prefix: [], tail: windowMessages, prefixTokens: 0, tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...windowMessages]) + dynamicOverheadTokens, maxPrefixTokens: Math.floor(Number(maxPrefixTokens)), tailStartUserOrdinal: 0, strategy: selected?.strategy || 'none' };
   }
-
-  const budget = Math.floor(Number(maxPrefixTokens));
-  const estimatePrefixAt = async (cutIndex) => (
-    estimateCompactHistoryTokens([...systemMessages, ...windowMessages.slice(0, cutIndex)])
-  );
-
-  // Token totals are monotonic as complete message rounds are added, so binary-search the largest safe cut.
-  let low = 0;
-  let high = userStartIndexes.length - 1;
-  let bestCandidate = -1;
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    const candidate = userStartIndexes[middle];
-    const tokens = await estimatePrefixAt(candidate);
-    if (tokens <= budget) {
-      bestCandidate = middle;
-      low = middle + 1;
-    } else {
-      high = middle - 1;
-    }
-  }
-
-  if (bestCandidate < 0) {
-    return {
-      insertIndex: list.length,
-      prefix: [],
-      tail: windowMessages,
-      prefixTokens: 0,
-      tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...windowMessages]),
-      maxPrefixTokens: budget,
-      tailStartUserOrdinal: 0
-    };
-  }
-
-  const thresholdCutIndex = userStartIndexes[bestCandidate];
-  const requestedKeepRounds = Math.max(0, Math.floor(Number(keepRecentRounds) || 0));
-  // Move the threshold cut backwards by N complete user rounds to keep them verbatim.
-  const tailStartUserOrdinal = Math.max(0, bestCandidate - requestedKeepRounds);
-  let cutIndex = userStartIndexes[tailStartUserOrdinal] ?? thresholdCutIndex;
-
-  // Never summarize only an existing compaction marker: that would not reduce history.
-  const hasRealPrefixMessage = windowMessages
-    .slice(0, cutIndex)
-    .some((message) => message?.role && message.role !== 'system' && message.role !== 'compaction');
-  if (!hasRealPrefixMessage) cutIndex = thresholdCutIndex;
 
   const prefix = windowMessages.slice(0, cutIndex);
   const tail = windowMessages.slice(cutIndex);
+  const userStarts = windowMessages
+    .map((message, index) => (isUserAuthoredMessage(message) ? index : -1))
+    .filter((index) => index >= 0);
+  const tailStartUserOrdinal = Math.max(0, userStarts.findIndex((index) => index >= cutIndex));
   return {
     insertIndex: windowStart + cutIndex,
     prefix,
     tail,
-    prefixTokens: await estimateCompactHistoryTokens([...systemMessages, ...prefix]),
-    tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...tail]),
-    maxPrefixTokens: budget,
-    tailStartUserOrdinal: Math.max(0, userStartIndexes.indexOf(cutIndex))
+    prefixTokens: await estimateCompactHistoryTokens([...systemMessages, ...prefix]) + dynamicOverheadTokens,
+    tailTokens: await estimateCompactHistoryTokens([...systemMessages, ...tail]) + dynamicOverheadTokens,
+    maxPrefixTokens: Math.floor(Number(maxPrefixTokens)),
+    tailStartUserOrdinal,
+    strategy: selected?.strategy || 'safe_adaptive'
   };
 };
 
@@ -6766,6 +7597,9 @@ const getOutermostCompactionIndexIn = (list = []) => {
   }
   return -1;
 };
+
+// This computed intentionally depends only on list structure and message roles. Streaming updates
+// mutate the last message content, so Vue keeps this projection cached instead of re-scanning history.
 
 const renderedChatMessages = computed(() => {
   const messages = Array.isArray(chat_show.value) ? chat_show.value : [];
@@ -6924,18 +7758,98 @@ const markOutermostCanRestore = () => {
   });
 };
 
+const compactToolSchemaTokenCache = new Map();
+const estimateCurrentDynamicToolPrompt = async () => {
+  if (!window.api?.estimateCompactTokens) {
+    return { systemPromptTokens: 0, schemaTokens: 0, totalTokens: 0 };
+  }
+  const overheadMessages = [];
+  if (openaiFormattedTools.value.length > 0 || sessionSkillIds.value.length > 0) {
+    overheadMessages.push({ role: 'system', content: generateMcpSystemPrompt() });
+  }
+  let activeTools = [...openaiFormattedTools.value];
+  if (sessionSkillIds.value.length > 0 && currentConfig.value.skillPath) {
+    try {
+      const skillTool = await window.api.getSkillToolDefinition(currentConfig.value.skillPath, sessionSkillIds.value);
+      if (skillTool) activeTools.push(skillTool);
+    } catch (error) {
+      console.warn('[compact] skill tool token estimate skipped:', error);
+    }
+  }
+  let schemaTokens = 0;
+  if (activeTools.length > 0) {
+    const schemaText = JSON.stringify(normalizeToolsForRequest(activeTools));
+    if (compactToolSchemaTokenCache.has(schemaText)) {
+      schemaTokens = compactToolSchemaTokenCache.get(schemaText);
+    } else {
+      const estimate = await window.api.estimateCompactTokens([{ role: 'system', content: schemaText }], { modelInput: model.value });
+      schemaTokens = Math.max(0, Number(estimate?.tokens) || 0);
+      compactToolSchemaTokenCache.clear();
+      compactToolSchemaTokenCache.set(schemaText, schemaTokens);
+    }
+  }
+  const promptEstimate = overheadMessages.length
+    ? await window.api.estimateCompactTokens(overheadMessages, { modelInput: model.value })
+    : { tokens: 0 };
+  const systemPromptTokens = Math.max(0, Number(promptEstimate?.tokens) || 0);
+  return {
+    systemPromptTokens,
+    schemaTokens,
+    totalTokens: systemPromptTokens + schemaTokens
+  };
+};
+
+const estimateCurrentDynamicRequestOverhead = async () => (
+  (await estimateCurrentDynamicToolPrompt()).totalTokens
+);
+
+const refreshPromptTokenBreakdown = async () => {
+  promptTokenBreakdown.value = { ...promptTokenBreakdown.value, loading: true, error: '' };
+  try {
+    const requestMessages = await buildRequestHistoryForCurrentConversation();
+    const systemMessages = requestMessages.filter((message) => message?.role === 'system');
+    const conversationMessages = requestMessages.filter((message) => message?.role !== 'system');
+    const [systemEstimate, conversationEstimate, toolPrompt] = await Promise.all([
+      window.api.estimateCompactTokens(systemMessages, { modelInput: model.value }),
+      window.api.estimateCompactTokens(conversationMessages, { modelInput: model.value }),
+      estimateCurrentDynamicToolPrompt()
+    ]);
+    const systemTokens = Math.max(0, Number(systemEstimate?.tokens) || 0);
+    const conversationTokens = Math.max(0, Number(conversationEstimate?.tokens) || 0);
+    const toolTokens = Math.max(0, Number(toolPrompt?.totalTokens) || 0);
+    promptTokenBreakdown.value = {
+      loading: false,
+      error: '',
+      systemTokens,
+      conversationTokens,
+      toolTokens,
+      effectiveTokens: systemTokens + conversationTokens + toolTokens,
+      updatedAt: Date.now()
+    };
+  } catch (error) {
+    promptTokenBreakdown.value = {
+      ...promptTokenBreakdown.value,
+      loading: false,
+      error: error?.message || String(error)
+    };
+  }
+};
+
+
 const getCompactTokenSnapshot = async (messagesForAi = history.value) => {
   // 自动压缩只看本地估算：压缩后对 summary + 尾部原文重新 estimate，
   // 避免沿用压缩前 assistant.tokenUsage.total_tokens 导致立刻二次压缩。
   let localTokens = 0;
   if (window.api?.estimateCompactTokens) {
-    const estimate = await window.api.estimateCompactTokens(messagesForAi);
+    const estimate = await window.api.estimateCompactTokens(messagesForAi, { modelInput: model.value });
     localTokens = Math.max(0, Number(estimate?.tokens) || 0);
   }
+  const requestOverheadTokens = await estimateCurrentDynamicRequestOverhead();
   return {
     localTokens,
+    requestOverheadTokens,
     usageTotalTokens: 0,
-    activeTokens: localTokens
+    activeTokens: localTokens + requestOverheadTokens
   };
 };
 
@@ -6972,32 +7886,22 @@ const findAiWindowStartIndex = (list = []) => {
  * 在「AI 可见窗口」内切 prefix/tail。
  * UI 不删除 prefix，只在 prefix 后插入 summary。
  */
-const splitAiWindowPrefixAndTail = (messages = [], tailStartUserOrdinal = 0) => {
+// Map a protocol-safe full-history cut to the owning chat bubbles. Full history keeps
+// tool results as rows; chat_show keeps those results inside the assistant bubble.
+// Counting only renderable non-system/non-tool rows keeps user and AI-unit cuts identical.
+const splitChatShowPrefixAtFullCut = (messages = [], fullPrefix = []) => {
   const list = Array.isArray(messages) ? messages : [];
-  if (list.length === 0) {
-    return { windowStart: 0, insertIndex: 0, prefix: [], tail: [] };
-  }
-
+  if (list.length === 0) return { windowStart: 0, insertIndex: 0, prefix: [], tail: [] };
   const windowStart = findAiWindowStartIndex(list);
-  const windowMsgs = list.slice(windowStart);
-  const userStartIndexes = [];
-  windowMsgs.forEach((message, index) => {
-    if (message?.role === 'user' && index > 0) userStartIndexes.push(index);
-  });
-  if (userStartIndexes.length === 0) {
-    return { windowStart, insertIndex: list.length, prefix: [], tail: windowMsgs };
-  }
-
-  const safeOrdinal = Math.min(
-    Math.max(0, Math.floor(Number(tailStartUserOrdinal) || 0)),
-    userStartIndexes.length - 1
-  );
-  const cutInWindow = userStartIndexes[safeOrdinal];
+  const visiblePrefixCount = (Array.isArray(fullPrefix) ? fullPrefix : [])
+    .filter((message) => message?.role && message.role !== 'system' && message.role !== 'tool')
+    .length;
+  const insertIndex = Math.max(windowStart, Math.min(list.length, windowStart + visiblePrefixCount));
   return {
     windowStart,
-    insertIndex: windowStart + cutInWindow,
-    prefix: windowMsgs.slice(0, cutInWindow),
-    tail: windowMsgs.slice(cutInWindow)
+    insertIndex,
+    prefix: list.slice(windowStart, insertIndex),
+    tail: list.slice(insertIndex)
   };
 };
 
@@ -7078,7 +7982,54 @@ const handleRestoreCompact = async (payload = null) => {
     return;
   }
 
-  // UI 原文一直在，只需删除最外层 summary 标记
+  const storage = currentConversationStorage.value;
+  if (storage?.format === 'sqlite' && storage?.conversationId && storage?.dirPath) {
+    if (!ensureConversationWriteAccess(true)) return;
+    try {
+      const restored = await window.api.restoreConversationCompaction({
+        dirPath: storage.dirPath,
+        conversationId: storage.conversationId,
+        snapshotId: outermost.snapshotId || outermost.id,
+        expectedRevision: storage.revision,
+        holderInstanceId: conversationInstanceId,
+        leaseEpoch: conversationLease.value?.leaseEpoch,
+        pageSize: 200
+      });
+      const sessionData = restored?.sessionData || {};
+      const paging = sessionData.conversationStorage || {};
+      replaceFullHistory(Array.isArray(sessionData.fullHistory) ? sessionData.fullHistory : []);
+      chat_show.value = Array.isArray(sessionData.chat_show) ? sessionData.chat_show : [];
+      compactArchives.value = Array.isArray(sessionData.compactArchives)
+        ? sessionData.compactArchives
+        : compactArchives.value.filter((item) => item?.id !== (restored?.restoredSnapshotId || outermost.snapshotId));
+      currentConversationStorage.value = {
+        ...storage,
+        title: restored?.descriptor?.title || storage.title,
+        revision: Number(restored?.descriptor?.revision) || storage.revision,
+        isPaged: paging.isPaged === true,
+        loadedFromOrdinal: Number(paging.loadedFromOrdinal) || 0,
+        loadedFromUiOrder: Number(paging.loadedFromUiOrder) || 0,
+        pageSize: Number(paging.pageSize) || 0,
+        hasMore: paging.isPaged === true
+      };
+      markOutermostCanRestore();
+      syncHistoryFromFullHistory();
+      await nextTick();
+      scrollToBottom();
+      showDismissibleMessage.success('已还原最外层压缩');
+      return;
+    } catch (error) {
+      if (/conversation_(revision_conflict|write_lease_lost)/.test(String(error?.message || ''))) {
+        conversationReadOnly.value = true;
+        showDismissibleMessage.warning('会话编辑权已失效，当前窗口已切换为只读模式');
+        return;
+      }
+      showDismissibleMessage.error(`恢复压缩失败: ${error?.message || error}`);
+      return;
+    }
+  }
+
+  // Legacy JSON sessions keep the complete transcript in memory, so removing the marker is sufficient.
   chat_show.value = [
     ...chat_show.value.slice(0, outermostIndex),
     ...chat_show.value.slice(outermostIndex + 1)
@@ -7099,6 +8050,10 @@ const runConversationCompact = async ({
   allowDuringLoading = false,
   quiet = false
 } = {}) => {
+  let hydratedPagedConversation = false;
+  let hasUnpersistedCompaction = false;
+  let expectedSnapshotId = '';
+
   if (compacting.value) return false;
   if (loading.value && !allowDuringLoading) {
     if (!quiet) showDismissibleMessage.warning('请等待当前回复完成后再压缩');
@@ -7113,11 +8068,14 @@ const runConversationCompact = async ({
     return false;
   }
 
-  // Full API history is the compression source; UI is only updated after summary succeeds.
+  // Full API history is the compression source; paged DB sessions hydrate only for the compact transaction.
+  hydratedPagedConversation = await hydratePagedConversationForCompaction();
   rehydrateHistoryToolsIfNeeded();
   syncHistoryFromFullHistory();
 
   compacting.value = true;
+
+  syncAutoCloseOnBlurListener();
   compactProgress.value = { percent: 2, message: '准备级联压缩…', stage: 'prepare' };
   compactAbortController = new AbortController();
   // 发送区仅 loading 时用户不易感知原因；气泡提示当前在做会话压缩
@@ -7153,20 +8111,18 @@ const runConversationCompact = async ({
         break;
       }
 
-      const maxPrefixTokens = Math.floor(
-        Number(compactConfig.value.contextLength || 0)
-        * Number(compactConfig.value.triggerRatio || 0)
-      );
+      const contextLength = Math.max(0, Number(compactConfig.value.contextLength) || 0);
+      const triggerRatio = Math.min(0.99, Math.max(0.1, Number(compactConfig.value.triggerRatio) || 0));
+      const maxPrefixTokens = Math.floor(contextLength * triggerRatio);
+      // Prefer safe boundaries in the first half of the remaining window: 80% → 80~90%, 90% → 90~95%.
+      const preferredMaxTokens = Math.floor(contextLength * (triggerRatio + ((1 - triggerRatio) * 0.5)));
       const fullSplit = await splitFullHistoryPrefixAndTail(fullHistory.value, {
         maxPrefixTokens,
+        preferredMaxTokens,
         keepRecentRounds: compactConfig.value.keepRecentRounds
       });
-      const {
-        insertIndex: fullInsertIndex,
-        prefix,
-        tailStartUserOrdinal
-      } = fullSplit;
-      const uiSplit = splitAiWindowPrefixAndTail(chat_show.value, tailStartUserOrdinal);
+      const { insertIndex: fullInsertIndex, prefix } = fullSplit;
+      const uiSplit = splitChatShowPrefixAtFullCut(chat_show.value, prefix);
       if (!prefix.length) {
         if (manual && steps === 1 && !quiet) {
           showDismissibleMessage.info('可压缩前缀不足，已跳过');
@@ -7218,6 +8174,8 @@ const runConversationCompact = async ({
       };
       // UI keeps the original messages; fullHistory receives the checkpoint at the same logical cut.
       applyCascadeCompactStep(marker, uiSplit.insertIndex, uiSplit.prefix, fullInsertIndex);
+      hasUnpersistedCompaction = true;
+      expectedSnapshotId = fullHistory.value[fullInsertIndex]?.snapshotId || '';
       didAny = true;
 
       if (result.modelConfig) {
@@ -7246,7 +8204,17 @@ const runConversationCompact = async ({
     }
 
     autoCompactSuppressedForTurn.value = false;
-    scheduleAutoSave({ reason: 'conversation-compacted', immediate: true });
+    // The database is authoritative after a cascade. Await one full snapshot then reload
+    // the active window so a multi-layer UI projection can never diverge until reopening.
+    const saved = await executeAutoSaveRequest({ reason: 'conversation-compacted', force: true, version: ++sessionMutationVersion });
+    if (saved !== true) {
+      throw new Error('压缩结果保存失败，已保留内存中的压缩结果，请重试保存');
+    }
+    if (!expectedSnapshotId) throw new Error('压缩检查点缺失，无法确认压缩结果');
+    const restored = await reloadConversationWindowFromStore({ activeOnly: true, pageSize: 200, expectedSnapshotId });
+    if (restored !== true) throw new Error('压缩结果重载失败');
+    hasUnpersistedCompaction = false;
+    await refreshPromptTokenBreakdown();
     if (!quiet) {
       showDismissibleMessage.success(manual ? `手动级联压缩完成（${steps} 步）` : `自动级联压缩完成（${steps} 步）`);
     }
@@ -7262,14 +8230,19 @@ const runConversationCompact = async ({
     if (!quiet) showDismissibleMessage.error(`压缩失败: ${error?.message || error}`);
     return false;
   } finally {
+    if (hydratedPagedConversation && !hasUnpersistedCompaction && currentConversationStorage.value?.isPaged === false) {
+      await reloadConversationWindowFromStore({ activeOnly: true, pageSize: 200 }).catch(() => {});
+    }
     compacting.value = false;
+
+    syncAutoCloseOnBlurListener();
     compactAbortController = null;
     compactProgress.value = { percent: 0, message: '', stage: '' };
   }
 };
 
 // 工具循环内：tool 结果写回后、下一轮 AI 请求前检测并压缩
-const maybeAutoCompactBeforeNextRequest = async ({ reason = 'pre-request' } = {}) => {
+const maybeAutoCompactBeforeNextRequest = async ({ reason = 'pre-request', requestMessages = null } = {}) => {
   if (autoCompactSuppressedForTurn.value) {
     autoCompactSuppressedForTurn.value = false;
     return false;
@@ -7277,9 +8250,13 @@ const maybeAutoCompactBeforeNextRequest = async ({ reason = 'pre-request' } = {}
   if (compacting.value) return false;
   if (compactConfig.value.autoCompactEnabled === false) return false;
   try {
-    rehydrateHistoryToolsIfNeeded();
-    // 不在这里 sync 掉内存 history 的 tool 细节；rehydrate 已保证 tool 完整
-    const need = await shouldCompactNow(history.value);
+    // The first user request already has an immutable, canonical request DTO. Tool-loop
+    // continuations still rehydrate before projection because their tool result may be new.
+    if (!Array.isArray(requestMessages)) rehydrateHistoryToolsIfNeeded();
+    const messagesForCheck = Array.isArray(requestMessages)
+      ? requestMessages
+      : await buildRequestHistoryForCurrentConversation();
+    const need = await shouldCompactNow(messagesForCheck);
     if (!need) return false;
     const ok = await runConversationCompact({
       manual: false,
@@ -7309,7 +8286,7 @@ const maybeAutoCompactAfterTurn = async () => {
   if (compactConfig.value.autoCompactEnabled === false) return;
   try {
     rehydrateHistoryToolsIfNeeded();
-    const need = await shouldCompactNow(history.value);
+    const need = await shouldCompactNow(await buildRequestHistoryForCurrentConversation());
     if (need) {
       await runConversationCompact({
         manual: false,
@@ -7325,7 +8302,61 @@ const maybeAutoCompactAfterTurn = async () => {
 
 
 
-// 单条 tool 结果进入 history 的硬顶，防止第三方 MCP / 意外大输出瞬间撑爆上下文
+// view_image results become regular, visible user media messages. This makes image context
+// durable across reask, save/restore, exports, and model-protocol switches.
+const getViewImagePayload = prepareViewImagePayload;
+
+const getViewPdfPayload = (result) => {
+  if (result?.__anywhereToolResult !== 'pdf') return null;
+  const encodedBytes = result?.pdf?.encodedBytes;
+  const fileName = typeof result?.pdf?.fileName === 'string' && result.pdf.fileName.trim()
+    ? result.pdf.fileName.trim()
+    : 'document.pdf';
+  if (result?.pdf?.mimeType !== 'application/pdf') return null;
+  if (typeof encodedBytes !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedBytes)) return null;
+  return {
+    dataUrl: `data:application/pdf;base64,${encodedBytes}`,
+    fileName,
+    pageCount: Math.max(1, Number(result?.pdf?.pageCount) || 1),
+    displayText: typeof result?.display?.text === 'string' ? result.display.text : 'Local PDF loaded as complete document context.'
+  };
+};
+
+
+const isToolMediaMessage = (message = {}) => (
+  message?.role === 'user' && (message?.origin === 'view_image' || message?.origin === 'view_pdf')
+);
+const isViewImageMessage = (message = {}) => message?.role === 'user' && message?.origin === 'view_image';
+const isUserAuthoredMessage = (message = {}) => message?.role === 'user' && !isToolMediaMessage(message);
+
+const createViewImageMessage = (toolCallId, payload) => ({
+  id: messageIdCounter.value++,
+  storageId: createConversationStorageId(),
+  role: 'user',
+  origin: 'view_image',
+  sourceToolCallId: toolCallId,
+  timestamp: new Date().toLocaleString('sv-SE'),
+  content: [
+    { type: 'text', text: 'The image returned by the view_image tool is attached below. Use it as visual context to continue the task.' },
+    { type: 'image_url', image_url: { url: payload.dataUrl, detail: payload.detail } }
+  ]
+});
+
+
+const createViewPdfMessage = (toolCallId, payload) => ({
+  id: messageIdCounter.value++,
+  storageId: createConversationStorageId(),
+  role: 'user',
+  origin: 'view_pdf',
+  sourceToolCallId: toolCallId,
+  timestamp: new Date().toLocaleString('sv-SE'),
+  content: [
+    { type: 'text', text: 'The PDF returned by the view_pdf tool is attached below. Use the complete document as context to continue the task.' },
+    { type: 'file', file: { filename: payload.fileName, file_data: payload.dataUrl, tokenEstimate: { pageCount: payload.pageCount } } }
+  ]
+});
+
+
 const MAX_TOOL_RESULT_CHARS = 48 * 1000;
 
 const truncateToolResultForHistory = (text = '') => {
@@ -7338,6 +8369,7 @@ const truncateToolResultForHistory = (text = '') => {
 
 
 const askAI = async (forceSend = false) => {
+  if (isClosingWindow.value || !ensureConversationWriteAccess(true)) return;
   if (loading.value || isPreparingSend.value || compacting.value) return;
   if (isMcpLoading.value) {
     showDismissibleMessage.info('正在加载工具，请稍后再试...');
@@ -7356,13 +8388,18 @@ const askAI = async (forceSend = false) => {
     if (!added) return;
   }
 
-  // 用户消息写入后、进入 AI 请求前：若已超阈值，先压缩再开跑
-  // 覆盖 ask / reask / 强制发送等同一入口，避免直接超上下文请求。
+  // User-message preflight reads the SQLite request window once. If no compaction runs,
+  // that same DTO is reused by the first model iteration below.
+  let firstRequestMessages = null;
   try {
-    await maybeAutoCompactBeforeNextRequest({ reason: 'before-askAI' });
+    firstRequestMessages = await buildRequestHistoryForCurrentConversation();
+    const compacted = await maybeAutoCompactBeforeNextRequest({ reason: 'before-askAI', requestMessages: firstRequestMessages });
+    if (compacted) firstRequestMessages = null;
   } catch (error) {
+    firstRequestMessages = null;
     console.warn('[compact] before-askAI compact failed:', error);
   }
+  if (isClosingWindow.value) return;
 
   // --- 2. 初始化 AI 回合 ---
   loading.value = true;
@@ -7372,12 +8409,16 @@ const askAI = async (forceSend = false) => {
   signalController.value = new AbortController();
   const requestAbortController = signalController.value;
   const requestSignal = requestAbortController.signal;
+  let resolveTurnSettlement;
+  const turnSettlementPromise = new Promise((resolve) => { resolveTurnSettlement = resolve; });
   const turnMeta = {
     id: turnId,
     controller: requestAbortController,
     assistantMessageId: null,
     cancellationRecorded: false,
-    cancelledByUser: false
+    cancelledByUser: false,
+    settlementPromise: turnSettlementPromise,
+    resolveSettlement: resolveTurnSettlement
   };
   activeAssistantTurnMeta = turnMeta;
   const isCurrentAssistantTurn = () => activeAssistantTurnId.value === turnId && activeAssistantTurnMeta === turnMeta;
@@ -7388,7 +8429,7 @@ const askAI = async (forceSend = false) => {
     }
   };
 
-  const shouldTriggerAutoNaming = !defaultConversationName.value && chat_show.value.filter(msg => msg.role === 'user').length === 1;
+  const shouldTriggerAutoNaming = !defaultConversationName.value && chat_show.value.filter(isUserAuthoredMessage).length === 1;
   if (shouldTriggerAutoNaming) {
     triggerAutoNamingForFirstUserMessage({ force: false, requestSignal }).catch((error) => {
       if (error?.name !== 'AbortError') {
@@ -7406,8 +8447,6 @@ const askAI = async (forceSend = false) => {
   }
 
   const currentPromptConfig = currentConfig.value.prompts[CODE.value];
-  const isVoiceReply = !!selectedVoice.value;
-  let useStream = (currentPromptConfig?.stream ?? true) && !isVoiceReply;
   let tool_calls_count = 0;
 
   // 获取当前服务商的 API 类型
@@ -7415,14 +8454,34 @@ const askAI = async (forceSend = false) => {
   const apiType = currentProviderConfig?.apiType || 'chat_completions';
 
   let currentAssistantChatShowIndex = -1;
+  let cancelPendingStreamingDisplay = null;
 
   try {
     // --- 3. 开始工具调用循环 ---
     while (!isTurnAborted()) {
+
+      if (isApplyMcpRunning.value && activeApplyMcpPromise) {
+        await activeApplyMcpPromise;
+        throwIfTurnAborted();
+      }
+      if (pendingApplyMcpRequest.value) {
+        await requestApplyMcpTools(false, 'before-next-model-iteration');
+        throwIfTurnAborted();
+      }
+      const iterationReasoningEffort = tempReasoningEffort.value;
+      const iterationVoice = selectedVoice.value;
+      const iterationSkillIds = [...sessionSkillIds.value];
+      const isVoiceReply = !!iterationVoice;
+      let useStream = (currentPromptConfig?.stream ?? true) && !isVoiceReply;
+      isModelIterationConfigLocked.value = true;
       // chatInputRef.value?.focus({ cursor: 'end' });
 
       // --- 为本次请求创建临时消息列表 ---
-      let messagesForThisRequest = JSON.parse(JSON.stringify(history.value));
+      // The first turn reuses the preflight DTO; tool continuations must rehydrate fresh history.
+      const reusableRequestMessages = firstRequestMessages;
+      firstRequestMessages = null;
+      if (!reusableRequestMessages) rehydrateHistoryToolsIfNeeded();
+      let messagesForThisRequest = reusableRequestMessages || await buildRequestHistoryForCurrentConversation();
 
       messagesForThisRequest = messagesForThisRequest.filter(msg => {
         if (msg.role === 'system' && (!msg.content || msg.content.trim() === '')) {
@@ -7431,7 +8490,7 @@ const askAI = async (forceSend = false) => {
         return true;
       });
 
-      ensureAssistantReasoningContentForThinkingMode(messagesForThisRequest, tempReasoningEffort.value);
+      ensureAssistantReasoningContentForThinkingMode(messagesForThisRequest, iterationReasoningEffort);
 
       messagesForThisRequest.forEach(msg => {
         if (Array.isArray(msg.content)) {
@@ -7479,7 +8538,7 @@ const askAI = async (forceSend = false) => {
 
       // 准备 System Prompt 和 MCP 规则
       let mcpSystemPromptStr = "";
-      if (openaiFormattedTools.value.length > 0 || sessionSkillIds.value.length > 0) {
+      if (openaiFormattedTools.value.length > 0 || iterationSkillIds.length > 0) {
         mcpSystemPromptStr = generateMcpSystemPrompt();
         const systemMessageIndex = messagesForThisRequest.findIndex(m => m.role === 'system');
         if (systemMessageIndex !== -1) {
@@ -7505,15 +8564,15 @@ const askAI = async (forceSend = false) => {
       };
 
       if (currentPromptConfig?.isTemperature) requestParams.temperature = currentPromptConfig.temperature;
-      if (tempReasoningEffort.value && tempReasoningEffort.value !== 'default') requestParams.reasoning_effort = tempReasoningEffort.value;
+      if (iterationReasoningEffort && iterationReasoningEffort !== 'default') requestParams.reasoning_effort = iterationReasoningEffort;
 
       // --- 构建工具列表 (MCP + Skill) ---
       let activeTools = [...openaiFormattedTools.value];
 
-      if (sessionSkillIds.value.length > 0 && currentConfig.value.skillPath) {
+      if (iterationSkillIds.length > 0 && currentConfig.value.skillPath) {
         try {
           throwIfTurnAborted();
-          const skillToolDef = await window.api.getSkillToolDefinition(currentConfig.value.skillPath, sessionSkillIds.value);
+          const skillToolDef = await window.api.getSkillToolDefinition(currentConfig.value.skillPath, iterationSkillIds);
           throwIfTurnAborted();
           if (skillToolDef) {
             activeTools.push(skillToolDef);
@@ -7537,11 +8596,13 @@ const askAI = async (forceSend = false) => {
 
       throwIfTurnAborted();
       const assistantMessageId = messageIdCounter.value++;
+      const assistantStorageId = createConversationStorageId();
       chat_show.value.push({
         id: assistantMessageId,
+        storageId: assistantStorageId,
         role: "assistant", content: [], reasoning_content: "", status: "",
         aiName: modelMap.value[model.value] || model.value.split('|')[1],
-        voiceName: selectedVoice.value, tool_calls: [],
+        voiceName: iterationVoice, tool_calls: [],
         startTime: Date.now()
       });
       turnMeta.assistantMessageId = assistantMessageId;
@@ -7554,7 +8615,21 @@ const askAI = async (forceSend = false) => {
 
       if (useStream) {
         // --- 流式处理 ---
-        const stream = await window.api.createChatCompletion(requestParams);
+        const stream = createNetworkRetryingStream(
+          () => window.api.createChatCompletion(requestParams),
+          {
+            maxRetries: MAX_AUTOMATIC_NETWORK_RETRIES,
+            signal: requestSignal,
+            isMeaningfulChunk: hasMeaningfulAssistantStreamOutput,
+            onRetry: ({ retryAttempt, maxRetries }) => {
+              const bubble = chat_show.value[currentAssistantChatShowIndex];
+              if (bubble && !isTurnAborted()) {
+                bubble.status = 'retrying';
+                bubble.retryMessage = `网络异常，正在自动重试（${retryAttempt}/${maxRetries}）`;
+              }
+            }
+          }
+        );
         throwIfTurnAborted();
 
         let aggregatedReasoningContent = "";
@@ -7564,6 +8639,7 @@ const askAI = async (forceSend = false) => {
         let aggregatedExtraContent = null;
         let aggregatedUsage = null;
         let lastUpdateTime = Date.now();
+        let streamingDisplayRafId = null;
 
         const responsesItemIdToIndexMap = new Map();
 
@@ -7583,8 +8659,26 @@ const askAI = async (forceSend = false) => {
           syncStickyScrollAfterRender();
         };
 
+        // Receive every chunk immediately, but merge expensive Vue/Markdown/layout work into one frame.
+        const cancelScheduledStreamingDisplay = () => {
+          if (streamingDisplayRafId !== null) cancelAnimationFrame(streamingDisplayRafId);
+          streamingDisplayRafId = null;
+        };
+        cancelPendingStreamingDisplay = cancelScheduledStreamingDisplay;
+        const scheduleStreamingDisplay = () => {
+          if (streamingDisplayRafId !== null) return;
+          streamingDisplayRafId = requestAnimationFrame(() => {
+            streamingDisplayRafId = null;
+            flushStreamingDisplay();
+          });
+        };
+
 
         for await (const part of stream) {
+          if (chat_show.value[currentAssistantChatShowIndex]?.status === 'retrying' && hasMeaningfulAssistantStreamOutput(part)) {
+            chat_show.value[currentAssistantChatShowIndex].status = '';
+            delete chat_show.value[currentAssistantChatShowIndex].retryMessage;
+          }
           if (isTurnAborted()) {
             break;
           }
@@ -7698,16 +8792,18 @@ const askAI = async (forceSend = false) => {
           }
 
           if (Date.now() - lastUpdateTime > throttleDelay) {
-            flushStreamingDisplay();
+            scheduleStreamingDisplay();
           }
         }
 
         if (isTurnAborted()) {
+          cancelScheduledStreamingDisplay();
           if (isCurrentAssistantTurn()) {
             flushStreamingDisplay(true);
           }
           throw createAbortError();
         }
+        cancelScheduledStreamingDisplay();
         flushStreamingDisplay(true);
 
         let finalContentForHistory = null;
@@ -7722,7 +8818,7 @@ const askAI = async (forceSend = false) => {
         responseMessage = {
           role: 'assistant',
           content: finalContentForHistory,
-          reasoning_content: aggregatedReasoningContent || (shouldBackfillAssistantReasoningContent(tempReasoningEffort.value) ? '' : null),
+          reasoning_content: aggregatedReasoningContent || (shouldBackfillAssistantReasoningContent(iterationReasoningEffort) ? '' : null),
           extra_content: aggregatedExtraContent
         };
 
@@ -7734,7 +8830,20 @@ const askAI = async (forceSend = false) => {
         }
       } else {
         // --- 非流式处理 ---
-        const response = await window.api.createChatCompletion(requestParams);
+        const response = await runWithNetworkRetries(
+          () => window.api.createChatCompletion(requestParams),
+          {
+            maxRetries: MAX_AUTOMATIC_NETWORK_RETRIES,
+            signal: requestSignal,
+            onRetry: ({ retryAttempt, maxRetries }) => {
+              const bubble = chat_show.value[currentAssistantChatShowIndex];
+              if (bubble && !isTurnAborted()) {
+                bubble.status = 'retrying';
+                bubble.retryMessage = `网络异常，正在自动重试（${retryAttempt}/${maxRetries}）`;
+              }
+            }
+          }
+        );
         throwIfTurnAborted();
 
         if (apiType === 'responses' || apiType === 'codex') {
@@ -7778,7 +8887,7 @@ const askAI = async (forceSend = false) => {
           responseMessage = {
             role: 'assistant',
             content: contentText || null,
-            reasoning_content: reasoningText || (shouldBackfillAssistantReasoningContent(tempReasoningEffort.value) ? '' : null),
+            reasoning_content: reasoningText || (shouldBackfillAssistantReasoningContent(iterationReasoningEffort) ? '' : null),
             tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
             tokenUsage: normalizeAssistantTokenUsage(response.usage)
           };
@@ -7805,16 +8914,20 @@ const askAI = async (forceSend = false) => {
         });
       }
 
-      ensureAssistantReasoningContentForThinkingMode([responseMessage], tempReasoningEffort.value);
+      ensureAssistantReasoningContentForThinkingMode([responseMessage], iterationReasoningEffort);
       if (!responseMessage.tokenUsage) {
         delete responseMessage.tokenUsage;
       }
 
+      responseMessage.storageId = chat_show.value[currentAssistantChatShowIndex]?.storageId || assistantStorageId;
       appendFullHistory(responseMessage);
+
       throwIfTurnAborted();
 
       // --- 更新 UI 气泡 ---
       const currentBubble = chat_show.value[currentAssistantChatShowIndex];
+      delete currentBubble.retryMessage;
+      if (currentBubble.status === 'retrying') currentBubble.status = '';
       applyTokenUsageToAssistantMessage(currentAssistantChatShowIndex, responseMessage.tokenUsage);
 
       // 更新正文
@@ -7846,6 +8959,9 @@ const askAI = async (forceSend = false) => {
         await nextTick();
         throwIfTurnAborted();
 
+        // Tool-generated images are stored as visible, durable user media messages after
+        // their matching text tool outputs. Keep an ID map because calls may execute in parallel.
+        const toolMediaMessagesByToolCallId = new Map();
         // 工具调用执行逻辑
         const toolMessages = await Promise.all(
           responseMessage.tool_calls.map(async (toolCall) => {
@@ -7970,7 +9086,18 @@ const askAI = async (forceSend = false) => {
                   withConversationOwnerContext(executionContext)
                 );
 
-                toolContent = formatToolResult(result);
+                const imagePayload = await getViewImagePayload(result, toolCallControllers.value.get(toolCall.id)?.signal || requestSignal);
+                throwIfTurnAborted();
+                const pdfPayload = getViewPdfPayload(result);
+                if (imagePayload) {
+                  toolMediaMessagesByToolCallId.set(toolCall.id, createViewImageMessage(toolCall.id, imagePayload));
+                  toolContent = imagePayload.displayText;
+                } else if (pdfPayload) {
+                  toolMediaMessagesByToolCallId.set(toolCall.id, createViewPdfMessage(toolCall.id, pdfPayload));
+                  toolContent = pdfPayload.displayText;
+                } else {
+                  toolContent = formatToolResult(result);
+                }
                 throwIfTurnAborted();
 
                 if (uiToolCall) uiToolCall.result = toolContent;
@@ -8016,12 +9143,22 @@ const askAI = async (forceSend = false) => {
             }
           });
         }
-        appendFullHistory(...safeToolMessages);
+        const toolMediaMessages = responseMessage.tool_calls
+          .map((toolCall) => toolMediaMessagesByToolCallId.get(toolCall.id))
+          .filter(Boolean);
+        // Preserve strict tool-call/result adjacency first; visible image/PDF messages follow as
+        // ordinary user multimodal context and are therefore durable for reask and restore.
+        appendFullHistory(...safeToolMessages, ...toolMediaMessages);
+        if (toolMediaMessages.length > 0) {
+          chat_show.value.push(...toolMediaMessages.map((message) => deepCloneSafe(message)));
+        }
         // 工具调用完成本质也会向 AI 续发请求，此处保存一次
         scheduleAutoSave({ reason: 'tool-calls-completed', immediate: true });
+
+        isModelIterationConfigLocked.value = false;
         // 工具调用完成后，把缓冲区消息插入历史，使下一轮请求即可纳入
         throwIfTurnAborted();
-        await drainBufferIntoHistory();
+        await drainBufferIntoHistory({ toolBoundaryTurn: turnMeta });
         throwIfTurnAborted();
 
         // 关键：tool 结果与缓冲消息写回后、进入下一轮 AI 请求前做上下文检测。
@@ -8029,6 +9166,7 @@ const askAI = async (forceSend = false) => {
         await maybeAutoCompactBeforeNextRequest({ reason: 'after-tool-results' });
         throwIfTurnAborted();
       } else {
+        isModelIterationConfigLocked.value = false;
         // EdgeTTS: 收到文本回复后，单独调用 EdgeTTS 生成语音
         if (isVoiceReply && responseMessage.content) {
           try {
@@ -8084,6 +9222,9 @@ const askAI = async (forceSend = false) => {
       }
     }
   } catch (error) {
+    // A queued frame must never overwrite the cancellation/error terminal state.
+    cancelPendingStreamingDisplay?.();
+    cancelPendingStreamingDisplay = null;
     const aborted = isAbortError(error);
     const staleTurn = !isCurrentAssistantTurn();
     if (staleTurn) {
@@ -8101,11 +9242,13 @@ const askAI = async (forceSend = false) => {
     const errorBubbleIndex = currentAssistantChatShowIndex > -1 ? currentAssistantChatShowIndex : chat_show.value.length;
     if (currentAssistantChatShowIndex === -1) {
       chat_show.value.push({
-        id: messageIdCounter.value++, role: "assistant", content: [],
+        id: messageIdCounter.value++, storageId: createConversationStorageId(), role: "assistant", content: [],
         aiName: modelMap.value[model.value] || model.value.split('|')[1], voiceName: selectedVoice.value
       });
     }
     const currentBubble = chat_show.value[errorBubbleIndex];
+    currentBubble.storageId = currentBubble.storageId || createConversationStorageId();
+    delete currentBubble.retryMessage;
 
     if (aborted) {
       finalizeCancelledAssistantTurn(turnMeta);
@@ -8122,6 +9265,7 @@ const askAI = async (forceSend = false) => {
 
       appendFullHistory({
         role: 'assistant',
+        storageId: currentBubble.storageId || createConversationStorageId(),
         content: finalContent,
         reasoning_content: finalReasoningContent || null
       });
@@ -8129,79 +9273,96 @@ const askAI = async (forceSend = false) => {
     scheduleAutoSave({ reason: aborted ? 'assistant-cancelled-error' : 'assistant-error', immediate: true });
 
   } finally {
-    const stillOwnsTurn = activeAssistantTurnMeta === turnMeta;
-    const stillOwnsSignal = signalController.value === requestAbortController;
-    if (stillOwnsTurn || stillOwnsSignal) {
-      loading.value = false;
-      syncAutoCloseOnBlurListener();
-    }
-    if (stillOwnsSignal) {
-      signalController.value = null;
-    }
-    if (currentAssistantChatShowIndex > -1 && !turnMeta.cancellationRecorded) {
-      const endTime = Date.now();
-      chat_show.value[currentAssistantChatShowIndex].endTime = endTime;
-      chat_show.value[currentAssistantChatShowIndex].completedTimestamp = new Date().toLocaleString('sv-SE');
-    }
-    await nextTick();
-    focusChatInputIfSafe({ cursor: 'end' });
+    try {
+      cancelPendingStreamingDisplay?.();
 
-    if (currentTaskConfig.value) {
-      let savedFileName = '未保存';
-      try {
-        if (currentTaskConfig.value.autoSave && currentConfig.value.webdav?.localChatPath) {
-          // 构造文件名：任务名-时间
-          const timeStr = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/[\/ :]/g, '-').replace(/,/g, '');
-          defaultConversationName.value = `定时任务-${currentTaskConfig.value.name}-${timeStr}`;
-          const sessionData = getSessionDataAsObject();
-          const jsonString = JSON.stringify(sessionData, null, 2);
+      isModelIterationConfigLocked.value = false;
+      if (pendingApplyMcpRequest.value && !isApplyMcpRunning.value) {
+        await requestApplyMcpTools(false, 'assistant-turn-finalized');
+      }
+      cancelPendingStreamingDisplay = null;
+      const stillOwnsTurn = activeAssistantTurnMeta === turnMeta;
+      const stillOwnsSignal = signalController.value === requestAbortController;
+      if (stillOwnsSignal) {
+        signalController.value = null;
+      }
+      if (currentAssistantChatShowIndex > -1 && !turnMeta.cancellationRecorded) {
+        const endTime = Date.now();
+        chat_show.value[currentAssistantChatShowIndex].endTime = endTime;
+        chat_show.value[currentAssistantChatShowIndex].completedTimestamp = new Date().toLocaleString('sv-SE');
+      }
+      await nextTick();
+      focusChatInputIfSafe({ cursor: 'end' });
 
-          const separator = currentOS.value === 'win' ? '\\' : '/';
-          const filePath = `${currentConfig.value.webdav.localChatPath}${separator}${defaultConversationName.value}.json`;
-
-          await window.api.writeLocalFile(filePath, jsonString);
-          savedFileName = `${defaultConversationName.value}.json`;
-
-          try {
-            const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(currentConfig.value.webdav.localChatPath));
+      if (currentTaskConfig.value) {
+        let savedFileName = '未保存';
+        let savedConversationId = '';
+        try {
+          if (currentTaskConfig.value.autoSave && currentConfig.value.webdav?.localChatPath) {
+            const timeStr = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/[\/ :]/g, '-').replace(/,/g, '');
+            defaultConversationName.value = `定时任务-${currentTaskConfig.value.name}-${timeStr}`;
+            const dirPath = currentConfig.value.webdav.localChatPath;
+            const localProjects = normalizeWindowProjects(await window.api.readLocalProjects(dirPath));
             const taskProjectId = typeof currentTaskConfig.value.autoSaveProjectId === 'string' ? currentTaskConfig.value.autoSaveProjectId : '';
             const projectName = localProjects.projects.find((p) => p.id === taskProjectId)?.name || '';
-            await reassignLocalProject({
-              projectId: taskProjectId,
-              projectName,
-              addFilename: savedFileName,
-              removeFilenames: []
-            });
-          } catch (projectError) {
-            console.warn('[projects] task auto-save local project assignment failed:', projectError);
+            if (!currentConversationStorage.value?.conversationId) {
+              const created = await window.api.createConversation({
+                dirPath,
+                title: defaultConversationName.value,
+                sessionData: getSessionDataAsObject(),
+                projectId: taskProjectId,
+                projectName
+              });
+              currentConversationStorage.value = {
+                format: 'sqlite',
+                conversationId: created.descriptor.conversationId,
+                dbFile: created.descriptor.dbFile,
+                title: created.descriptor.title,
+                revision: Number(created.descriptor.revision) || 0,
+                dirPath,
+                storageMode: 'local'
+              };
+            } else {
+              await executeAutoSaveRequest({ reason: 'scheduled-task-finalized', force: true, version: ++sessionMutationVersion });
+            }
+            savedFileName = defaultConversationName.value;
+            savedConversationId = currentConversationStorage.value?.conversationId || '';
           }
-        }
-        // 将历史记录写入主配置
-        await window.api.addTaskHistory(currentTaskConfig.value.id, {
-          time: Date.now(),
-          status: 'success',
-          file: savedFileName
-        });
+          await window.api.addTaskHistory(currentTaskConfig.value.id, {
+            time: Date.now(),
+            status: 'success',
+            file: savedFileName,
+            conversationId: savedConversationId
+          });
 
-        // 自动关闭窗口
-        if (currentTaskConfig.value.autoClose) {
-          window.api.windowControl('close-window');
+          // 自动关闭窗口
+          if (currentTaskConfig.value.autoClose) {
+            window.api.windowControl('close-window');
+          }
+        } catch (taskErr) {
+          console.error("Task Finalize Error:", taskErr);
+          await window.api.addTaskHistory(currentTaskConfig.value.id, {
+            time: Date.now(),
+            status: 'error',
+            file: '报错'
+          });
         }
-      } catch (taskErr) {
-        console.error("Task Finalize Error:", taskErr);
-        await window.api.addTaskHistory(currentTaskConfig.value.id, {
-          time: Date.now(),
-          status: 'error',
-          file: '报错'
-        });
+        currentTaskConfig.value = null; // 清空标记，避免后续手动问答也触发
+      } else {
+        scheduleAutoSave({ reason: 'assistant-turn-finalized', immediate: true }); // 普通对话的自动保存
+        if (stillOwnsTurn) {
+          // Keep loading until auto-compaction has settled so all new inputs stay in the buffer.
+          await maybeAutoCompactAfterTurn();
+        }
       }
-      currentTaskConfig.value = null; // 清空标记，避免后续手动问答也触发
-    } else {
-      scheduleAutoSave({ reason: 'assistant-turn-finalized', immediate: true }); // 普通对话的自动保存
-      await maybeAutoCompactAfterTurn();
-    }
-    if (stillOwnsTurn) {
-      activeAssistantTurnMeta = null;
+      if (activeAssistantTurnMeta === turnMeta) {
+        activeAssistantTurnMeta = null;
+        loading.value = false;
+        syncAutoCloseOnBlurListener();
+        await flushAppendBuffer();
+      }
+    } finally {
+      turnMeta.resolveSettlement?.();
     }
   }
 };
@@ -8258,46 +9419,91 @@ const cancelAskAI = () => {
   loading.value = false;
   syncAutoCloseOnBlurListener();
   scheduleAutoSave({ reason: 'assistant-cancelled', immediate: true });
+  nextTick(() => { flushAppendBuffer(); });
   focusChatInputIfSafe({ cursor: 'end' });
 };
 const copyText = async (content, index) => { if (loading.value && index === chat_show.value.length - 1) return; await window.api.copyText(content); };
-const reaskAI = async () => {
-  if (loading.value) return;
+const reaskAI = async (assistantMessageId = null) => {
+  if (!ensureConversationWriteAccess(true)) return;
 
-  // fullHistory remains the authoritative transcript after compaction. history is only the shorter
-  // outbound projection, so it must never decide how many UI bubbles to remove.
-  const lastVisibleMessageIndexInFullHistory = fullHistory.value.findLastIndex((message) => (
-    message?.role === 'user' || message?.role === 'assistant'
-  ));
-  if (lastVisibleMessageIndexInFullHistory < 0) {
-    showDismissibleMessage.warning('没有可以重新提问的用户消息');
+  if (loading.value || isReasking) return;
+  if (isMcpLoading.value || compacting.value || isPreparingSend.value) {
+    showDismissibleMessage.warning(isMcpLoading.value ? '工具加载中，暂不可重新请求' : '当前状态暂不可重新请求');
     return;
   }
 
-  const lastVisibleMessage = fullHistory.value[lastVisibleMessageIndexInFullHistory];
-  if (lastVisibleMessage.role === 'assistant') {
-    const assistantSignature = getComparableRenderableSignature(lastVisibleMessage);
-    fullHistory.value.splice(lastVisibleMessageIndexInFullHistory);
-    syncHistoryFromFullHistory();
+  isReasking = true;
+  try {
+    // fullHistory remains the authoritative transcript after compaction. history is only the shorter
+    // outbound projection, so it must never decide how many UI bubbles to remove.
+    const lastVisibleMessageIndexInFullHistory = fullHistory.value.findLastIndex((message) => (
+      message?.role === 'user' || message?.role === 'assistant'
+    ));
+    if (lastVisibleMessageIndexInFullHistory < 0) {
+      showDismissibleMessage.warning('没有可以重新提问的用户消息');
+      return;
+    }
 
-    // Remove only the matching trailing assistant bubble. Never infer a UI deletion count from
-    // the compacted request projection, which could otherwise remove the preceding user bubble.
-    const showIndex = findTailUiMessageIndexBySignature(assistantSignature);
-    if (showIndex >= 0) chat_show.value.splice(showIndex, 1);
-  } else if (lastVisibleMessage.role === 'user') {
-    // A stale persisted cache can omit this bubble although the outgoing request has it.
-    ensureLatestTailUserBubble();
-  } else {
-    showDismissibleMessage.warning('无法从此消息类型重新提问。');
-    return;
+    const lastVisibleMessage = fullHistory.value[lastVisibleMessageIndexInFullHistory];
+    if (lastVisibleMessage.role === 'assistant') {
+      const assistantSignature = getComparableRenderableSignature(lastVisibleMessage);
+      const hasAssistantMessageId = assistantMessageId !== null && assistantMessageId !== undefined;
+      const idMatchedShowIndex = hasAssistantMessageId
+        ? chat_show.value.findIndex((message) => message?.role === 'assistant' && message.id === assistantMessageId)
+        : -1;
+      // IDs are stable for live bubbles. Keep the signature lookup only for legacy callers that
+      // cannot provide one; never mutate fullHistory until a UI deletion target is verified.
+      const showIndex = hasAssistantMessageId
+        ? idMatchedShowIndex
+        : findTailUiMessageIndexBySignature(assistantSignature);
+      const lastVisibleMessageIndexInShow = chat_show.value.findLastIndex((message) => (
+        message?.role === 'user' || message?.role === 'assistant'
+      ));
+      if (showIndex < 0 || showIndex !== lastVisibleMessageIndexInShow) {
+        showDismissibleMessage.warning('消息状态已变化，未重新请求');
+        return;
+      }
+
+      // Delete the verified UI bubble and the authoritative transcript together before starting
+      // the new request. This prevents a stale UI cache from leaving the old reply on screen.
+      chat_show.value.splice(showIndex, 1);
+      fullHistory.value.splice(lastVisibleMessageIndexInFullHistory);
+      syncHistoryFromFullHistory();
+    } else if (lastVisibleMessage.role === 'user') {
+      // A stale persisted cache can omit this bubble although the outgoing request has it.
+      ensureLatestTailUserBubble();
+    } else {
+      showDismissibleMessage.warning('无法从此消息类型重新提问。');
+      return;
+    }
+
+    collapsedMessages.value.clear();
+    await askAI(true);
+  } finally {
+    isReasking = false;
   }
-
-  collapsedMessages.value.clear();
-  await nextTick();
-  await askAI(true);
 };
 
-const deleteMessage = (index) => {
+// Recovery reads only persisted canonical history and merges an unloaded prefix; it never
+// reloads the UI/draft or replaces a dirty in-memory tail.
+const conversationDeleteRecovery = createConversationDeleteRecovery({
+  getState: () => ({storage: currentConversationStorage.value, full: fullHistory.value, ui: chat_show.value, lease: conversationLease.value, version: sessionMutationVersion}),
+  canMutate: (command) => !loading.value && !compacting.value && !isPreparingSend.value && !isClosingWindow.value && ensureConversationWriteAccess(false),
+  readHistory: (storage) => window.api.openConversation({dirPath: storage.dirPath, reference: storage.conversationId, activeOnly: false, pageSize: 0}),
+  apply: ({fullHistory: merged, uiMessages, loadedFromOrdinal}) => {
+    fullHistory.value = merged;
+    // Keep live message object identities: a concurrent renderer event must not select a new row.
+    uiMessages.forEach((message, index) => {if (message.storageId) chat_show.value[index].storageId = message.storageId;});
+    if (loadedFromOrdinal !== null) currentConversationStorage.value = {...currentConversationStorage.value, loadedFromOrdinal};
+    syncHistoryFromFullHistory();
+  },
+  remove: (index, command, recovered) => deleteMessage(index, recovered),
+  onFailure: () => showDismissibleMessage.warning('消息关联无法唯一确认，已阻止删除；未保存内容保持不变，请稍后重试')
+});
+
+const deleteMessage = (index, recovered = false) => {
+  if (!ensureConversationWriteAccess(true)) return;
+
   if (loading.value || compacting.value) {
     showDismissibleMessage.warning(compacting.value ? '压缩进行中，暂不可编辑历史' : '请等待当前回复完成后再操作');
     return;
@@ -8309,23 +9515,41 @@ const deleteMessage = (index) => {
     return;
   }
 
-  const fullVisibleIndexes = fullHistory.value
-    .map((message, fullIndex) => (message?.role === 'tool' ? -1 : fullIndex))
-    .filter((fullIndex) => fullIndex >= 0);
-  const fullStartIndex = fullVisibleIndexes[index];
-  if (Number.isInteger(fullStartIndex)) {
+  // A persisted UI cache can be out of sync with canonical history. Never delete by array position:
+  // require a verified storage link or one unique semantic anchor match.
+  const fullStartIndex = resolveSafeConversationMutationTarget(fullHistory.value, chat_show.value, index);
+  if (fullStartIndex < 0) {
+    if (!recovered && currentConversationStorage.value?.conversationId) return conversationDeleteRecovery.recover(messageToDelete);
+    showDismissibleMessage.warning('消息关联无法唯一确认，已阻止删除；未保存内容保持不变');
+    return;
+  }
+  {
     let fullDeleteCount = 1;
     if (fullHistory.value[fullStartIndex]?.role === 'assistant') {
       const calledIds = new Set((fullHistory.value[fullStartIndex]?.tool_calls || []).map((call) => call?.id).filter(Boolean));
       let cursor = fullStartIndex + 1;
       while (cursor < fullHistory.value.length && fullHistory.value[cursor]?.role === 'tool') {
-        if (calledIds.size === 0 || calledIds.has(fullHistory.value[cursor]?.tool_call_id)) fullDeleteCount += 1;
+        if (!calledIds.has(fullHistory.value[cursor]?.tool_call_id)) break;
+        fullDeleteCount += 1;
+        cursor += 1;
+      }
+      while (isToolMediaMessage(fullHistory.value[cursor]) && calledIds.has(fullHistory.value[cursor]?.sourceToolCallId)) {
+        fullDeleteCount += 1;
         cursor += 1;
       }
     }
     fullHistory.value.splice(fullStartIndex, fullDeleteCount);
   }
-  chat_show.value.splice(index, 1);
+  let showDeleteCount = 1;
+  if (messageToDelete?.role === 'assistant' && Array.isArray(messageToDelete.tool_calls)) {
+    const calledIds = new Set(messageToDelete.tool_calls.map((call) => call?.id).filter(Boolean));
+    let cursor = index + 1;
+    while (isToolMediaMessage(chat_show.value[cursor]) && calledIds.has(chat_show.value[cursor]?.sourceToolCallId)) {
+      showDeleteCount += 1;
+      cursor += 1;
+    }
+  }
+  chat_show.value.splice(index, showDeleteCount);
   markOutermostCanRestore();
   syncHistoryFromFullHistory();
 
@@ -8337,9 +9561,12 @@ const deleteMessage = (index) => {
   collapsedMessages.value = nextCollapsed;
   focusedMessageIndex.value = null;
   scheduleAutoSave({ reason: 'message-deleted', immediate: true });
+  return true;
 };
 
 const clearHistory = async () => {
+  if (!ensureConversationWriteAccess(true)) return;
+
   if (loading.value) {
     return;
   }
@@ -8367,6 +9594,10 @@ const clearHistory = async () => {
   messageRefs.clear();
   focusedMessageIndex.value = null;
   cancelAutoNamingRequest();
+  await releaseCurrentConversationLease();
+  currentConversationStorage.value = null;
+  conversationReadOnly.value = false;
+  conversationLeasePending.value = false;
   defaultConversationName.value = "";
   taskList.value = [];
   taskPanelVisible.value = false;
@@ -8432,7 +9663,7 @@ function getDisplayTypeName(type) {
 
 const handleSaveModel = async (modelToSave) => {
   if (!CODE.value || !currentConfig.value.prompts[CODE.value]) {
-    showDismissibleMessage.warning('无法保存模型，因为当前不是一个已定义的快捷助手。');
+    showDismissibleMessage.warning('无法保存模型，因为当前不是一个已定义的智能体。');
     return;
   }
 
@@ -8441,7 +9672,7 @@ const handleSaveModel = async (modelToSave) => {
     changeModel_page.value = false;
     if (result && result.success) {
       currentConfig.value.prompts[CODE.value].model = modelToSave;
-      showDismissibleMessage.success(`模型已为快捷助手 "${CODE.value}" 保存成功！`);
+      showDismissibleMessage.success(`模型已为智能体 "${CODE.value}" 保存成功！`);
     } else {
       throw new Error(result?.message || '保存失败');
     }
@@ -8555,11 +9786,18 @@ const handleGlobalKeyDown = (event) => {
   }
 };
 
-const navMessages = computed(() => {
-  return chat_show.value
-    .map((msg, index) => ({ ...msg, originalIndex: index })) // 保留原始索引用于跳转
-    .filter(msg => msg.role !== 'system');
-});
+// Reuse the visible-message projection so hidden compacted history also leaves the
+// navigation DOM. Keep original chat_show indexes for edit/delete/navigation compatibility.
+const navMessages = computed(() => renderedChatMessages.value
+  .filter(({ message }) => message?.role && message.role !== 'system')
+  .map(({ message, index }) => ({
+    id: message.id,
+    role: message.role,
+    message,
+    originalIndex: index,
+    navKind: message.role === 'compaction' ? 'compaction' : 'normal'
+  }))
+);
 
 
 
@@ -8645,7 +9883,7 @@ const scrollToMessageByIndex = (index) => {
             @update-auto-approve="handleToggleAutoApprove" @confirm-tool="handleToolApproval"
             @reject-tool="handleToolApproval" :ref="el => setMessageRef(el, message.id)" :message="message"
             :index="index" :is-last-message="index === chat_show.length - 1" :is-loading="loading"
-            :user-avatar="UserAvart" :ai-avatar="AIAvart" :is-collapsed="isCollapsed(index)"
+            :user-avatar="UserAvart" :user-nickname="userNickname" :ai-avatar="AIAvart" :is-collapsed="isCollapsed(index)"
             :is-dark-mode="currentConfig.isDarkMode" @delete-message="handleDeleteMessage" @copy-text="handleCopyText"
             @re-ask="handleReAsk" @toggle-collapse="handleToggleCollapse" @show-system-prompt="handleShowSystemPrompt"
             @avatar-click="onAvatarClick" @edit-message-requested="handleEditStart" @edit-finished="handleEditEnd"
@@ -8679,7 +9917,7 @@ const scrollToMessageByIndex = (index) => {
           <div class="nav-timeline-area">
             <div class="timeline-track"></div>
             <div ref="navTimelineScrollerRef" class="timeline-scroller no-scrollbar">
-              <el-tooltip v-for="msg in navMessages" :key="msg.id" :content="getMessagePreviewText(msg)" placement="left"
+              <el-tooltip v-for="msg in navMessages" :key="msg.id" :content="getMessagePreviewText(msg.message)" placement="left"
                 :show-after="160" :enterable="false" effect="dark" popper-class="nav-message-tooltip">
                 <div class="timeline-node-wrapper" :data-original-index="msg.originalIndex"
                   @click="scrollToMessageByIndex(msg.originalIndex)">
@@ -8723,9 +9961,10 @@ const scrollToMessageByIndex = (index) => {
             :compacting="compacting"
             :compact-progress="compactProgress"
             :compact-config="compactConfig"
+            :prompt-token-breakdown="promptTokenBreakdown"
             :can-restore-compact="canRestoreCompact"
  ref="chatInputRef" v-model:prompt="prompt" v-model:fileList="fileList"
-          v-model:selectedVoice="selectedVoice" v-model:tempReasoningEffort="tempReasoningEffort" :loading="loading || compacting"
+          v-model:selectedVoice="selectedVoice" v-model:tempReasoningEffort="tempReasoningEffort" :loading="loading || compacting" :write-locked="conversationReadOnly || conversationLeasePending || isClosingWindow"
           :ctrlEnterToSend="currentConfig.CtrlEnterToSend" :layout="inputLayout" :voiceList="currentConfig.voiceList"
           :is-mcp-active="isMcpActive" :all-mcp-servers="availableMcpServers" :active-mcp-ids="sessionMcpServerIds"
           :active-skill-ids="sessionSkillIds" :all-skills="allSkillsList" :append-buffer="pendingAppendBuffer" :sub-agent-tasks="subAgentTasks" @open-compact-dialog="handleOpenCompactDialog"
@@ -8792,6 +10031,8 @@ const scrollToMessageByIndex = (index) => {
             @click="mcpFilter = 'selected'">已选</span>
           <span class="filter-tag" :class="{ active: mcpFilter === 'unselected' }"
             @click="mcpFilter = 'unselected'">未选</span>
+          <span class="filter-tag" :class="{ active: mcpFilter === 'preset' }"
+            @click="mcpFilter = 'preset'">预设</span>
         </div>
         <div class="action-tags">
           <span class="action-tag" @click="refreshSelectedMcpServers" title="强制重新拉取选中服务的最新工具配置">
@@ -8909,8 +10150,7 @@ const scrollToMessageByIndex = (index) => {
             style="margin-left: 40px; margin-right: 0;" />
         </div>
         <div>
-          <el-button type="primary" class="bw-btn"
-            @click="sessionMcpServerIds = [...tempSessionMcpServerIds]; requestApplyMcpTools(true, 'dialog-apply');">应用</el-button>
+          <el-button type="primary" class="bw-btn" @click="handleApplyMcpDialog">应用</el-button>
         </div>
       </div>
     </template>
@@ -9097,56 +10337,57 @@ html.dark .el-dialog {
 }
 
 .save-options-list {
-  display: flex;
-  flex-direction: column;
-  gap: 15px;
-  padding: 10px 0 0 20px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 2px 0;
   margin: 0;
 }
 
 .save-option-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 15px 20px;
+  min-height: 94px;
+  padding: 18px 16px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: var(--el-border-radius-base);
+  border-radius: 5px;
   cursor: pointer;
-  transition: all 0.2s ease-in-out;
+  outline: none;
+  transition: border-color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
 }
 
-.save-option-item:hover {
-  transform: scale(1.02);
+.save-option-item.is-wide {
+  grid-column: 1 / -1;
+  min-height: auto;
+}
+
+.save-option-item:hover,
+.save-option-item:focus-visible {
   border-color: var(--el-color-primary);
+  background-color: var(--el-fill-color-light);
   box-shadow: var(--el-box-shadow-light);
 }
 
 .save-option-item.is-disabled {
   cursor: not-allowed;
-  opacity: 0.68;
+  opacity: 0.65;
 }
 
 .save-option-item.is-disabled:hover {
-  transform: none;
   border-color: var(--el-border-color-lighter);
+  background-color: transparent;
   box-shadow: none;
-}
-
-.save-option-text {
-  flex-grow: 1;
-  margin-right: 20px;
 }
 
 .save-option-text h4 {
   margin: 0;
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--el-text-color-primary);
 }
 
 .save-option-text p {
-  margin: 4px 0 0 0;
-  font-size: 12px;
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.65;
   color: var(--el-text-color-secondary);
 }
 
@@ -9154,7 +10395,8 @@ html.dark .save-option-item {
   border-color: var(--el-border-color-dark);
 }
 
-html.dark .save-option-item:hover {
+html.dark .save-option-item:hover,
+html.dark .save-option-item:focus-visible {
   border-color: var(--el-color-primary);
   background-color: var(--el-fill-color-dark);
 }
@@ -9166,6 +10408,16 @@ html.dark .save-option-item.is-disabled:hover {
 
 html.dark .save-option-text p {
   color: var(--el-text-color-regular);
+}
+
+@media (max-width: 460px) {
+  .save-options-list {
+    grid-template-columns: 1fr;
+  }
+
+  .save-option-item.is-wide {
+    grid-column: auto;
+  }
 }
 
 /* System Prompt Dialog */

@@ -7,9 +7,53 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 const { t, locale } = useI18n();
 const currentConfig = inject('config');
 const activeTaskId = ref(null);
+
+const currentTaskDevice = ref(null);
+const currentTaskDeviceLabel = computed(() => currentTaskDevice.value?.deviceName || '当前设备');
+
+async function refreshTaskDeviceIdentity() {
+    try {
+        currentTaskDevice.value = await window.api?.getTaskDeviceIdentity?.() || null;
+    } catch (error) {
+        console.warn('[tasks] failed to resolve current task device:', error);
+        currentTaskDevice.value = null;
+    }
+}
+
+async function refreshTaskConfigSilently() {
+    const latestConfigData = await window.api.getConfig();
+    if (latestConfigData?.config) currentConfig.value = latestConfigData.config;
+}
+
+async function handleTaskEnabledChange(enabled) {
+    if (!activeTaskId.value || !window.api?.setTaskDeviceEnabled) return;
+    try {
+        await window.api.setTaskDeviceEnabled(activeTaskId.value, enabled === true);
+        await refreshTaskConfigSilently();
+    } catch (error) {
+        ElMessage.error(t('common.saveFailed'));
+        await refreshTaskConfigSilently();
+    }
+}
+
+async function addCurrentTaskDevice() {
+    await handleTaskEnabledChange(true);
+}
+
+async function removeAppliedTaskDevice(device) {
+    if (!activeTaskId.value || !window.api?.removeTaskAppliedDevice) return;
+    try {
+        await window.api.removeTaskAppliedDevice(activeTaskId.value, device);
+        await refreshTaskConfigSilently();
+    } catch (error) {
+        ElMessage.error(t('common.saveFailed'));
+        await refreshTaskConfigSilently();
+    }
+}
+
 const searchQuery = ref('');
 
-// 收集可用的快捷助手 (只允许独立窗口模式)
+// 收集可用的智能体 (只允许独立窗口模式)
 const availablePrompts = computed(() => {
     if (!currentConfig.value || !currentConfig.value.prompts) return [];
     const prompts = Object.entries(currentConfig.value.prompts)
@@ -103,6 +147,7 @@ const refreshLocalProjectOptions = async () => {
 };
 
 onMounted(async () => {
+    await refreshTaskDeviceIdentity();
     if (!currentConfig.value.tasks) currentConfig.value.tasks = {};
     const taskIds = Object.keys(currentConfig.value.tasks);
     if (taskIds.length > 0) activeTaskId.value = taskIds[0];
@@ -117,8 +162,13 @@ onMounted(async () => {
     }
 });
 
-onActivated(() => {
+onActivated(async () => {
     window.addEventListener('keydown', handleGlobalKeyDown);
+    await refreshLocalProjectOptions();
+});
+
+watch(() => currentConfig.value?.webdav?.localChatPath, () => {
+    void refreshLocalProjectOptions();
 });
 
 onDeactivated(() => {
@@ -316,6 +366,16 @@ async function clearTaskHistory() {
         if (localPath) {
             // 遍历所有带有 json 文件的日志记录，并尝试从本地删除
             for (const log of selectedTask.value.history) {
+                if (log.conversationId) {
+                    try {
+                        const result = await window.api.deleteConversation({ dirPath: localPath, conversationId: log.conversationId, deleteLegacyJson: true });
+                        if (result?.removed) deleteCount++;
+                    } catch (err) {
+                        console.warn(`本地数据库会话删除跳过或失败: ${log.conversationId}`, err);
+                    }
+                    continue;
+                }
+
                 if (log.file && log.file.endsWith('.json')) {
                     // 使用原生 path.join 防呆，若不可用则使用正则过滤掉双斜杠
                     let filePath = "";
@@ -407,8 +467,8 @@ const formatTime = (ts) => {
     return new Date(ts).toLocaleString(locale.value === 'en' ? 'en-US' : 'zh-CN'); // 日期时间格式建议保留本地化
 }
 
-async function openTaskChat(logFile) {
-    if (!logFile || !logFile.endsWith('.json')) return;
+async function openTaskChat(logFile, conversationId = '') {
+    if (!conversationId && (!logFile || !logFile.endsWith('.json'))) return;
 
     const localPath = currentConfig.value.webdav?.localChatPath;
     if (!localPath) {
@@ -416,18 +476,22 @@ async function openTaskChat(logFile) {
         return;
     }
 
-    let filePath = "";
-    if (window.api && window.api.pathJoin) {
-        filePath = window.api.pathJoin(localPath, logFile);
-    } else {
-        filePath = `${localPath}/${logFile}`.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
-    }
-
     try {
         ElMessage.info(t('chats.alerts.loadingChat') || '正在加载对话...');
-        const jsonString = await window.api.readLocalFile(filePath);
-        // 将 t('chats.alerts.restoreChat') || '恢复聊天' 修改为硬编码的 '恢复聊天'
-        await window.api.coderedirect('恢复聊天', JSON.stringify({ sessionData: jsonString, filename: logFile }));
+        if (conversationId) {
+            const opened = await window.api.openConversation({ dirPath: localPath, reference: conversationId, activeOnly: true });
+            await window.api.coderedirect('恢复聊天', JSON.stringify({
+                conversationId: opened.descriptor.conversationId,
+                conversationTitle: opened.descriptor.title,
+                format: 'sqlite'
+            }));
+        } else {
+            const filePath = window.api?.pathJoin
+                ? window.api.pathJoin(localPath, logFile)
+                : `${localPath}/${logFile}`.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+            const jsonString = await window.api.readLocalFile(filePath);
+            await window.api.coderedirect('恢复聊天', JSON.stringify({ sessionData: jsonString, filename: logFile }));
+        }
         ElMessage.success(t('chats.alerts.restoreInitiated') || '对话已开始');
     } catch (error) {
         ElMessage.error((t('chats.alerts.restoreFailed') || '无法打开对话') + `: ${error.message}`);
@@ -497,8 +561,8 @@ async function openTaskChat(logFile) {
                                     </el-tooltip>
 
                                     <span class="control-label">{{ t('tasks.enableTaskLabel') }}</span>
-                                    <el-switch v-model="selectedTask.enabled"
-                                        @change="(val) => saveTaskSetting('enabled', val)" size="large" />
+                                    <el-switch :model-value="selectedTask.enabled"
+                                        @change="handleTaskEnabledChange" size="large" />
                                 </div>
                             </div>
 
@@ -657,6 +721,22 @@ async function openTaskChat(logFile) {
                                                     </el-form-item>
                                                 </el-col>
                                             </template>
+                                            <el-col :span="24" style="margin-top: 12px;">
+                                                <el-form-item>
+                                                    <div style="width: 100%; display: flex; flex-direction: column; gap: 8px;">
+                                                        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                                                            <span style="font-weight: 600;">启用设备列表</span>
+                                                            <span style="color: var(--text-secondary); font-size: 13px;">当前设备：{{ currentTaskDeviceLabel }}</span>
+                                                            <el-button size="small" type="primary" plain @click="addCurrentTaskDevice">添加本设备</el-button>
+                                                        </div>
+                                                        <div v-if="!selectedTask.appliedDevices || selectedTask.appliedDevices.length === 0" style="color: var(--text-secondary); font-size: 13px;">暂无启用设备；任务不会在任何设备自动执行。</div>
+                                                        <div v-for="(device, index) in (selectedTask.appliedDevices || [])" :key="`${device.machineCode}-${device.deviceName}-${index}`" style="display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: 6px;">
+                                                            <span>{{ device.deviceName || '未命名设备' }}</span>
+                                                            <el-button size="small" type="danger" plain @click="removeAppliedTaskDevice(device)">删除</el-button>
+                                                        </div>
+                                                    </div>
+                                                </el-form-item>
+                                            </el-col>
                                         </el-row>
                                     </div>
                                 </div>
@@ -762,6 +842,7 @@ async function openTaskChat(logFile) {
                                                             <el-select
                                                                 :model-value="selectedTask.autoSaveProjectId || ''"
                                                                 @change="(val) => saveTaskSetting('autoSaveProjectId', val || '')"
+                                                                @visible-change="(visible) => { if (visible) void refreshLocalProjectOptions(); }"
                                                                 clearable
                                                                 :placeholder="t('tasks.autoSaveProjectPlaceholder', '未分组')"
                                                                 class="task-project-select">
@@ -815,8 +896,8 @@ async function openTaskChat(logFile) {
                                                         log.status === 'success' ? t('tasks.statusSuccess') :
                                                             t('tasks.statusFail') }}</el-tag>
                                                 <span class="log-file" :title="log.file"
-                                                    :class="{ 'clickable': log.file && log.file.endsWith('.json') }"
-                                                    @click="openTaskChat(log.file)">
+                                                    :class="{ 'clickable': Boolean(log.conversationId) || (log.file && log.file.endsWith('.json')) }"
+                                                    @click="openTaskChat(log.file, log.conversationId)">
                                                     <el-icon style="margin-right: 4px; vertical-align: middle;">
                                                         <Document />
                                                     </el-icon>

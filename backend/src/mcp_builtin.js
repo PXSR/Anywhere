@@ -8,6 +8,9 @@ const { exec, spawn } = require('child_process');
 const { handleFilePath, parseFileObject } = require('./file.js');
 
 const { createChatCompletion } = require('./chat.js');
+const { formatSubAgentError, requestSubAgentCompletion } = require('./subAgentRequest.js');
+const { setCurrentTaskDeviceEnabled } = require('./task_devices.js');
+const { fetchWebResource } = require('./webFetch.js');
 
 const isWin = process.platform === 'win32';
 const currentOS = process.platform === 'win32' ? 'Windows' : (process.platform === 'darwin' ? 'macOS' : 'Linux');
@@ -105,6 +108,94 @@ async function callParentShell(action, payload, signal = null) {
 }
 
 const MAX_READ = 128 * 1000; // 128k characters
+const MAX_READ_HARD = MAX_READ; // Preserve this host's existing text read limit.
+
+
+const MAX_SLEEP_DURATION_MS = 12 * 60 * 60 * 1000;
+
+function sleepForDuration(durationMs, signal = null) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            const error = new Error('Sleep interrupted by active turn cancellation.');
+            error.name = 'AbortError';
+            reject(error);
+            return;
+        }
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, durationMs);
+        const onAbort = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
+            const error = new Error('Sleep interrupted by active turn cancellation.');
+            error.name = 'AbortError';
+            reject(error);
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+
+const MAX_VIEW_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_VIEW_IMAGE_PIXELS = 24 * 1024 * 1024;
+const MAX_VIEW_PDF_BYTES = 50 * 1024 * 1024;
+
+function inspectViewableImage(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length < 10) return null;
+    if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) && buffer.length >= 24) {
+        return { mimeType: 'image/png', format: 'PNG', width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+    }
+    const gifHeader = buffer.subarray(0, 6).toString('ascii');
+    if ((gifHeader === 'GIF87a' || gifHeader === 'GIF89a') && buffer.length >= 10) {
+        return { mimeType: 'image/gif', format: 'GIF', width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+    }
+    if (buffer.subarray(0, 2).equals(Buffer.from([0xff, 0xd8]))) {
+        let offset = 2;
+        while (offset + 9 < buffer.length) {
+            if (buffer[offset] !== 0xff) { offset += 1; continue; }
+            const marker = buffer[offset + 1];
+            offset += 2;
+            if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+            if (offset + 2 > buffer.length) break;
+            const length = buffer.readUInt16BE(offset);
+            if (length < 7 || offset + length > buffer.length) break;
+            if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+                return { mimeType: 'image/jpeg', format: 'JPEG', height: buffer.readUInt16BE(offset + 3), width: buffer.readUInt16BE(offset + 5) };
+            }
+            offset += length;
+        }
+    }
+    if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+        const kind = buffer.subarray(12, 16).toString('ascii');
+        if (kind === 'VP8X' && buffer.length >= 30) {
+            return { mimeType: 'image/webp', format: 'WebP', width: 1 + buffer.readUIntLE(24, 3), height: 1 + buffer.readUIntLE(27, 3) };
+        }
+        if (kind === 'VP8 ' && buffer.length >= 30 && buffer[23] === 0x9d && buffer[24] === 0x01 && buffer[25] === 0x2a) {
+            return { mimeType: 'image/webp', format: 'WebP', width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
+        }
+        if (kind === 'VP8L' && buffer.length >= 25 && buffer[20] === 0x2f) {
+            const bits = buffer.readUInt32LE(21);
+            return { mimeType: 'image/webp', format: 'WebP', width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+        }
+    }
+    return null;
+}
+
+function estimatePdfPageCount(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) return 1;
+    try {
+        const source = buffer.toString('latin1');
+        const pageObjects = (source.match(/\/Type\s*\/Page\b/g) || []).length;
+        const pageTreeCounts = [...source.matchAll(/\/Type\s*\/Pages\b[\s\S]{0,256}?\/Count\s+(\d+)/g)]
+            .map((match) => Number(match[1]))
+            .filter((count) => Number.isFinite(count) && count > 0);
+        return Math.max(1, pageObjects, ...pageTreeCounts);
+    } catch {
+        return 1;
+    }
+}
+
 
 const subAgentTasks = new Map();
 const MAX_SUBAGENT_TASKS = 100;
@@ -874,6 +965,30 @@ const BUILTIN_TOOLS = {
             }
         },
         {
+            name: "view_image",
+            description: "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk. Do not use read_file for images.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    file_path: { type: "string", description: "Absolute path to a local PNG, JPEG, WebP, or GIF image file." },
+                    detail: { type: "string", enum: ["high", "original"], description: "Optional image detail hint. Defaults to high." }
+                },
+                required: ["file_path"]
+            }
+        },
+        {
+            name: "view_pdf",
+            description: "View a complete local PDF file as model-readable document context. Use this for PDFs already available on disk. Do not use read_file for PDF binary content.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    file_path: { type: "string", description: "Absolute path to a local PDF file." }
+                },
+                required: ["file_path"]
+            }
+        },
+
+        {
             name: "write_file",
             description: "Create a new file or completely overwrite an existing file. CAUTION: This tool is ONLY for TEXT-BASED files (code, txt, md, json, etc.). DO NOT use this for binary or Office files (e.g., .docx, .xlsx, .pdf, .png) as it will corrupt them. BEST PRACTICE: Before overwriting an EXISTING file, call 'read_file' first to confirm its current content and avoid accidental data loss.",
             inputSchema: {
@@ -967,6 +1082,18 @@ IMPORTANT:
             }
         },
         {
+            name: "sleep",
+            description: "Pause execution for a specified duration. The sleep ends early if the active turn is cancelled. Returns the elapsed wall-clock time.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    duration_ms: { type: "integer", minimum: 1, maximum: 43200000, description: "How long to sleep in milliseconds. Must be between 1 and 43200000." }
+                },
+                required: ["duration_ms"]
+            }
+        },
+
+        {
             name: "list_background_shells",
             description: "List all currently running background shell processes started by this agent's tool.",
             inputSchema: { type: "object", properties: {} }
@@ -1015,13 +1142,14 @@ IMPORTANT:
         },
         {
             name: "builtin_web_fetch",
-            description: "Retrieve and parse the FULL text content of a specific URL. Use this when the user provides a URL or after getting a URL from search results. Capable of parsing complex pages like documentation, papers, and code repositories.",
+            description: "Read webpages as text. Binary files/attachments are automatically saved to system Downloads; returns path, size and type. Responses must be <200 MB. Use download=true to save text too.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    url: { type: "string", description: "The URL of the webpage to read." },
-                    offset: { type: "integer", description: "Optional. The character position to start reading from. Defaults to 0.", default: 0 },
-                    length: { type: "integer", description: `Optional. Number of characters to read. Defaults to ${MAX_READ}.`, default: MAX_READ }
+                    url: { type: "string", description: "Full http:// or https:// URL of the webpage or file." },
+                    download: { type: "boolean", description: "Save text as a file too. Default false; binary files auto-download.", default: false },
+                    offset: { type: "integer", description: "Optional. Text character offset, default 0. Downloads require 0 and always save the complete file.", default: 0 },
+                    length: { type: "integer", description: `Text characters to return (default ${MAX_READ}, max ${MAX_READ_HARD}); not download size.`, default: MAX_READ }
                 },
                 required: ["url"]
             }
@@ -1136,7 +1264,7 @@ IMPORTANT:
         },
         {
             name: "continue_agent_chats",
-            description: "Send follow-up messages to an ALREADY OPEN agent window. Returns immediately. The agent starts generating in background. You can do other things or immediately call 'read_agent_chats' with index=-1 to wait for its result.",
+            description: "Send follow-up messages to an ALREADY OPEN agent window. Returns immediately. If the target is busy, the message is queued until its current response completes; otherwise it starts responding to this message in background. You can do other things or immediately call 'read_agent_chats' with index=-1 to wait for its result.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -1747,12 +1875,21 @@ const runPythonScript = (code, interpreter, signal = null) => {
 };
 
 // 安全检查辅助函数
+// 仅将公开模板识别为安全：.env.example、.env.local.example、.env.production.local.example 等。
+// 真实环境文件（含 .env、.env.local、.envrc）及名为 .env 的目录仍必须受保护。
+const isEnvironmentExampleFile = (targetPath) => /^\.env(?:\.[^.]+)*\.example$/i.test(path.basename(String(targetPath)));
+const isSensitiveEnvironmentPath = (targetPath) => {
+    const segments = path.normalize(String(targetPath)).split(/[\\/]+/).filter(Boolean);
+    const baseName = segments.at(-1) || '';
+    const hasEnvironmentDirectory = segments.slice(0, -1).some(segment => segment.toLowerCase() === '.env');
+    return hasEnvironmentDirectory || (baseName.toLowerCase().startsWith('.env') && !isEnvironmentExampleFile(baseName));
+};
+
 const isPathSafe = (targetPath) => {
-    // 基础黑名单：SSH密钥、AWS凭证、环境变量文件、Git配置、系统Shadow文件
+    // 基础黑名单：SSH密钥、AWS凭证、真实环境变量文件、Git配置、系统Shadow文件
     const forbiddenPatterns = [
         /[\\/]\.ssh[\\/]/i,
         /[\\/]\.aws[\\/]/i,
-        /[\\/]\.env/i,
         /[\\/]\.gitconfig/i,
         /id_rsa/i,
         /authorized_keys/i,
@@ -1761,7 +1898,7 @@ const isPathSafe = (targetPath) => {
         /C:\\Windows\\System32\\config/i // Windows SAM hive
     ];
 
-    return !forbiddenPatterns.some(regex => regex.test(targetPath));
+    return !isSensitiveEnvironmentPath(targetPath) && !forbiddenPatterns.some(regex => regex.test(targetPath));
 };
 
 async function runSubAgent(args, globalContext, signal) {
@@ -1844,7 +1981,7 @@ ${userContext || 'No additional context provided.'}
             // 3.1 LLM 思考 (使用 chat.js)
             const currentApiType = apiType || 'chat_completions';
 
-            const response = await createChatCompletion({
+            const response = await requestSubAgentCompletion(createChatCompletion, {
                 baseUrl: baseUrl,
                 apiKey: apiKey,
                 model: requestModelName,
@@ -1856,7 +1993,7 @@ ${userContext || 'No additional context provided.'}
                 tool_choice: availableTools.length > 0 ? "auto" : undefined,
                 stream: false,
                 signal: signal
-            });
+            }, log);
 
             let messageContent = "";
             let toolCalls = [];
@@ -1922,7 +2059,8 @@ ${userContext || 'No additional context provided.'}
 
                     const result = await invokeMcpTool(toolName, toolArgsObj, signal, null);
 
-                    if (typeof result === 'string') toolResult = result;
+                    if (result?.__anywhereToolResult === 'image') toolResult = result?.display?.text || 'Local image loaded for visual inspection.';
+                    else if (typeof result === 'string') toolResult = result;
                     else if (Array.isArray(result)) toolResult = result.map(i => i.text || JSON.stringify(i)).join('\n');
                     else toolResult = JSON.stringify(result);
 
@@ -1943,8 +2081,9 @@ ${userContext || 'No additional context provided.'}
             }
         } catch (e) {
             if (e.name === 'AbortError') throw e;
-            log(`[Critical Error] ${e.message}`);
-            return `[Sub-Agent Error] ${e.message}`;
+            const reason = formatSubAgentError(e, apiKey);
+            log(`[Critical Error] ${reason}`);
+            return `[Sub-Agent Error] ${reason}`;
         }
     }
 
@@ -1975,7 +2114,7 @@ ${userContext || 'No additional context provided.'}
         });
 
         const currentApiType = apiType || 'chat_completions';
-        const summaryResponse = await createChatCompletion({
+        const summaryResponse = await requestSubAgentCompletion(createChatCompletion, {
             baseUrl: baseUrl,
             apiKey: apiKey,
             model: requestModelName,
@@ -1983,11 +2122,9 @@ ${userContext || 'No additional context provided.'}
             retryCount: Number.isInteger(providerInfo.retryCount) ? providerInfo.retryCount : 3,
             headers: providerHeaders,
             messages: messages,
-            tools: availableTools.length > 0 ? availableTools : undefined,
-            tool_choice: availableTools.length > 0 ? "auto" : undefined,
             stream: false,
             signal: signal
-        });
+        }, log);
 
         let summaryContent = "";
         if (currentApiType === 'responses' && summaryResponse.output) {
@@ -2007,7 +2144,8 @@ ${userContext || 'No additional context provided.'}
             return `[Sub-Agent Timeout Summary]\n${summaryContent}\n\n(System Note: The sub-agent stopped because the step limit of ${MAX_STEPS} was reached...)`;
         }
     } catch (e) {
-        log(`[Error] Failed to generate summary: ${e.message}`);
+        if (signal?.aborted) throw e;
+        log(`[Error] Failed to generate summary: ${formatSubAgentError(e, apiKey)}`);
     }
 
     return generateStaticReport() + `\n\n[Instruction for Main Agent]: Please check the conversation context...`;
@@ -2346,6 +2484,64 @@ ${contextBlock}
             return `Grep error: ${e.message}`;
         }
     },
+
+    // 3. View Image
+    view_image: async ({ file_path, detail } = {}, context, signal) => {
+        try {
+            if (!file_path || typeof file_path !== 'string') return 'Error: file_path is required.';
+            if (detail !== undefined && !['high', 'original'].includes(detail)) {
+                return "Error: view_image.detail only supports 'high' or 'original'.";
+            }
+            const safePath = resolvePath(file_path);
+            if (!isPathSafe(safePath)) return `[Security Block] Access to sensitive system file '${path.basename(safePath)}' is restricted.`;
+            const stats = await fs.promises.stat(safePath);
+            if (!stats.isFile()) return `Error: Image path is not a file: ${safePath}`;
+            if (stats.size > MAX_VIEW_IMAGE_BYTES) return `Error: Image is too large for visual inspection (>${MAX_VIEW_IMAGE_BYTES / 1024 / 1024}MB).`;
+            if (signal?.aborted) throw Object.assign(new Error('Operation aborted by user.'), { name: 'AbortError' });
+            const bytes = await fs.promises.readFile(safePath, signal ? { signal } : undefined);
+            const image = inspectViewableImage(bytes);
+            if (!image || !image.width || !image.height) return 'Error: Unsupported or invalid image data. Supported formats: PNG, JPEG, WebP, GIF.';
+            if (image.width * image.height > MAX_VIEW_IMAGE_PIXELS) return `Error: Image dimensions exceed the ${MAX_VIEW_IMAGE_PIXELS / 1000000}MP visual inspection limit.`;
+            const displayText = `Local image loaded for visual inspection: ${path.basename(safePath)} (${image.format}, ${image.width}×${image.height}, ${(stats.size / 1024 / 1024).toFixed(2)} MB).`;
+            return {
+                __anywhereToolResult: 'image',
+                // Do not use dataUrl/base64 field names here: desktop IPC treats them as File-like
+                // values. The window rebuilds the data URL in the durable view_image chat message.
+                image: { encodedBytes: bytes.toString('base64'), mimeType: image.mimeType, detail: detail || 'high' },
+                display: { text: displayText, fileName: path.basename(safePath), format: image.format, width: image.width, height: image.height, bytes: stats.size }
+            };
+        } catch (error) {
+            if (error?.name === 'AbortError') throw error;
+            return `Error viewing image: ${error.message}`;
+        }
+    },
+
+
+    view_pdf: async ({ file_path } = {}, context, signal) => {
+        try {
+            if (!file_path || typeof file_path !== 'string') return 'Error: file_path is required.';
+            const safePath = resolvePath(file_path);
+            if (!isPathSafe(safePath)) return `[Security Block] Access to sensitive system file '${path.basename(safePath)}' is restricted.`;
+            if (path.extname(safePath).toLowerCase() !== '.pdf') return `Error: view_pdf only supports .pdf files: ${safePath}`;
+            const stats = await fs.promises.stat(safePath);
+            if (!stats.isFile()) return `Error: PDF path is not a file: ${safePath}`;
+            if (stats.size > MAX_VIEW_PDF_BYTES) return `Error: PDF is too large for document inspection (>${MAX_VIEW_PDF_BYTES / 1024 / 1024}MB).`;
+            if (signal?.aborted) throw Object.assign(new Error('Operation aborted by user.'), { name: 'AbortError' });
+            const bytes = await fs.promises.readFile(safePath, signal ? { signal } : undefined);
+            if (bytes.length < 5 || bytes.subarray(0, 5).toString('ascii') !== '%PDF-') return 'Error: Unsupported or invalid PDF data.';
+            const displayText = `Local PDF loaded as complete document context: ${path.basename(safePath)} (${(stats.size / 1024 / 1024).toFixed(2)} MB).`;
+            return {
+                __anywhereToolResult: 'pdf',
+                pdf: { encodedBytes: bytes.toString('base64'), mimeType: 'application/pdf', fileName: path.basename(safePath), pageCount: estimatePdfPageCount(bytes) },
+                display: { text: displayText, fileName: path.basename(safePath), bytes: stats.size }
+            };
+        } catch (error) {
+            if (error?.name === 'AbortError') throw error;
+            return `Error viewing PDF: ${error.message}`;
+        }
+    },
+
+
 
     // 3. Read File
     read_file: async ({ file_path, offset = 0, length = MAX_READ, start_line, end_line, show_line_numbers = true }, context, signal) => {
@@ -2712,6 +2908,18 @@ ${contextBlock}
     },
 
     // Bash / PowerShell
+
+    // Sleep (Codex-compatible timer; intentionally does not spawn a shell process)
+    sleep: async ({ duration_ms } = {}, context, signal) => {
+        if (!Number.isInteger(duration_ms) || duration_ms < 1 || duration_ms > MAX_SLEEP_DURATION_MS) {
+            return `Error: duration_ms must be an integer between 1 and ${MAX_SLEEP_DURATION_MS}.`;
+        }
+        const startedAt = Date.now();
+        await sleepForDuration(duration_ms, signal);
+        const wallTimeSeconds = (Date.now() - startedAt) / 1000;
+        return `Wall time: ${wallTimeSeconds.toFixed(4)} seconds\nSleep completed.`;
+    },
+
     execute_bash_command: async ({ command, background = false, timeout = 15000 }, context, signal) => {
         const trimmedCmd = command.trim();
 
@@ -3174,72 +3382,31 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
         }
     },
 
-    // Web Fetch Handler
-    builtin_web_fetch: async ({ url, offset = 0, length = MAX_READ }, context, signal) => {
-        try {
-            if (!url || !url.startsWith('http')) {
-                return "Error: Invalid URL. Please provide a full URL starting with http:// or https://";
+    // Web Fetch Handler: use the host's native Downloads setting (also in child windows).
+    builtin_web_fetch: async (args, context, signal) => fetchWebResource(args, {
+        fetchImpl: (url, options) => fetch(url, options),
+        getDownloadsDirectory: () => utools.getPath('downloads'),
+        signal,
+        maxRead: MAX_READ,
+        hardMaxRead: MAX_READ_HARD,
+        renderHtml: async (rawText, url) => {
+            const metadata = extractMetadata(rawText);
+            let markdownBody;
+            try {
+                markdownBody = await convertHtmlWithMarkitdownJs(rawText, url);
+            } catch {
+                console.warn('[builtin_web_fetch] HTML conversion failed; using fallback.');
+                markdownBody = convertHtmlToMarkdown(rawText, url);
             }
-
-            const MAX_SINGLE_READ = MAX_READ;
-            const readLength = Math.min(length, MAX_SINGLE_READ);
-
-            const headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Referer": "https://www.google.com/"
-            };
-
-            const response = await fetch(url, { headers, redirect: 'follow', signal });
-
-            if (response.status === 403 || response.status === 521) {
-                return `Failed to fetch page (Anti-bot protection ${response.status}).`;
+            if (!markdownBody || markdownBody.length < 50) {
+                return `Fetched URL: ${url}\n\nTitle: ${metadata.title}\n\n[System Info]: The extracted content is very short.`;
             }
-            if (!response.ok) {
-                return `Failed to fetch page. Status: ${response.status} ${response.statusText}`;
-            }
-            const contentType = response.headers.get('content-type') || '';
-            const rawText = await response.text();
-            let fullText = "";
-            if (contentType.includes('application/json')) {
-                try { fullText = JSON.stringify(JSON.parse(rawText), null, 2); } catch (e) { fullText = rawText; }
-            } else {
-                const metadata = extractMetadata(rawText);
-                let markdownBody = "";
-                try {
-                    markdownBody = await convertHtmlWithMarkitdownJs(rawText, url);
-                } catch (markitdownError) {
-                    console.warn('[builtin_web_fetch] markitdown-js conversion failed, fallback to legacy converter:', markitdownError?.message || markitdownError);
-                    markdownBody = convertHtmlToMarkdown(rawText, url);
-                }
-                if (!markdownBody || markdownBody.length < 50) {
-                    return `Fetched URL: ${url}\n\nTitle: ${metadata.title}\n\n[System Info]: The extracted content is very short.`;
-                }
-                fullText = `URL: ${url}\n\n`;
-                if (metadata.title) fullText += `# ${metadata.title}\n\n`;
-                if (metadata.description) fullText += `> **Description:** ${metadata.description}\n\n`;
-                fullText += `---\n\n${markdownBody}`;
-            }
-            const totalChars = fullText.length;
-            const startPos = Math.max(0, offset);
-            const contentChunk = fullText.substring(startPos, startPos + readLength);
-            const remainingChars = totalChars - (startPos + contentChunk.length);
-            let result = contentChunk;
-            if (remainingChars > 0) {
-                const nextOffset = startPos + contentChunk.length;
-                result += `\n\n--- [SYSTEM NOTE: CONTENT TRUNCATED] ---\n`;
-                result += `Total characters: ${totalChars}. Current chunk: ${startPos}-${nextOffset}.\n`;
-                result += `Remaining: ${remainingChars}. Call 'builtin_web_fetch' with offset=${nextOffset} to read more.\n`;
-            } else if (startPos > 0) {
-                result += `\n\n--- [SYSTEM NOTE: END OF PAGE REACHED] ---`;
-            }
-            return result;
-
-        } catch (e) {
-            return `Error fetching page: ${e.message}`;
+            let result = `URL: ${url}\n\n`;
+            if (metadata.title) result += `# ${metadata.title}\n\n`;
+            if (metadata.description) result += `> **Description:** ${metadata.description}\n\n`;
+            return result + `---\n\n${markdownBody}`;
         }
-    },
+    }),
 
     // Background Sub-Agent handlers
     sub_agent: async (args, globalContext) => {
@@ -3485,7 +3652,7 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
             const res = await win.webContents.executeJavaScript(`window.__AGENT_API__ ? window.__AGENT_API__.sendMessage(${JSON.stringify(text)}, ${JSON.stringify(file_paths || [])}) : Promise.reject("API not ready")`);
             return res;
         } catch (e) {
-            return `Error sending message: ${e.message}`;
+            return `Error sending message: ${typeof e === 'string' ? e : (e?.message || 'Unable to deliver the message to the target agent.')}`;
         }
     },
 
@@ -3620,6 +3787,7 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
                 singleDate: single_date || new Date().toISOString().split('T')[0],
                 singleTime: '12:00',
             };
+            setCurrentTaskDeviceEnabled(newTask, enabled === true);
 
             if (interval_time_ranges && Array.isArray(interval_time_ranges)) {
                 newTask.intervalTimeRanges = interval_time_ranges.map(r => r.split('-')).filter(r => r.length === 2);
@@ -3811,10 +3979,10 @@ if (Get-Variable -Name PSStyle -ErrorAction SilentlyContinue) { $PSStyle.OutputR
 
             if (!targetId) return `Error: Task "${task_name_or_id}" not found.`;
 
-            tasks[targetId].enabled = enable;
+            setCurrentTaskDeviceEnabled(tasks[targetId], enable === true);
 
             // Reset last run time if enabling, so it doesn't trigger immediately if missed
-            if (enable) {
+            if (tasks[targetId].enabled) {
                 tasks[targetId].lastRunTime = Date.now();
             }
 
@@ -4152,6 +4320,9 @@ function getBuiltinTools(serverId) {
 async function invokeBuiltinTool(toolName, args, signal = null, context = null) {
     if (handlers[toolName]) {
         const result = await handlers[toolName](args, context, signal);
+        // Media payloads are intentionally left structured for the active chat turn. All other
+        // built-in tools keep the established MCP-compatible text-array return contract.
+        if (result?.__anywhereToolResult === 'image' || result?.__anywhereToolResult === 'pdf') return result;
         const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
 
         return JSON.stringify([{

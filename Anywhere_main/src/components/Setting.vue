@@ -221,10 +221,22 @@ async function handleGlobalToggleChange(key, value) {
   ElMessage.success(t('setting.alerts.saveSuccess'));
 }
 
+function disableTasksInExportedConfig(config) {
+  if (!config?.tasks || typeof config.tasks !== 'object' || Array.isArray(config.tasks)) return;
+
+  for (const task of Object.values(config.tasks)) {
+    if (task && typeof task === 'object' && !Array.isArray(task)) {
+      task.enabled = false;
+    }
+  }
+}
+
+
 async function exportConfig() {
   if (!currentConfig.value) return;
   try {
     const configToExport = JSON.parse(JSON.stringify(currentConfig.value));
+    disableTasksInExportedConfig(configToExport);
 
     if (configToExport.webdav && configToExport.webdav.localChatPath) {
       delete configToExport.webdav.localChatPath;
@@ -287,6 +299,10 @@ function importConfig() {
           if (typeof importedData !== 'object' || importedData === null) {
             throw new Error("Imported file is not a valid configuration object.");
           }
+
+          // Desktop-only request statistics must never enter the plugin's config/database.
+          delete importedData.usageStatistics;
+
 
           if (currentLocalChatPath) {
             if (!importedData.webdav) {
@@ -470,6 +486,7 @@ async function backupToWebdav() {
             }
 
             const configToBackup = JSON.parse(JSON.stringify(currentConfig.value));
+            disableTasksInExportedConfig(configToBackup);
             if (configToBackup.webdav && configToBackup.webdav.localChatPath) {
               delete configToBackup.webdav.localChatPath;
             }

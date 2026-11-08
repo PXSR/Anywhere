@@ -1,4 +1,9 @@
 const { ipcRenderer } = require('electron');
+const {
+    CONVERSATION_RPC_REQUEST_CHANNEL,
+    CONVERSATION_RPC_RESPONSE_CHANNEL,
+    createConversationRpcClient,
+} = require('./conversationWindowRpc.js');
 const fs = require('fs');
 const path = require('path');
 const { fileURLToPath } = require('url');
@@ -22,6 +27,7 @@ const {
 
 const {
     handleFilePath,
+    sendfileDirect,
     saveFile,
     writeLocalFile,
     isFileTypeSupported,
@@ -117,6 +123,30 @@ const {
 
 const channel = "window";
 let senderId = null; // [新增] 用于存储当前窗口的唯一ID
+let conversationRpcCapability = null;
+
+const conversationRpcClient = createConversationRpcClient({
+    getSenderId: () => senderId,
+    getCapability: () => conversationRpcCapability,
+    sendRequest: (request) => utools.sendToParent(CONVERSATION_RPC_REQUEST_CHANNEL, request),
+    subscribeResponse: (callback) => {
+        const handler = (_event, response) => callback(response);
+        ipcRenderer.on(CONVERSATION_RPC_RESPONSE_CHANNEL, handler);
+        return () => ipcRenderer.removeListener(CONVERSATION_RPC_RESPONSE_CHANNEL, handler);
+    }
+});
+
+const invokeConversationRpc = (method, ...args) => conversationRpcClient.invoke(method, ...args);
+
+let conversationLeaseHeartbeatPromise = null;
+const invokeConversationLeaseHeartbeat = (input = {}) => {
+    if (conversationLeaseHeartbeatPromise) return conversationLeaseHeartbeatPromise;
+    conversationLeaseHeartbeatPromise = invokeConversationRpc('heartbeatConversationWriteLease', input)
+        .finally(() => {
+            conversationLeaseHeartbeatPromise = null;
+        });
+    return conversationLeaseHeartbeatPromise;
+};
 
 window.preload = {
     receiveMsg: (callback) => {
@@ -125,8 +155,13 @@ window.preload = {
                 // 捕获并存储 senderId
                 if (data.senderId) {
                     senderId = data.senderId;
+                    conversationRpcCapability = typeof data.conversationRpcCapability === 'string'
+                        ? data.conversationRpcCapability
+                        : null;
                 }
-                callback(data);
+                const safeData = { ...data };
+                delete safeData.conversationRpcCapability;
+                callback(safeData);
             }
         });
     },
@@ -221,10 +256,54 @@ window.api = {
     },
     copyText,
     handleFilePath,
+    sendfileDirect,
     saveFile,
     renameLocalFile,
     listJsonFiles,
     writeLocalFile,
+    listLocalConversations: (...args) => invokeConversationRpc('listLocalConversations', ...args),
+    migrateJsonConversation: (input = {}) => invokeConversationRpc('migrateJsonConversation', input),
+    createConversation: (input = {}) => invokeConversationRpc('createConversation', input),
+    openConversation: (input = {}) => invokeConversationRpc('openConversation', input),
+    loadConversationPage: (input = {}) => invokeConversationRpc('loadConversationPage', input),
+    getConversationRequestMessages: (input = {}) => invokeConversationRpc('getConversationRequestMessages', input),
+    repairConversationUiLinks: (input = {}) => invokeConversationRpc('repairConversationUiLinks', input),
+
+    saveConversationSnapshot: (input = {}) => invokeConversationRpc('saveConversationSnapshot', input),
+    saveConversationState: (input = {}) => invokeConversationRpc('saveConversationState', input),
+    appendConversationMessages: (input = {}) => invokeConversationRpc('appendConversationMessages', input),
+    updateConversationMessage: (input = {}) => invokeConversationRpc('updateConversationMessage', input),
+    truncateConversationMessages: (input = {}) => invokeConversationRpc('truncateConversationMessages', input),
+    deleteConversationMessages: (input = {}) => invokeConversationRpc('deleteConversationMessages', input),
+    replaceActiveConversationMessages: (input = {}) => invokeConversationRpc('replaceActiveConversationMessages', input),
+    restoreConversationCompaction: (input = {}) => invokeConversationRpc('restoreConversationCompaction', input),
+    renameConversation: (input = {}) => invokeConversationRpc('renameConversation', input),
+    deleteConversation: (input = {}) => invokeConversationRpc('deleteConversation', input),
+    acquireConversationWriteLease: (input = {}) => invokeConversationRpc('acquireConversationWriteLease', input),
+    heartbeatConversationWriteLease: invokeConversationLeaseHeartbeat,
+    releaseConversationWriteLease: (input = {}) => invokeConversationRpc('releaseConversationWriteLease', input),
+
+    registerConversationWriteLease: (input = {}) => {
+        if (!senderId) return { ok: false, error: 'window_sender_missing' };
+        utools.sendToParent('window-event', {
+            senderId,
+            event: 'conversation-lease-register',
+            state: input && typeof input === 'object' ? input : {}
+        });
+        return { ok: true };
+    },
+    clearRegisteredConversationWriteLease: () => {
+        if (!senderId) return { ok: false, error: 'window_sender_missing' };
+        utools.sendToParent('window-event', { senderId, event: 'conversation-lease-clear' });
+        return { ok: true };
+    },
+    createConversationSnapshot: (input = {}) => invokeConversationRpc('createConversationSnapshot', input),
+    createCloudConversationWorktree: (input = {}) => invokeConversationRpc('createCloudConversationWorktree', input),
+    openCloudConversationSnapshot: (input = {}) => invokeConversationRpc('openCloudConversationSnapshot', input),
+    readConversationSnapshot: (input = {}) => invokeConversationRpc('readConversationSnapshot', input),
+    importConversationSnapshot: (input = {}) => invokeConversationRpc('importConversationSnapshot', input),
+    getConversationDescriptor: (input = {}) => invokeConversationRpc('getConversationDescriptor', input),
+
     readLocalProjects: (...args) => getProjectsModule().readLocalProjects(...args),
     writeLocalProjects: (...args) => getProjectsModule().writeLocalProjects(...args),
     parseProjectsYaml: (...args) => getProjectsModule().parseProjectsYaml(...args),
@@ -330,6 +409,16 @@ window.api = {
     shellOpenPath: (fullPath) => {
         utools.shellOpenPath(fullPath);
     },
+    applyConversationWindowState: (state = {}) => {
+      if (!senderId) return false;
+      utools.sendToParent('window-event', {
+        senderId,
+        event: 'apply-conversation-window-state',
+        state
+      });
+      return true;
+    },
+
     // 向父进程(preload.js)发送切换置顶状态的请求
     toggleAlwaysOnTop: () => {
       if (senderId) {
@@ -584,10 +673,14 @@ window.api = {
     pruneCompactCache: async (enabledModels = []) => {
         return getCompactModule().pruneCompactCacheByEnabledModels(enabledModels);
     },
-    estimateCompactTokens: async (messages = []) => {
-        const tokens = getCompactModule().estimateMessagesTokens(messages);
+    estimateCompactTokens: async (messages = [], options = {}) => {
+        const tokens = getCompactModule().estimateMessagesTokens(messages, options);
         return { ok: true, tokens };
     },
+    selectCompactionCut: async (input = {}) => {
+        return getCompactModule().selectCompactionCut(input && typeof input === 'object' ? input : {});
+    },
+
     shouldAutoCompact: async (input = {}) => {
         return {
             ok: true,

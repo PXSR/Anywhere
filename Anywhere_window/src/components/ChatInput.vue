@@ -11,6 +11,8 @@ const tempReasoningEffort = defineModel('tempReasoningEffort');
 
 const props = defineProps({
     loading: Boolean,
+
+    writeLocked: { type: Boolean, default: false },
     ctrlEnterToSend: Boolean,
     voiceList: { type: Array, default: () => [] },
     layout: { type: String, default: 'horizontal' },
@@ -39,6 +41,18 @@ const props = defineProps({
             hideCompactedMessages: true,
             compactPrompt: '',
             resolvedId: ''
+        })
+    },
+    promptTokenBreakdown: {
+        type: Object,
+        default: () => ({
+            loading: false,
+            error: '',
+            systemTokens: 0,
+            conversationTokens: 0,
+            toolTokens: 0,
+            effectiveTokens: 0,
+            updatedAt: 0
         })
     },
     canRestoreCompact: { type: Boolean, default: false }
@@ -74,7 +88,10 @@ const compactStatusText = computed(() => {
     if (!props.compacting) return '';
     return props.compactProgress?.message || '正在压缩…';
 });
-const interactionLocked = computed(() => Boolean(props.loading || props.compacting));
+// 历史改写继续互斥；压缩本身不再阻止编辑草稿或会话配置。
+const interactionLocked = computed(() => Boolean(props.loading || props.compacting || props.writeLocked));
+const configurationLocked = computed(() => Boolean(props.writeLocked));
+const draftInputLocked = computed(() => Boolean(isRecording.value || props.writeLocked));
 
 watch(() => props.compactConfig, (next) => {
     if (!next || typeof next !== 'object') return;
@@ -99,6 +116,40 @@ const contextLengthSourceLabel = computed(() => {
     if (source === 'default') return '默认';
     return source;
 });
+
+
+const formatCompactTokenCount = (value = 0) => {
+    const numeric = Math.max(0, Number(value) || 0);
+    if (numeric >= 1000000) return `${(numeric / 1000000).toFixed(numeric >= 10000000 ? 1 : 2)}M`;
+    if (numeric >= 1000) return `${(numeric / 1000).toFixed(numeric >= 10000 ? 1 : 2)}K`;
+    return String(Math.round(numeric));
+};
+
+const promptUsage = computed(() => {
+    const contextLength = Math.max(1, Number(localCompactConfig.value.contextLength) || 1);
+    const thresholdRatio = Math.min(0.99, Math.max(0.1, Number(localCompactConfig.value.triggerRatio) || 0.9));
+    const systemTokens = Math.max(0, Number(props.promptTokenBreakdown?.systemTokens) || 0);
+    const conversationTokens = Math.max(0, Number(props.promptTokenBreakdown?.conversationTokens) || 0);
+    const toolTokens = Math.max(0, Number(props.promptTokenBreakdown?.toolTokens) || 0);
+    const effectiveTokens = systemTokens + conversationTokens + toolTokens;
+    const toPercent = (tokens) => Math.max(0, Math.min(100, (tokens / contextLength) * 100));
+    return {
+        contextLength,
+        thresholdTokens: Math.floor(contextLength * thresholdRatio),
+        thresholdPercent: thresholdRatio * 100,
+        systemTokens,
+        conversationTokens,
+        toolTokens,
+        effectiveTokens,
+        remainingTokens: Math.max(0, contextLength - effectiveTokens),
+        overTokens: Math.max(0, effectiveTokens - contextLength),
+        systemPercent: toPercent(systemTokens),
+        conversationPercent: toPercent(conversationTokens),
+        toolPercent: toPercent(toolTokens),
+        effectivePercent: toPercent(effectiveTokens)
+    };
+});
+
 
 // 自动压缩时不要强行打开配置弹窗；仅当用户已打开弹窗时，在弹窗内展示进度
 watch(() => props.compacting, (isCompacting, wasCompacting) => {
@@ -350,10 +401,20 @@ onMounted(() => {
 });
 
 // --- Computed Properties ---
-const reasoningTooltipContent = computed(() => {
-    const map = { default: '默认', none:'关闭', low: '低', medium: '中', high: '高', xhigh: '极深'};
-    return `思考预算: ${map[tempReasoningEffort.value] || '默认'}`;
-});
+const reasoningEffortOptions = [
+    { value: 'none', label: '关闭' },
+    { value: 'default', label: '自动' },
+    { value: 'low', label: '快速' },
+    { value: 'medium', label: '均衡' },
+    { value: 'high', label: '深入' },
+    { value: 'xhigh', label: '强化' },
+    { value: 'max', label: '极致' }
+];
+const reasoningEffortValues = new Set(reasoningEffortOptions.map((option) => option.value));
+
+const normalizeReasoningEffort = (value) => reasoningEffortValues.has(value) ? value : 'default';
+const currentReasoningOption = computed(() => reasoningEffortOptions.find((option) => option.value === normalizeReasoningEffort(tempReasoningEffort.value)) || reasoningEffortOptions[1]);
+const reasoningTooltipContent = computed(() => `思维深度: ${currentReasoningOption.value.label}`);
 
 const isImage = (file) => {
     if (file.type && file.type.startsWith('image/')) return true;
@@ -585,7 +646,7 @@ const toggleReasoningSelector = () => {
 };
 
 const handleReasoningSelection = (effort) => {
-    tempReasoningEffort.value = effort;
+    tempReasoningEffort.value = normalizeReasoningEffort(effort);
     isReasoningSelectorVisible.value = false;
 };
 
@@ -629,6 +690,7 @@ const handleVoiceSelection = async (value) => {
 
 // --- File Handling ---
 const triggerFileUpload = () => {
+    if (draftInputLocked.value) return;
     emit('pick-file-start');
     nextTick(() => {
         fileInputRef.value?.click();
@@ -636,10 +698,47 @@ const triggerFileUpload = () => {
 };
 const handleFileChange = (event) => { const files = event.target.files; if (files.length) emit('upload', { file: files[0], fileList: Array.from(files) }); if (fileInputRef.value) fileInputRef.value.value = ''; };
 const preventDefaults = (e) => e.preventDefault();
-const handleDragEnter = (event) => { preventDefaults(event); dragCounter.value++; isDragging.value = true; };
-const handleDragLeave = (event) => { preventDefaults(event); dragCounter.value--; if (dragCounter.value <= 0) { isDragging.value = false; dragCounter.value = 0; } };
-const handleDrop = (event) => { preventDefaults(event); isDragging.value = false; dragCounter.value = 0; const files = event.dataTransfer.files; if (files && files.length > 0) { emit('upload', { file: files[0], fileList: Array.from(files) }); focus(); } };
-const handlePasteEvent = (event) => { const clipboardData = event.clipboardData || window.clipboardData; if (!clipboardData) return; const items = Array.from(clipboardData.items).filter(item => item.kind === 'file'); if (items.length > 0) { preventDefaults(event); const files = items.map(item => item.getAsFile()); emit('upload', { file: files[0], fileList: files }); focus(); } };
+const handleDragEnter = (event) => {
+    preventDefaults(event);
+    if (draftInputLocked.value) return;
+    dragCounter.value++;
+    isDragging.value = true;
+};
+const handleDragLeave = (event) => {
+    preventDefaults(event);
+    if (draftInputLocked.value) {
+        isDragging.value = false;
+        dragCounter.value = 0;
+        return;
+    }
+    dragCounter.value--;
+    if (dragCounter.value <= 0) {
+        isDragging.value = false;
+        dragCounter.value = 0;
+    }
+};
+const handleDrop = (event) => {
+    preventDefaults(event);
+    isDragging.value = false;
+    dragCounter.value = 0;
+    if (draftInputLocked.value) return;
+    const files = event.dataTransfer.files;
+    if (files && files.length > 0) {
+        emit('upload', { file: files[0], fileList: Array.from(files) });
+        focus();
+    }
+};
+const handlePasteEvent = (event) => {
+    const clipboardData = event.clipboardData || window.clipboardData;
+    if (!clipboardData) return;
+    const items = Array.from(clipboardData.items).filter(item => item.kind === 'file');
+    if (items.length === 0) return;
+    preventDefaults(event);
+    if (draftInputLocked.value) return;
+    const files = items.map(item => item.getAsFile()).filter(Boolean);
+    if (files.length > 0) emit('upload', { file: files[0], fileList: files });
+    focus();
+};
 
 const toggleAudioSourceSelector = () => {
     if (isRecording.value) return;
@@ -990,24 +1089,17 @@ defineExpose({ focus, senderRef });
         <el-row v-if="isReasoningSelectorVisible" class="option-selector-row">
             <el-col :span="0" />
             <el-col :span="24">
-                <div class="option-selector-wrapper" ref="reasoningSelectorRef">
-                    <div class="option-selector-content">
-                        <el-text tag="b" class="selector-label">思考预算</el-text>
-                        <el-divider direction="vertical" />
-                        <el-button @click="handleReasoningSelection('default')"
-                            :type="tempReasoningEffort === 'default' ? 'primary' : 'default'" round>默认</el-button>
-                        <el-button @click="handleReasoningSelection('none')"
-                            :type="tempReasoningEffort === 'none' ? 'primary' : 'default'" round>关闭</el-button>
-                        <el-button @click="handleReasoningSelection('low')"
-                            :type="tempReasoningEffort === 'low' ? 'primary' : 'default'" round>快速</el-button>
-                        <el-button @click="handleReasoningSelection('medium')"
-                            :type="tempReasoningEffort === 'medium' ? 'primary' : 'default'" round>均衡</el-button>
-                        <el-button @click="handleReasoningSelection('high')"
-                            :type="tempReasoningEffort === 'high' ? 'primary' : 'default'" round>深入</el-button>
-                        <el-button @click="handleReasoningSelection('xhigh')"
-                            :type="tempReasoningEffort === 'xhigh' ? 'primary' : 'default'" round>极深</el-button>
+                <section class="reasoning-depth-selector" ref="reasoningSelectorRef" aria-label="思维深度">
+                    <div class="reasoning-depth-track" role="radiogroup" aria-label="思维深度选项">
+                        <button v-for="option in reasoningEffortOptions" :key="option.value" type="button"
+                            class="reasoning-depth-node" :class="{ active: normalizeReasoningEffort(tempReasoningEffort) === option.value }"
+                            :aria-checked="normalizeReasoningEffort(tempReasoningEffort) === option.value" role="radio"
+                            :title="option.label" @click="handleReasoningSelection(option.value)">
+                            <span class="reasoning-depth-dot"></span>
+                            <span class="reasoning-depth-label">{{ option.label }}</span>
+                        </button>
                     </div>
-                </div>
+                </section>
             </el-col>
             <el-col :span="0" />
         </el-row>
@@ -1132,14 +1224,14 @@ defineExpose({ focus, senderRef });
 
                     <div class="input-wrapper">
                         <el-input ref="senderRef" class="chat-textarea-vertical" v-model="prompt" type="textarea"
-                            :placeholder="isRecording ? '录音中... 结束后将连同文本一起发送' : '输入、粘贴、拖拽以发送内容，“ @”选择MCP，“ /”选择skill'"
+                            :placeholder="isRecording ? '录音中... 结束后将连同文本一起发送' : (loading ? '输入、粘贴或拖拽内容后，发送将加入缓冲区' : '输入、粘贴、拖拽以发送内容，“ @”选择MCP，“ /”选择skill')"
                             :autosize="{ minRows: 1, maxRows: 15 }" resize="none" @keydown="handleKeyDown"
-                            :disabled="isRecording" />
+                            :disabled="draftInputLocked" />
                     </div>
                     <div class="input-actions-bar">
                         <div class="action-buttons-left">
                             <el-tooltip content="清除聊天记录">
-                                <el-button size="default" @click="onClearHistory" circle :disabled="isRecording">
+                                <el-button size="default" @click="onClearHistory" circle :disabled="isRecording || interactionLocked">
                                     <el-icon :size="18">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
                                             viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -1156,7 +1248,7 @@ defineExpose({ focus, senderRef });
                                 </el-button>
                             </el-tooltip>
                             <el-tooltip content="添加附件">
-                                <el-button size="default" @click="triggerFileUpload" circle :disabled="isRecording">
+                                <el-button size="default" @click="triggerFileUpload" circle :disabled="draftInputLocked">
                                     <el-icon :size="17">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
                                             viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -1173,7 +1265,7 @@ defineExpose({ focus, senderRef });
                             <el-tooltip :content="reasoningTooltipContent">
                                 <el-button ref="reasoningButtonRef"
                                     :class="{ 'is-active-special': tempReasoningEffort && tempReasoningEffort !== 'default' }"
-                                    size="default" circle :disabled="isRecording" @click="toggleReasoningSelector">
+                                    size="default" circle :disabled="isRecording || configurationLocked" @click="toggleReasoningSelector">
                                     <el-icon :size="18">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
                                             viewBox="0 0 24 24" class="icon" style="margin-top: -2px;">
@@ -1186,7 +1278,7 @@ defineExpose({ focus, senderRef });
                             </el-tooltip>
 
                             <el-tooltip content="语音回复设置">
-                                <el-button ref="voiceButtonRef" size="default" circle :disabled="isRecording"
+                                <el-button ref="voiceButtonRef" size="default" circle :disabled="isRecording || configurationLocked"
                                     :class="{ 'is-active-special': selectedVoice }" @click="toggleVoiceSelector">
                                     <el-icon :size="18">
                                         <svg t="1765028999430" class="icon" viewBox="0 0 1024 1024" version="1.1"
@@ -1199,7 +1291,7 @@ defineExpose({ focus, senderRef });
                                 </el-button>
                             </el-tooltip>
                             <el-tooltip content="MCP工具">
-                                <el-button size="default" circle :disabled="isRecording"
+                                <el-button size="default" circle :disabled="isRecording || configurationLocked"
                                     :class="{ 'is-active-special': isMcpActive }" @click="$emit('open-mcp-dialog')">
                                     <el-icon :size="18">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
@@ -1212,7 +1304,7 @@ defineExpose({ focus, senderRef });
                                 </el-button>
                             </el-tooltip>
                             <el-tooltip content="Skill 技能库">
-                                <el-button size="default" circle :disabled="isRecording"
+                                <el-button size="default" circle :disabled="isRecording || configurationLocked"
                                     :class="{ 'is-active-special': activeSkillIds && activeSkillIds.length > 0 }"
                                     @click="$emit('open-skill-dialog')">
                                     <el-icon :size="18">
@@ -1221,7 +1313,7 @@ defineExpose({ focus, senderRef });
                                 </el-button>
                             </el-tooltip>
                             <el-tooltip :content="compacting ? '压缩进行中…' : '会话压缩'">
-                                <el-button size="default" circle :disabled="isRecording"
+                                <el-button size="default" circle :disabled="isRecording || configurationLocked"
                                     :class="{ 'is-active-special': compacting || canRestoreCompact }"
                                     @click="openCompactDialog">
                                     <el-icon :size="18">
@@ -1255,7 +1347,8 @@ defineExpose({ focus, senderRef });
                                         </el-icon>
                                     </el-button>
                                 </el-tooltip>
-                                <el-button v-if="!loading" @click="onSubmit" circle :disabled="loading">
+                                <el-tooltip :content="loading ? '加入缓冲区' : '发送'">
+                                    <el-button @click="onSubmit" circle :disabled="draftInputLocked">
                                     <el-icon :size="18">
                                         <svg t="1765029205363" class="icon" viewBox="0 0 1024 1024" version="1.1"
                                             xmlns="http://www.w3.org/2000/svg" p-id="63447" width="200" height="200">
@@ -1264,13 +1357,16 @@ defineExpose({ focus, senderRef });
                                                 p-id="63448"></path>
                                         </svg>
                                     </el-icon>
-                                </el-button>
-                                <el-button v-else @click="onCancel" circle class="cancel-button-animated">
+                                    </el-button>
+                                </el-tooltip>
+                                <el-tooltip v-if="loading" content="取消请求">
+                                    <el-button @click="onCancel" circle class="cancel-button-animated">
                                     <el-icon class="static-icon">
                                         <Close />
                                     </el-icon>
-                                    <div class="cancel-spinner"></div>
-                                </el-button>
+                                        <div class="cancel-spinner"></div>
+                                    </el-button>
+                                </el-tooltip>
                             </template>
                         </div>
                     </div>
@@ -1322,19 +1418,13 @@ defineExpose({ focus, senderRef });
         :show-close="true" align-center>
         <template #header>
             <div class="compact-dialog-header">
-                <div class="compact-dialog-title-row">
-                    <div class="compact-dialog-title">会话压缩</div>
-                    <el-tooltip content="学习codex本地压缩功能" placement="top">
-                        <el-icon class="compact-info-icon"><InfoFilled /></el-icon>
-                    </el-tooltip>
-                </div>
-                <div class="compact-dialog-subtitle">级联检查点 · 摘要交接 · 可还原</div>
+                <div class="compact-dialog-title">会话压缩</div>
             </div>
         </template>
 
         <div class="compact-dialog-scroll">
             <!-- 压缩进行中：关闭仅切换为后台继续，取消才会中断压缩 -->
-            <div v-if="compacting" class="compact-progress-block">
+            <div v-if="compacting" class="compact-section-card compact-progress-block">
                 <div class="compact-progress-heading">
                     <div>
                         <div class="compact-progress-title">{{ compactStatusText }}</div>
@@ -1350,7 +1440,34 @@ defineExpose({ focus, senderRef });
                     <el-button round @click="compactDialogVisible = false">后台继续</el-button>
                 </div>
             </div>
-            <div v-else class="compact-config-block">
+            <div class="compact-config-block">
+                <div class="compact-section-card compact-prompt-usage-card">
+                    <div class="compact-prompt-usage-heading">
+                        <div class="compact-section-title">Prompt 上下文占用</div>
+                        <div class="compact-prompt-usage-total" :class="{ 'is-over': promptUsage.overTokens > 0 }">
+                            <span v-if="promptTokenBreakdown.loading">计算中…</span>
+                            <span v-else>有效 {{ formatCompactTokenCount(promptUsage.effectiveTokens) }} / {{ formatCompactTokenCount(promptUsage.contextLength) }}</span>
+                        </div>
+                    </div>
+                    <div class="compact-prompt-track" :class="{ 'is-loading': promptTokenBreakdown.loading }">
+                        <span class="compact-prompt-segment is-system" :style="{ width: `${promptUsage.systemPercent}%` }"></span>
+                        <span class="compact-prompt-segment is-conversation" :style="{ width: `${promptUsage.conversationPercent}%` }"></span>
+                        <span class="compact-prompt-segment is-tool" :style="{ width: `${promptUsage.toolPercent}%` }"></span>
+                        <span class="compact-prompt-threshold" :style="{ left: `${promptUsage.thresholdPercent}%` }">
+                            <span class="compact-prompt-threshold-dot"></span>
+                            <span class="compact-prompt-threshold-label">阈值 {{ formatCompactTokenCount(promptUsage.thresholdTokens) }}</span>
+                        </span>
+                    </div>
+                    <div class="compact-prompt-legend">
+                        <span><i class="is-system"></i>System {{ promptUsage.systemPercent.toFixed(1) }}%({{ formatCompactTokenCount(promptUsage.systemTokens) }})</span>
+                        <span><i class="is-conversation"></i>对话 {{ promptUsage.conversationPercent.toFixed(1) }}%({{ formatCompactTokenCount(promptUsage.conversationTokens) }})</span>
+                        <span><i class="is-tool"></i>工具 {{ promptUsage.toolPercent.toFixed(1) }}%({{ formatCompactTokenCount(promptUsage.toolTokens) }})</span>
+                        <span class="is-remaining">剩余 {{ Math.max(0, 100 - promptUsage.effectivePercent).toFixed(1) }}%({{ formatCompactTokenCount(promptUsage.remainingTokens) }})</span>
+                    </div>
+                    <div v-if="promptUsage.overTokens > 0" class="compact-prompt-warning">已超出上下文 {{ formatCompactTokenCount(promptUsage.overTokens) }} tokens</div>
+                    <div v-else-if="promptTokenBreakdown.error" class="compact-prompt-warning">统计失败：{{ promptTokenBreakdown.error }}</div>
+                </div>
+
                 <div class="compact-section-card">
                     <div class="compact-section-title">基础设置</div>
                     <div class="compact-grid-2">
@@ -1380,12 +1497,15 @@ defineExpose({ focus, senderRef });
                 </div>
 
                 <div class="compact-section-card">
-                    <button type="button" class="compact-advanced-toggle" @click="advancedCollapsed = !advancedCollapsed">
-                        <el-icon>
-                            <component :is="advancedCollapsed ? ArrowRight : ArrowDown" />
-                        </el-icon>
-                        <span>高级参数</span>
-                    </button>
+                    <div class="compact-advanced-header">
+                        <button type="button" class="compact-advanced-toggle" @click="advancedCollapsed = !advancedCollapsed">
+                            <el-icon>
+                                <component :is="advancedCollapsed ? ArrowRight : ArrowDown" />
+                            </el-icon>
+                            <span>高级参数</span>
+                        </button>
+                        <el-button type="warning" plain round size="small" @click="applyAdvancedToGlobal">应用到全部模型</el-button>
+                    </div>
                     <div v-show="!advancedCollapsed" class="compact-advanced-body">
                         <div class="compact-grid-2">
                             <div class="compact-field compact-display-control">
@@ -1394,7 +1514,7 @@ defineExpose({ focus, senderRef });
                                     <el-tooltip
                                         placement="top"
                                         :show-after="200"
-                                        content="压缩时在摘要后额外保留最近 N 轮原文（user+assistant）。默认 3。设为 0 时仍会至少保留 1 条，保证可续聊。"
+                                        content="优先在摘要后保留最近 N 个用户回合；用户回合不足 N 时，自动以最近完整 AI 单元补足。AI 工具单元会连同全部匹配 tool 结果保留，绝不拆分。默认 3。"
                                     >
                                         <el-icon class="compact-info-icon"><InfoFilled /></el-icon>
                                     </el-tooltip>
@@ -1409,24 +1529,21 @@ defineExpose({ focus, senderRef });
                             <div class="compact-label">摘要 Prompt</div>
                             <el-input v-model="localCompactConfig.compactPrompt" type="textarea" :autosize="{ minRows: 4, maxRows: 8 }" />
                         </div>
-                        <div class="compact-advanced-actions">
-                            <el-button type="warning" plain round @click="applyAdvancedToGlobal">应用到全局</el-button>
-                            <div class="compact-form-hint">将高级参数同步到所有已缓存模型（不改各模型上下文长度）</div>
-                        </div>
+
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- 压缩中不渲染 footer，避免「取消压缩」旁边再出现无用的关闭 -->
-        <template v-if="!compacting" #footer>
+        <!-- 压缩中仍允许保存未来回合使用的配置；历史改写操作保持禁用。 -->
+        <template #footer>
             <div class="compact-dialog-footer">
-                <el-button v-if="canRestoreCompact" round @click="restoreCompact">恢复最外层压缩</el-button>
+                <el-button v-if="canRestoreCompact" round :disabled="interactionLocked" @click="restoreCompact">恢复最外层压缩</el-button>
                 <div class="compact-dialog-footer-right">
                     <el-button round @click="compactDialogVisible = false">关闭</el-button>
                     <el-button round @click="resetCompactConfigToDefault">恢复默认</el-button>
                     <el-button round @click="saveCompactConfig">保存参数</el-button>
-                    <el-button type="primary" round @click="runCompactNow">立即压缩</el-button>
+                    <el-button type="primary" round :disabled="interactionLocked" @click="runCompactNow">立即压缩</el-button>
                 </div>
             </div>
         </template>
@@ -1932,6 +2049,100 @@ html.dark .waveform-display-area {
 .option-selector-row {
     margin-bottom: 8px;
 }
+
+.reasoning-depth-selector {
+    padding: 10px 14px 6px;
+    border-radius: 12px;
+    background: var(--el-bg-color-input);
+}
+
+.reasoning-depth-track {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    align-items: start;
+    padding: 0 4px;
+}
+
+.reasoning-depth-track::before {
+    position: absolute;
+    top: 5px;
+    right: 7%;
+    left: 7%;
+    height: 2px;
+    background: var(--el-border-color);
+    content: '';
+}
+
+.reasoning-depth-node {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    justify-items: center;
+    gap: 5px;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    color: var(--el-text-color-secondary);
+    background: transparent;
+    cursor: pointer;
+}
+
+.reasoning-depth-dot {
+    box-sizing: border-box;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--el-bg-color-input);
+    border-radius: 50%;
+    background: var(--el-text-color-secondary);
+    transition: transform .16s ease, background .16s ease, box-shadow .16s ease;
+}
+
+.reasoning-depth-label {
+    overflow: hidden;
+    max-width: 100%;
+    font-size: 11px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.reasoning-depth-node:hover,
+.reasoning-depth-node:focus-visible {
+    color: var(--el-color-primary);
+}
+
+.reasoning-depth-node:hover .reasoning-depth-dot,
+.reasoning-depth-node:focus-visible .reasoning-depth-dot {
+    transform: scale(1.2);
+    background: var(--el-color-primary);
+}
+
+.reasoning-depth-node.active {
+    color: var(--el-color-primary);
+    font-weight: 600;
+}
+
+.reasoning-depth-node.active .reasoning-depth-dot {
+    background: var(--el-bg-color-overlay);
+    box-shadow: 0 0 0 4px var(--el-color-primary);
+}
+
+html.dark .reasoning-depth-node.active .reasoning-depth-dot {
+    background: var(--el-bg-color-overlay);
+}
+
+@media (max-width: 500px) {
+    .reasoning-depth-selector {
+        padding-right: 8px;
+        padding-left: 8px;
+    }
+
+    .reasoning-depth-label {
+        font-size: 10px;
+    }
+}
+
 
 .option-selector-wrapper {
     background-color: var(--el-bg-color-input);
@@ -2660,6 +2871,9 @@ html.dark .subagent-detail-output-scroll::-webkit-scrollbar-thumb:hover {
     flex: 1 1 auto;
     min-height: 0;
     max-height: min(56vh, 480px);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
     overflow-y: auto;
     overflow-x: hidden;
     padding-right: 4px;
@@ -2728,12 +2942,11 @@ html.dark .compact-dialog-scroll::-webkit-scrollbar-thumb {
     gap: 10px;
 }
 
-.compact-advanced-actions {
+.compact-advanced-header {
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 6px;
-    padding-top: 4px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
 }
 
 .compact-dialog-subtitle {
@@ -2758,6 +2971,136 @@ html.dark .compact-dialog-scroll::-webkit-scrollbar-thumb {
     flex-direction: column;
     gap: 10px;
 }
+
+
+.compact-prompt-usage-card {
+    overflow: visible;
+}
+
+.compact-prompt-usage-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.compact-prompt-usage-total {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--el-text-color-primary);
+    white-space: nowrap;
+}
+
+.compact-prompt-usage-total.is-over,
+.compact-prompt-warning {
+    color: var(--el-color-danger);
+}
+
+.compact-prompt-track {
+    position: relative;
+    display: flex;
+    width: 100%;
+    height: 14px;
+    margin-top: 28px;
+    overflow: visible;
+    border-radius: 999px;
+    background: var(--el-fill-color);
+    box-shadow: inset 0 0 0 1px var(--el-border-color-lighter);
+}
+
+.compact-prompt-track.is-loading {
+    opacity: 0.58;
+}
+
+.compact-prompt-segment {
+    display: block;
+    height: 100%;
+    min-width: 0;
+    transition: width 0.25s ease;
+}
+
+.compact-prompt-segment:first-child {
+    border-radius: 999px 0 0 999px;
+}
+
+.compact-prompt-segment.is-system,
+.compact-prompt-legend i.is-system {
+    background: #7c3aed;
+}
+
+.compact-prompt-segment.is-conversation,
+.compact-prompt-legend i.is-conversation {
+    background: #2563eb;
+}
+
+.compact-prompt-segment.is-tool,
+.compact-prompt-legend i.is-tool {
+    background: #f59e0b;
+}
+
+.compact-prompt-threshold {
+    position: absolute;
+    top: -8px;
+    bottom: -8px;
+    width: 2px;
+    transform: translateX(-1px);
+    background: var(--el-color-danger);
+    z-index: 2;
+}
+
+.compact-prompt-threshold-dot {
+    position: absolute;
+    top: -3px;
+    left: 50%;
+    width: 8px;
+    height: 8px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: var(--el-color-danger);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--el-color-danger) 20%, transparent);
+}
+
+.compact-prompt-threshold-label {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    right: 0;
+    transform: translateX(6px);
+    font-size: 10px;
+    color: var(--el-color-danger);
+    white-space: nowrap;
+}
+
+.compact-prompt-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--el-text-color-secondary);
+}
+
+.compact-prompt-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.compact-prompt-legend i {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.compact-prompt-legend .is-remaining {
+    color: var(--el-text-color-secondary);
+}
+
+.compact-prompt-warning {
+    margin-top: 7px;
+    font-size: 11px;
+}
+
 
 .compact-section-title {
     font-size: 13px;
@@ -2804,7 +3147,7 @@ html.dark .compact-dialog-scroll::-webkit-scrollbar-thumb {
 
 .compact-progress-block {
     gap: 16px;
-    padding: 4px 0 2px;
+    padding: 14px;
 }
 
 .compact-progress-heading {
@@ -2987,6 +3330,9 @@ html.dark .compact-config-dialog :deep(.el-dialog) {
     flex: 1 1 auto;
     min-height: 0;
     max-height: min(58vh, 520px);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
     overflow-y: auto;
     overflow-x: hidden;
     padding-right: 4px;

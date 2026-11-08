@@ -44,6 +44,21 @@ function buildAnthropicImageBlock(url) {
     return null;
 }
 
+function buildAnthropicDocumentBlock(item = {}) {
+    const fileInput = item.file || item;
+    const fileData = fileInput.file_data || fileInput.url;
+    const filename = fileInput.filename || fileInput.name || 'document.pdf';
+    if (typeof fileData !== 'string') return null;
+    const match = fileData.match(/^data:application\/pdf;base64,(.+)$/i);
+    if (!match) return null;
+    return {
+        type: 'document',
+        source: { type: 'base64', media_type: 'application/pdf', data: match[1] },
+        title: filename
+    };
+}
+
+
 // 把 OpenAI 消息 content（string | array）转为 Anthropic content blocks
 function convertContentToBlocks(content) {
     if (typeof content === 'string') {
@@ -60,8 +75,11 @@ function convertContentToBlocks(content) {
             const url = typeof item.image_url === 'string' ? item.image_url : item.image_url?.url;
             const block = buildAnthropicImageBlock(url);
             if (block) blocks.push(block);
+        } else if (item.type === 'file' || item.type === 'input_file') {
+            const block = buildAnthropicDocumentBlock(item);
+            if (block) blocks.push(block);
         }
-        // 其余类型（audio/file 等）Anthropic 不支持，跳过
+        // 其余类型（如 audio）当前不支持，跳过
     }
     return blocks;
 }
@@ -76,6 +94,8 @@ function safeParseJson(text) {
 }
 
 // OpenAI messages → { system, messages(Anthropic) }
+
+
 function convertMessagesToAnthropic(messages = []) {
     const systemParts = [];
     const result = [];
@@ -104,7 +124,7 @@ function convertMessagesToAnthropic(messages = []) {
         }
 
         if (role === 'tool') {
-            // OpenAI tool 结果 → Anthropic user 消息里的 tool_result block
+            // OpenAI tool result → Anthropic user message tool_result block.
             pushMessage('user', [{
                 type: 'tool_result',
                 tool_use_id: msg.tool_call_id,

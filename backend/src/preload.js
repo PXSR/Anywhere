@@ -1,4 +1,16 @@
-const { createChatCompletion, getRandomItem, batchTestProviderKeys } = require('./chat.js');
+const path = require('path');
+const crypto = require('crypto');
+const {
+  CONVERSATION_RPC_REQUEST_CHANNEL,
+  createConversationRpcRequestHandler,
+} = require('./conversationWindowRpc.js');
+const {
+  createConversationDbHelperClient
+} = require('./conversationDbHelperClient.js');
+const { getCurrentModuleAbi } = require('./utoolsRuntime.js');
+
+
+const { reconcileTaskDeviceState, setCurrentTaskDeviceEnabled } = require('./task_devices.js');
 
 const {
   getConfig,
@@ -10,6 +22,7 @@ const {
   copyText,
   openWindow,
   openFastInputWindow,
+  applyConversationWindowState,
   coderedirect,
   setZoomFactor,
   feature_suffix,
@@ -22,6 +35,9 @@ const {
   importMemoryData,
   resolveDefaultAssistantModel,
   openConferenceWindow,
+  getTaskDeviceIdentity,
+  setTaskDeviceEnabled,
+  removeTaskAppliedDeviceForCurrentConfig,
 } = require('./data.js');
 
 // 引入 TTS 模块
@@ -50,36 +66,41 @@ const {
 } = require('./file.js');
 
 
-const {
-  invokeBuiltinTool,
-  handleBgShellRequest,
-  killAllBackgroundShells,
-} = require('./mcp_builtin.js');
+// Keep heavyweight Chat/MCP/Skill/OAuth dependencies in lazy_runtime.js so the
+// main preload and custom-window preload share one release artifact instead of
+// each embedding the same dependency graph.
+function getLazyRuntime() {
+  const runtimePath = './' + 'lazy_runtime.js';
+  return require(runtimePath);
+}
+
+function getChatModule() {
+  return getLazyRuntime();
+}
+
+function getMcpBuiltinModule() {
+  return getLazyRuntime();
+}
 
 function getMcpModule() {
-  return require('./mcp.js');
+  return getLazyRuntime();
+}
+
+function getSkillModule() {
+  return getLazyRuntime();
+}
+
+function getCompactModule() {
+  return getLazyRuntime();
 }
 
 function getOauthStore() {
-  return require('./mcp_oauth_store.js');
+  return getLazyRuntime().oauthStore;
 }
 
 function getOauthProvider() {
-  return require('./mcp_oauth_provider.js');
+  return getLazyRuntime().oauthProvider;
 }
-
-const {
-  listSkills,
-  getSkillDetails,
-  generateSkillToolDefinition,
-  resolveSkillInvocation,
-  saveSkill,
-  deleteSkill,
-  exportSkillToPackage,
-  exportSkillPackageBuffer,
-  extractSkillPackage,
-  importSkillPackageBuffer,
-} = require('./skill.js');
 
 // 引入会议讨论模块
 const {
@@ -104,6 +125,37 @@ const {
   findProjectByBasename,
 } = require('./projects.js');
 
+
+async function createCloudConversationWorktree(input = {}) {
+  const cacheId = String(input?.conversationId || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  const worktreeDir = path.join(utools.getPath('userData'), 'Anywhere', 'cloud-worktrees', cacheId);
+  const created = await conversationDbHelperClient.invoke('createConversation', [{
+    dirPath: worktreeDir,
+    title: input?.title,
+    sessionData: input?.sessionData,
+    storageMode: 'cloud'
+  }]);
+  return { ...created, worktreeDir, storageMode: 'cloud' };
+}
+
+async function openCloudConversationSnapshot(input = {}) {
+  const conversationId = String(input?.descriptor?.conversationId || '').trim();
+  if (!conversationId) throw new Error('conversation_descriptor_invalid');
+  const worktreeDir = path.join(utools.getPath('userData'), 'Anywhere', 'cloud-worktrees', conversationId);
+  await conversationDbHelperClient.invoke('importConversationSnapshot', [{
+    dirPath: worktreeDir,
+    descriptor: { ...input.descriptor, storageMode: 'cloud' },
+    content: input.content
+  }]);
+  const opened = await conversationDbHelperClient.invoke('openConversation', [{
+    dirPath: worktreeDir,
+    reference: conversationId,
+    activeOnly: true
+  }]);
+  return { ...opened, worktreeDir, storageMode: 'cloud' };
+}
+
+
 const {
   parseChatMetadataYaml,
   serializeChatMetadataYaml,
@@ -114,14 +166,19 @@ const {
 
 window.api = {
   getConfig,
+  getTaskDeviceIdentity,
+  setTaskDeviceEnabled,
+  removeTaskAppliedDevice: removeTaskAppliedDeviceForCurrentConfig,
   updateConfig,
   saveSetting,
   updateConfigWithoutFeatures,
   getUser,
-  getRandomItem,
-  batchTestProviderKeys,
+  getRandomItem: (list) => getChatModule().getRandomItem(list),
+  batchTestProviderKeys: async (input = {}) => {
+    return await getChatModule().batchTestProviderKeys(input);
+  },
   createChatCompletion: async (params) => {
-    return await createChatCompletion(params);
+    return await getChatModule().createChatCompletion(params);
   },
   copyText,
   handleFilePath,
@@ -135,6 +192,65 @@ window.api = {
   writeLocalFile,
   setFileMtime,
   coderedirect,
+  openConversationWindow: async (input = {}) => {
+    const descriptor = input?.descriptor;
+    const sessionData = input?.sessionData;
+    const conversationId = String(descriptor?.conversationId || '').trim();
+    if (!conversationId || !sessionData || typeof sessionData !== 'object' || Array.isArray(sessionData)) {
+      throw new Error('conversation_open_payload_invalid');
+    }
+
+    utools.hideMainWindow();
+    const configResult = await getConfig();
+    const config = configResult?.config || defaultConfig.config;
+    const code = String(sessionData.CODE || 'AI');
+    const result = await openWindow(config, {
+      os: utools.isMacOS() ? 'macos' : utools.isWindows() ? 'win' : 'linux',
+      code,
+      originalCode: code,
+      type: 'conversation',
+      payload: '',
+      conversation: {
+        descriptor,
+        sessionData,
+        dirPath: String(input?.dirPath || ''),
+        worktreeDir: String(input?.worktreeDir || ''),
+        storageMode: String(input?.storageMode || descriptor?.storageMode || 'local')
+      },
+      conversationTitle: String(descriptor?.title || '')
+    });
+    utools.outPlugin();
+    return result;
+  },
+  listLocalConversations: (...args) => conversationDbHelperClient.invoke('listLocalConversations', args),
+  migrateJsonConversation: (input = {}) => conversationDbHelperClient.invoke('migrateJsonConversation', [input]),
+  createConversation: (input = {}) => conversationDbHelperClient.invoke('createConversation', [input]),
+  openConversation: (input = {}) => conversationDbHelperClient.invoke('openConversation', [input]),
+  loadConversationPage: (input = {}) => conversationDbHelperClient.invoke('loadConversationPage', [input]),
+  getConversationRequestMessages: (input = {}) => conversationDbHelperClient.invoke('getConversationRequestMessages', [input]),
+  repairConversationUiLinks: (input = {}) => conversationDbHelperClient.invoke('repairConversationUiLinks', [input]),
+
+  saveConversationSnapshot: (input = {}) => conversationDbHelperClient.invoke('saveConversationSnapshot', [input]),
+  saveConversationState: (input = {}) => conversationDbHelperClient.invoke('saveConversationState', [input]),
+  appendConversationMessages: (input = {}) => conversationDbHelperClient.invoke('appendConversationMessages', [input]),
+  updateConversationMessage: (input = {}) => conversationDbHelperClient.invoke('updateConversationMessage', [input]),
+  truncateConversationMessages: (input = {}) => conversationDbHelperClient.invoke('truncateConversationMessages', [input]),
+  deleteConversationMessages: (input = {}) => conversationDbHelperClient.invoke('deleteConversationMessages', [input]),
+  replaceActiveConversationMessages: (input = {}) => conversationDbHelperClient.invoke('replaceActiveConversationMessages', [input]),
+  restoreConversationCompaction: (input = {}) => conversationDbHelperClient.invoke('restoreConversationCompaction', [input]),
+  renameConversation: (input = {}) => conversationDbHelperClient.invoke('renameConversation', [input]),
+  deleteConversation: (input = {}) => conversationDbHelperClient.invoke('deleteConversation', [input]),
+  acquireConversationWriteLease: (input = {}) => conversationDbHelperClient.invoke('acquireConversationWriteLease', [input]),
+  heartbeatConversationWriteLease: (input = {}) => conversationDbHelperClient.invoke('heartbeatConversationWriteLease', [input]),
+  releaseConversationWriteLease: (input = {}) => conversationDbHelperClient.invoke('releaseConversationWriteLease', [input]),
+  createConversationSnapshot: (input = {}) => conversationDbHelperClient.invoke('createConversationSnapshot', [input]),
+  createCloudConversationWorktree,
+  openCloudConversationSnapshot,
+
+  readConversationSnapshot: (input = {}) => conversationDbHelperClient.invoke('readConversationSnapshot', [input]),
+  importConversationSnapshot: (input = {}) => conversationDbHelperClient.invoke('importConversationSnapshot', [input]),
+
+  getConversationDescriptor: (input = {}) => conversationDbHelperClient.invoke('getConversationDescriptor', [input]),
   readLocalProjects,
   writeLocalProjects,
   parseProjectsYaml,
@@ -304,37 +420,37 @@ window.api = {
   // Skill 相关 API
   listSkills: async (path) => {
     try {
-      return listSkills(path);
+      return getSkillModule().listSkills(path);
     } catch (e) {
       console.error("listSkills error:", e);
       return [];
     }
   },
   getSkillDetails: async (rootPath, id) => {
-    return getSkillDetails(rootPath, id);
+    return getSkillModule().getSkillDetails(rootPath, id);
   },
   saveSkill: async (rootPath, id, content) => {
-    const res = await saveSkill(rootPath, id, content);
+    const res = await getSkillModule().saveSkill(rootPath, id, content);
     broadcastEvent('skills-updated');
     return res;
   },
   deleteSkill: async (rootPath, id) => {
-    const res = await deleteSkill(rootPath, id);
+    const res = await getSkillModule().deleteSkill(rootPath, id);
     broadcastEvent('skills-updated');
     return res;
   },
   // 暴露给前端的导出/导入接口
   exportSkillToPackage: async (rootPath, skillId, outputDir, options = {}) => {
-    return exportSkillToPackage(rootPath, skillId, outputDir, options);
+    return getSkillModule().exportSkillToPackage(rootPath, skillId, outputDir, options);
   },
   exportSkillPackageBuffer: async (rootPath, skillId, options = {}) => {
-    return exportSkillPackageBuffer(rootPath, skillId, options);
+    return getSkillModule().exportSkillPackageBuffer(rootPath, skillId, options);
   },
   extractSkillPackage: async (filePath) => {
-    return extractSkillPackage(filePath);
+    return getSkillModule().extractSkillPackage(filePath);
   },
   importSkillPackageBuffer: async (rootPath, skillId, packageBuffer) => {
-    const result = importSkillPackageBuffer(rootPath, skillId, packageBuffer);
+    const result = getSkillModule().importSkillPackageBuffer(rootPath, skillId, packageBuffer);
     broadcastEvent('skills-updated');
     return result;
   },
@@ -368,11 +484,12 @@ window.api = {
   // 生成 Skill Tool 定义 (供前端构建请求参数时使用)
   getSkillToolDefinition: async (rootPath, enabledSkillNames = []) => {
     try {
-      const allSkills = listSkills(rootPath);
+      const skillModule = getSkillModule();
+      const allSkills = skillModule.listSkills(rootPath);
       // 过滤出已启用且存在的 Skills
       const activeSkills = allSkills.filter(s => enabledSkillNames.includes(s.name));
       if (activeSkills.length === 0) return null;
-      return generateSkillToolDefinition(activeSkills, rootPath);
+      return skillModule.generateSkillToolDefinition(activeSkills, rootPath);
     } catch (e) {
       return null;
     }
@@ -380,7 +497,7 @@ window.api = {
   // 执行 Skill (AI 调用 tool 时使用)
   resolveSkillInvocation: async (rootPath, skillName, toolArgs, globalContext = null, signal = null) => {
     // 1. 获取 Skill 解析结果
-    const result = resolveSkillInvocation(rootPath, skillName, toolArgs);
+    const result = getSkillModule().resolveSkillInvocation(rootPath, skillName, toolArgs);
 
     // 2. 检查是否为 Fork 请求
     if (result && result.__isForkRequest && result.subAgentArgs) {
@@ -394,7 +511,7 @@ window.api = {
 
       // 3. 自动调用内置的 sub_agent 工具
       // 注意：invokeBuiltinTool 已经修复为返回序列化的 JSON 字符串，直接透传即可
-      return await invokeBuiltinTool(
+      return await getMcpBuiltinModule().invokeBuiltinTool(
         'sub_agent',
         result.subAgentArgs,
         signal,
@@ -421,6 +538,7 @@ window.api = {
     const tasks = configResult.config.tasks || {};
     const task = tasks[taskId];
     if (!task) return false;
+    if (!reconcileTaskDeviceState(task).enabled) return false;
 
     const windowConfig = JSON.parse(JSON.stringify(configResult.config));
 
@@ -506,10 +624,10 @@ window.api = {
 
   // Compact cache (upstream)
   getCompactCache: async () => {
-    return require('./compact.js').getCompactCacheSnapshot();
+    return getCompactModule().getCompactCacheSnapshot();
   },
   importCompactCache: async (models = {}) => {
-    return require('./compact.js').importCompactCacheModels(models);
+    return getCompactModule().importCompactCacheModels(models);
   },
 };
 
@@ -522,12 +640,13 @@ const commandHandlers = {
 
     // 2. 将高开销的底层 API 调用和窗口创建推入下一个事件循环，让系统的隐藏动画先行
     setTimeout(() => {
-      const { windowMap, openAppendSelectorWindow } = require('./data.js');
+      const { windowMap, windowRpcCapabilityMap, openAppendSelectorWindow } = require('./data.js');
 
       // 清理僵尸窗口逻辑
       for (const [sid, win] of windowMap.entries()) {
         if (win.isDestroyed()) {
           windowMap.delete(sid);
+          windowRpcCapabilityMap.delete(sid);
           utools.removeFeature(`append_to_${sid}`);
         }
       }
@@ -580,10 +699,13 @@ const commandHandlers = {
     const { type, payload, code } = action;
 
     const senderId = code.replace('append_to_', '');
-    const { windowMap } = require('./data.js');
+    const { windowMap, windowRpcCapabilityMap } = require('./data.js');
+
     const win = windowMap.get(senderId);
 
     if (!win || win.isDestroyed()) {
+      windowMap.delete(senderId);
+      windowRpcCapabilityMap.delete(senderId);
       utools.removeFeature(code);
       utools.outPlugin();
       return;
@@ -675,7 +797,7 @@ const commandHandlers = {
     utools.outPlugin();
   },
 
-  // 直接打开快捷助手
+  // 直接打开智能体
   handleAssistant: async ({ code, type, payload }) => {
     // 避免弹出主窗口
     utools.hideMainWindow();
@@ -781,11 +903,12 @@ utools.onPluginEnter(async (action) => {
 
   // 启动时顺便清理一下因强制退出等意外残留的僵尸指令
   const features = utools.getFeatures();
-  const { windowMap } = require('./data.js');
+  const { windowMap, windowRpcCapabilityMap } = require('./data.js');
 
   for (const [sid, win] of windowMap.entries()) {
     if (win.isDestroyed()) {
       windowMap.delete(sid);
+      windowRpcCapabilityMap.delete(sid);
     }
   }
 
@@ -815,7 +938,7 @@ utools.onPluginEnter(async (action) => {
 utools.onPluginOut((isKill) => {
   if (isKill) {
     try {
-      killAllBackgroundShells();
+      getMcpBuiltinModule().killAllBackgroundShells();
     } catch (e) {
       console.error("Error during background shells cleanup:", e);
     }
@@ -823,7 +946,114 @@ utools.onPluginOut((isKill) => {
 });
 
 const { ipcRenderer } = require('electron');
-const { windowMap } = require('./data.js');
+const { windowMap, windowRpcCapabilityMap } = require('./data.js');
+
+
+const windowConversationLeaseRegistry = new Map();
+const windowLeaseProbeTimers = new Map();
+const WINDOW_LEASE_PROBE_INTERVAL_MS = 2000;
+const conversationDbHelperClient = createConversationDbHelperClient({
+  helperPath: path.join(__dirname, 'conversation_db_helper.js'),
+  execPath: process.execPath,
+  expectedModuleAbi: getCurrentModuleAbi()
+});
+
+function isMatchingConversationRpcCapability(request = {}) {
+  const expected = windowRpcCapabilityMap.get(request.senderId);
+  const actual = typeof request.capability === 'string' ? request.capability : '';
+  if (!expected || !actual || expected.length !== actual.length) return false;
+  const expectedBytes = Buffer.from(expected);
+  const actualBytes = Buffer.from(actual);
+  return crypto.timingSafeEqual(expectedBytes, actualBytes);
+}
+
+async function invokeConversationHelperMethod(method, args = [], options = {}) {
+  if (method === 'createCloudConversationWorktree') {
+    return await createCloudConversationWorktree(args?.[0] || {});
+  }
+  if (method === 'openCloudConversationSnapshot') {
+    return await openCloudConversationSnapshot(args?.[0] || {});
+  }
+  return await conversationDbHelperClient.invoke(method, args, options);
+}
+
+const handleConversationRpcRequest = createConversationRpcRequestHandler({
+  resolveWindow: (senderId) => windowMap.get(senderId),
+  authorizeRequest: isMatchingConversationRpcCapability,
+  invokeMethod: async (method, args, request) => {
+    const result = await invokeConversationHelperMethod(method, args);
+    if (method === 'acquireConversationWriteLease' && result?.ok && result?.leaseEpoch) {
+      const lease = normalizeWindowLeaseRegistration({
+        ...(args?.[0] || {}),
+        leaseEpoch: result.leaseEpoch
+      });
+      if (lease) {
+        windowConversationLeaseRegistry.set(request.senderId, lease);
+        bindWindowLeaseCleanup(request.senderId, windowMap.get(request.senderId));
+      }
+    } else if (method === 'releaseConversationWriteLease' && result?.ok) {
+      windowConversationLeaseRegistry.delete(request.senderId);
+      clearWindowLeaseProbe(request.senderId);
+    }
+    return result;
+  }
+});
+
+ipcRenderer.on(CONVERSATION_RPC_REQUEST_CHANNEL, (_event, request) => {
+  void handleConversationRpcRequest(request);
+});
+
+function normalizeWindowLeaseRegistration(input = {}) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const dirPath = typeof source.dirPath === 'string' ? source.dirPath.trim() : '';
+  const conversationId = typeof source.conversationId === 'string' ? source.conversationId.trim() : '';
+  const holderInstanceId = typeof source.holderInstanceId === 'string' ? source.holderInstanceId.trim() : '';
+  const leaseEpoch = Number(source.leaseEpoch);
+  if (!dirPath || !conversationId || !holderInstanceId || !Number.isFinite(leaseEpoch) || leaseEpoch <= 0) return null;
+  return { dirPath, conversationId, holderInstanceId, leaseEpoch };
+}
+
+function clearWindowLeaseProbe(senderId) {
+  const timer = windowLeaseProbeTimers.get(senderId);
+  if (timer) clearInterval(timer);
+  windowLeaseProbeTimers.delete(senderId);
+}
+
+function releaseRegisteredWindowLease(senderId, reason = 'closed') {
+  const lease = windowConversationLeaseRegistry.get(senderId);
+  clearWindowLeaseProbe(senderId);
+  if (!lease) return false;
+  windowConversationLeaseRegistry.delete(senderId);
+  Promise.resolve(
+    conversationDbHelperClient.invoke('releaseConversationWriteLease', [lease])
+  ).catch((error) => {
+    console.error(`[conversation-lease] release on window ${reason} failed:`, error?.message || error);
+  });
+  return true;
+}
+
+// uTools custom BrowserWindow proxies deliberately do not expose BrowserWindow/WebContents
+// instance events. Probe only explicit terminal states supported by its API; do not release a
+// lease for a merely hidden or unresponsive window.
+function probeRegisteredWindowLease(senderId) {
+  const bw = windowMap.get(senderId);
+  const destroyed = !bw || typeof bw.isDestroyed !== 'function' || bw.isDestroyed();
+  const crashed = !destroyed && typeof bw.webContents?.isCrashed === 'function' && bw.webContents.isCrashed();
+  if (!destroyed && !crashed) return;
+  const reason = crashed ? 'webcontents-crashed' : 'window-destroyed';
+  const hadLease = releaseRegisteredWindowLease(senderId, reason);
+  console.warn('[conversation-window] terminal-state', { senderId, reason, hadLease });
+  windowMap.delete(senderId);
+  windowRpcCapabilityMap.delete(senderId);
+  try { utools.removeFeature(`append_to_${senderId}`); } catch {}
+}
+
+function bindWindowLeaseCleanup(senderId, bw) {
+  if (!bw || windowLeaseProbeTimers.has(senderId)) return;
+  const timer = setInterval(() => probeRegisteredWindowLease(senderId), WINDOW_LEASE_PROBE_INTERVAL_MS);
+  windowLeaseProbeTimers.set(senderId, timer);
+  probeRegisteredWindowLease(senderId);
+}
 
 // 接收来自选择面板的转发消息，触发目标窗口
 ipcRenderer.on('forward-append-msg', (e, { senderId, type, payload }) => {
@@ -838,7 +1068,7 @@ ipcRenderer.on('forward-append-msg', (e, { senderId, type, payload }) => {
   }
 });
 
-ipcRenderer.on('window-event', (e, { senderId, event }) => {
+ipcRenderer.on('window-event', (e, { senderId, event, state }) => {
   const bw = windowMap.get(senderId);
   if (!bw) {
     console.warn(`[IPC Hub] Window with senderId ${senderId} not found.`);
@@ -847,6 +1077,22 @@ ipcRenderer.on('window-event', (e, { senderId, event }) => {
 
   try {
     switch (event) {
+
+      case 'conversation-lease-register': {
+        const lease = normalizeWindowLeaseRegistration(state);
+        if (!lease) {
+          console.warn('[conversation-lease] ignored invalid window lease registration', { senderId });
+          break;
+        }
+        windowConversationLeaseRegistry.set(senderId, lease);
+        bindWindowLeaseCleanup(senderId, bw);
+        break;
+      }
+      case 'conversation-lease-clear': {
+        windowConversationLeaseRegistry.delete(senderId);
+        clearWindowLeaseProbe(senderId);
+        break;
+      }
       case 'toggle-always-on-top': {
         const currentState = bw.isAlwaysOnTop();
         const newState = !currentState;
@@ -854,9 +1100,16 @@ ipcRenderer.on('window-event', (e, { senderId, event }) => {
         bw.webContents.send('always-on-top-changed', newState);
         break;
       }
+      case 'apply-conversation-window-state': {
+        applyConversationWindowState(senderId, state || {});
+        break;
+      }
       case 'close-window': {
+        const hadLease = releaseRegisteredWindowLease(senderId, 'requested-close');
+        console.warn('[conversation-window] close-requested', { senderId, hadLease });
         bw.close();
         windowMap.delete(senderId);
+        windowRpcCapabilityMap.delete(senderId);
         utools.removeFeature(`append_to_${senderId}`); // 窗口关闭时主动移除对应的追问指令
         break;
       }
@@ -1043,6 +1296,9 @@ async function checkScheduledTasks() {
 
     for (const taskId in tasks) {
       const task = tasks[taskId];
+      const deviceState = reconcileTaskDeviceState(task);
+      if (!deviceState.enabled) continue;
+      needsUpdate = needsUpdate || deviceState.changed;
       const now = Date.now();
       const nowDate = new Date(now);
       const slotKey = getDueTaskRunSlotKey(taskId, task, now, nowDate);
@@ -1059,7 +1315,7 @@ async function checkScheduledTasks() {
         task.lastRunTime = completedAt;
         task.lastRunSlotKey = slotKey;
         if (task.triggerType === 'single') {
-          task.enabled = false;
+          setCurrentTaskDeviceEnabled(task, false);
         }
         processedTaskRunSlots.set(slotKey, completedAt);
         needsUpdate = true;
@@ -1095,7 +1351,7 @@ try {
 
 ipcRenderer.on('background-shell-request', async (e, { requestId, action, payload }) => {
   try {
-    const result = await handleBgShellRequest(action, payload);
+    const result = await getMcpBuiltinModule().handleBgShellRequest(action, payload);
 
     // 广播结果给所有存活的窗口，让发起者认领
     for (const win of windowMap.values()) {
@@ -1120,9 +1376,9 @@ ipcRenderer.on('background-shell-request', async (e, { requestId, action, payloa
 
 // ================= 窗口彻底关闭/刷新时的清理 =================
 window.addEventListener('beforeunload', () => {
+  conversationDbHelperClient.dispose();
   try {
-    const { killAllBackgroundShells } = require('./mcp_builtin.js');
-    killAllBackgroundShells();
+    getMcpBuiltinModule().killAllBackgroundShells();
   } catch (e) {
     console.error("Cleanup on beforeunload failed:", e);
   }

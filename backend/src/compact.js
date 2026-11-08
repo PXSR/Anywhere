@@ -6,6 +6,161 @@ const COMPACT_CACHE_DOC_ID = 'conversation_compact_cache'
 const DEFAULT_CONTEXT_LENGTH = 256 * 1024
 const DEFAULT_TRIGGER_RATIO = 0.9
 const DEFAULT_KEEP_RECENT_ROUNDS = 3
+
+const DEFAULT_COMPACT_TOTAL_TIMEOUT_MS = 10 * 60 * 1000
+const DEFAULT_COMPACT_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1000
+
+function getToolCallIds(message = {}) {
+  if (message?.role !== 'assistant' || !Array.isArray(message?.tool_calls)) return []
+  return message.tool_calls
+    .map((call) => String(call?.id || call?.tool_call_id || '').trim())
+    .filter(Boolean)
+}
+
+function selectNearestCut(candidates = [], { minTokens = -Infinity, maxTokens = Infinity, preferLower = true } = {}) {
+  let selected = null
+  for (const candidate of candidates) {
+    if (candidate.tokens < minTokens || candidate.tokens > maxTokens) continue
+    if (!selected) {
+      selected = candidate
+      continue
+    }
+    const isBetter = preferLower
+      ? candidate.tokens < selected.tokens || (candidate.tokens === selected.tokens && candidate.cutIndex < selected.cutIndex)
+      : candidate.tokens > selected.tokens || (candidate.tokens === selected.tokens && candidate.cutIndex > selected.cutIndex)
+    if (isBetter) selected = candidate
+  }
+  return selected
+}
+
+function selectCompactionCut({
+  systemMessages = [],
+  windowMessages = [],
+  thresholdTokens = 0,
+  preferredMaxTokens = 0,
+  keepRecentRounds = 0,
+  fixedOverheadTokens = 0,
+  modelInput = '',
+  includeCandidates = false
+} = {}) {
+  const system = Array.isArray(systemMessages) ? systemMessages : []
+  const window = Array.isArray(windowMessages) ? windowMessages : []
+  const threshold = Math.max(1, Math.floor(Number(thresholdTokens) || 0))
+  const preferredMax = Math.max(threshold, Math.floor(Number(preferredMaxTokens) || threshold))
+  if (window.length < 2 || threshold <= 0) return { cutIndex: 0, strategy: 'none', candidates: [] }
+
+  const userStarts = window
+    .map((message, index) => (message?.role === 'user' && index > 0 ? index : -1))
+    .filter((index) => index > 0)
+  const allUserStarts = window
+    .map((message, index) => (message?.role === 'user' ? index : -1))
+    .filter((index) => index >= 0)
+  const aiUnitStarts = window
+    .map((message, index) => (message?.role === 'assistant' && index > 0 ? index : -1))
+    .filter((index) => index > 0)
+  const requestedKeepRounds = Math.max(0, Math.floor(Number(keepRecentRounds) || 0))
+  const hasEnoughUserRounds = requestedKeepRounds === 0 || allUserStarts.length >= requestedKeepRounds
+  const retainedUnitStarts = hasEnoughUserRounds ? allUserStarts : aiUnitStarts
+  const preserveFrom = requestedKeepRounds > 0 && retainedUnitStarts.length >= requestedKeepRounds
+    ? retainedUnitStarts[retainedUnitStarts.length - requestedKeepRounds]
+    : 0
+  const retentionKind = hasEnoughUserRounds ? 'user' : 'ai'
+
+  const userStartSet = new Set(userStarts)
+  const pendingToolCallIds = new Set()
+  const baseTokens = estimateMessagesTokens(system, { modelInput }) + Math.max(0, Number(fixedOverheadTokens) || 0)
+  let prefixTokens = baseTokens
+  const candidates = []
+  for (let cutIndex = 1; cutIndex < window.length; cutIndex += 1) {
+    const previousMessage = window[cutIndex - 1]
+    prefixTokens += estimateMessagesTokens([previousMessage], { modelInput })
+    for (const toolCallId of getToolCallIds(previousMessage)) pendingToolCallIds.add(toolCallId)
+    if (previousMessage?.role === 'tool') {
+      const toolCallId = String(previousMessage?.tool_call_id || previousMessage?.toolCallId || '').trim()
+      if (toolCallId) pendingToolCallIds.delete(toolCallId)
+    }
+    if (pendingToolCallIds.size > 0 || window[cutIndex]?.role === 'tool') continue
+    candidates.push({
+      cutIndex,
+      tokens: prefixTokens,
+      isUserRoundBoundary: userStartSet.has(cutIndex),
+      preservesRequestedRounds: preserveFrom > 0 && cutIndex <= preserveFrom,
+      retentionKind
+    })
+  }
+  if (!candidates.length) return { cutIndex: 0, strategy: 'none', candidates: [] }
+
+  const pickWithin = (items, minTokens, maxTokens, strategy, preferLower) => {
+    const matching = selectNearestCut(items, { minTokens, maxTokens, preferLower })
+    return matching ? { ...matching, strategy } : null
+  }
+  const preferredRounds = candidates.filter((candidate) => candidate.isUserRoundBoundary && candidate.preservesRequestedRounds)
+  const userRound = candidates.filter((candidate) => candidate.isUserRoundBoundary)
+  const preservedSafe = candidates.filter((candidate) => candidate.preservesRequestedRounds)
+  const retainedUnitLabel = retentionKind === 'user' ? 'user_round' : 'ai_unit'
+
+  // The configured threshold window is authoritative. Keeping recent units only ranks
+  // candidates inside it; it cannot force a much earlier cut when a safe 80~90%/90~95% cut exists.
+  const selected = retentionKind === 'user'
+    ? (
+        pickWithin(preferredRounds, threshold, preferredMax, 'user_round_keep', true)
+        || pickWithin(userRound, threshold, preferredMax, 'user_round_adaptive', true)
+        || pickWithin(preservedSafe, threshold, preferredMax, 'safe_keep', true)
+        || pickWithin(candidates, threshold, preferredMax, 'safe_adaptive', true)
+        || pickWithin(preferredRounds, -Infinity, threshold, 'user_round_keep_threshold_fallback', false)
+        || pickWithin(userRound, -Infinity, threshold, 'user_round_adaptive_threshold_fallback', false)
+        || pickWithin(preservedSafe, -Infinity, threshold, 'safe_keep_threshold_fallback', false)
+        || pickWithin(candidates, -Infinity, threshold, 'safe_adaptive_threshold_fallback', false)
+      )
+    : (
+        pickWithin(preservedSafe, threshold, preferredMax, `${retainedUnitLabel}_keep`, true)
+        || pickWithin(candidates, threshold, preferredMax, 'safe_adaptive', true)
+        || pickWithin(preservedSafe, -Infinity, threshold, `${retainedUnitLabel}_keep_threshold_fallback`, false)
+        || pickWithin(candidates, -Infinity, threshold, 'safe_adaptive_threshold_fallback', false)
+      )
+  return selected
+    ? { ...selected, ...(includeCandidates ? { candidates } : {}) }
+    : { cutIndex: 0, strategy: 'none', ...(includeCandidates ? { candidates } : {}) }
+}
+
+function createCompactionTimeoutContext(upstreamSignal = null, {
+  totalTimeoutMs = DEFAULT_COMPACT_TOTAL_TIMEOUT_MS,
+  idleTimeoutMs = DEFAULT_COMPACT_STREAM_IDLE_TIMEOUT_MS
+} = {}) {
+  const controller = new AbortController()
+  let timeoutCode = ''
+  let totalTimer = null
+  let idleTimer = null
+  const abortWith = (code, reason = null) => {
+    if (controller.signal.aborted) return
+    timeoutCode = code || ''
+    try { controller.abort(reason || new Error(code)) } catch { controller.abort() }
+  }
+  const forwardAbort = () => abortWith('', upstreamSignal?.reason)
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) forwardAbort()
+    else upstreamSignal.addEventListener('abort', forwardAbort, { once: true })
+  }
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer)
+    const timeout = Math.max(1, Number(idleTimeoutMs) || DEFAULT_COMPACT_STREAM_IDLE_TIMEOUT_MS)
+    idleTimer = setTimeout(() => abortWith('compact_stream_idle_timeout', new Error(`compact_stream_idle_timeout_${timeout}ms`)), timeout)
+  }
+  const total = Math.max(1, Number(totalTimeoutMs) || DEFAULT_COMPACT_TOTAL_TIMEOUT_MS)
+  totalTimer = setTimeout(() => abortWith('compact_request_timeout', new Error(`compact_request_timeout_${total}ms`)), total)
+  armIdle()
+  return {
+    signal: controller.signal,
+    touch: armIdle,
+    getTimeoutCode: () => timeoutCode,
+    cleanup: () => {
+      if (totalTimer) clearTimeout(totalTimer)
+      if (idleTimer) clearTimeout(idleTimer)
+      if (upstreamSignal) upstreamSignal.removeEventListener('abort', forwardAbort)
+    }
+  }
+}
+
 // Structured handoff prompt adapted from local compact skill + Codex-style continuation needs.
 const DEFAULT_COMPACT_PROMPT = [
   'You are performing CONTEXT CHECKPOINT COMPACTION for the same conversation thread.',
@@ -121,13 +276,123 @@ function extractTextFromContent(content) {
     .map((part) => {
       if (!part || typeof part !== 'object') return ''
       if (part.type === 'text' && typeof part.text === 'string') return part.text
-      if (part.type === 'image_url') return '[image]'
+      // Images and PDFs are counted separately by the visual estimator; do not double-count placeholders as text.
+      if (part.type === 'image_url' || part.type === 'file' || part.type === 'input_file') return ''
       if (part.type === 'input_audio' || part.type === 'audio') return '[audio]'
       return ''
     })
     .filter(Boolean)
     .join('\n')
 }
+
+// Local multimodal estimates are calibrated from the user's observed Gemini/GPT usage.
+// They are intentionally provider-neutral approximations; API usage remains authoritative.
+const BINARY_MEBIBYTE = 1024 * 1024
+const IMAGE_TOKENS_PER_MEBIBYTE = 1875
+const PDF_TOKENS_PER_PAGE = 32250 / 29
+const UNKNOWN_IMAGE_TOKENS = Math.round(1.44 * IMAGE_TOKENS_PER_MEBIBYTE)
+const VISUAL_METADATA_CACHE_LIMIT = 256
+const visualMetadataCache = new Map()
+
+function getVisualCacheKey(kind, value = '') {
+  const source = typeof value === 'string' ? value : ''
+  return `${kind}:${source.length}:${source.slice(0, 160)}:${source.slice(-160)}`
+}
+
+function rememberVisualMetadata(cacheKey, value) {
+  if (!cacheKey) return value
+  visualMetadataCache.delete(cacheKey)
+  visualMetadataCache.set(cacheKey, value)
+  while (visualMetadataCache.size > VISUAL_METADATA_CACHE_LIMIT) {
+    visualMetadataCache.delete(visualMetadataCache.keys().next().value)
+  }
+  return value
+}
+
+function estimateDataUrlBinaryBytes(dataUrl = '') {
+  const cacheKey = getVisualCacheKey('binary-bytes', dataUrl)
+  const cached = visualMetadataCache.get(cacheKey)
+  if (Number.isFinite(cached) && cached >= 0) return cached
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) return rememberVisualMetadata(cacheKey, 0)
+  const comma = dataUrl.indexOf(',')
+  if (comma < 0 || !/;base64(?:;|$)/i.test(dataUrl.slice(0, comma))) return rememberVisualMetadata(cacheKey, 0)
+  const payloadLength = dataUrl.length - comma - 1
+  if (payloadLength <= 0) return rememberVisualMetadata(cacheKey, 0)
+  const last = dataUrl.charCodeAt(dataUrl.length - 1)
+  const previous = dataUrl.charCodeAt(dataUrl.length - 2)
+  const padding = last === 61 ? (previous === 61 ? 2 : 1) : 0
+  return rememberVisualMetadata(cacheKey, Math.max(0, Math.floor((payloadLength * 3) / 4) - padding))
+}
+
+function estimatePdfPageCountFromDataUrl(dataUrl = '') {
+  const cacheKey = getVisualCacheKey('pdf-pages', dataUrl)
+  const cached = visualMetadataCache.get(cacheKey)
+  if (Number.isFinite(cached) && cached > 0) return cached
+  if (typeof dataUrl !== 'string' || !/^data:application\/pdf(?:;[^,]*)?;base64,/i.test(dataUrl)) return 1
+  const base64Start = dataUrl.indexOf(',') + 1
+  if (base64Start <= 0 || base64Start >= dataUrl.length) return 1
+  try {
+    const chunkChars = 64 * 1024
+    let carry = ''
+    let pageObjects = 0
+    let maxPageTreeCount = 0
+    for (let offset = base64Start; offset < dataUrl.length; offset += chunkChars) {
+      const chunk = Buffer.from(dataUrl.slice(offset, offset + chunkChars), 'base64').toString('latin1')
+      const source = carry + chunk
+      for (const match of source.matchAll(/\/Type\s*\/Page\b/g)) {
+        if (match.index + match[0].length > carry.length) pageObjects += 1
+      }
+      for (const match of source.matchAll(/\/Type\s*\/Pages\b[\s\S]{0,256}?\/Count\s+(\d+)/g)) {
+        if (match.index + match[0].length > carry.length) maxPageTreeCount = Math.max(maxPageTreeCount, Number(match[1]) || 0)
+      }
+      carry = source.slice(-512)
+    }
+    return rememberVisualMetadata(cacheKey, Math.max(1, pageObjects, maxPageTreeCount))
+  } catch {
+    return rememberVisualMetadata(cacheKey, 1)
+  }
+}
+
+function estimateVisualImageTokens({ byteLength, bytes } = {}) {
+  const resolvedBytes = Math.max(0, Number(byteLength ?? bytes) || 0)
+  if (resolvedBytes <= 0) return UNKNOWN_IMAGE_TOKENS
+  return Math.max(1, Math.round((resolvedBytes / BINARY_MEBIBYTE) * IMAGE_TOKENS_PER_MEBIBYTE))
+}
+
+function getPartTokenEstimate(part = {}) {
+  if (!part || typeof part !== 'object') return {}
+  const imageMeta = part?.image_url && typeof part.image_url === 'object' ? part.image_url.tokenEstimate : null
+  const fileMeta = part?.file && typeof part.file === 'object' ? part.file.tokenEstimate : null
+  return part.tokenEstimate || imageMeta || fileMeta || {}
+}
+
+function estimateMultimodalContentTokens(content) {
+  if (!Array.isArray(content)) return 0
+  let total = 0
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue
+    if (part.type === 'image_url') {
+      const source = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url
+      const metadata = getPartTokenEstimate(part)
+      const byteLength = Math.max(0, Number(metadata?.byteLength ?? metadata?.bytes ?? metadata?.size) || estimateDataUrlBinaryBytes(source))
+      total += estimateVisualImageTokens({ byteLength })
+      continue
+    }
+    if (part.type === 'file' || part.type === 'input_file') {
+      const file = part.file || part
+      const isPdf = /^application\/pdf(?:;|$)/i.test(String(file?.mimeType || file?.type || ''))
+        || /^data:application\/pdf;base64,/i.test(String(file?.file_data || file?.url || ''))
+        || /\.pdf$/i.test(String(file?.filename || file?.name || ''))
+      if (!isPdf) continue
+      const metadata = getPartTokenEstimate(part)
+      const source = String(file?.file_data || file?.url || '')
+      const pageCount = Math.max(1, Math.floor(Number(metadata?.pageCount || metadata?.pages) || estimatePdfPageCountFromDataUrl(source)))
+      total += Math.max(1, Math.round(pageCount * PDF_TOKENS_PER_PAGE))
+    }
+  }
+  return total
+}
+
 
 function messageToPlainText(message = {}) {
   const role = message?.role || 'unknown'
@@ -145,17 +410,19 @@ function messageToPlainText(message = {}) {
   return [role, text, reasoning, toolCalls].filter(Boolean).join('\n')
 }
 
-function estimateMessagesTokens(messages = []) {
+function estimateMessagesTokens(messages = [], { modelInput = '' } = {}) {
   if (!Array.isArray(messages) || messages.length === 0) return 0
   let total = 0
   for (const message of messages) {
     const text = messageToPlainText(message)
-    if (!text) continue
-    try {
-      total += encode(text).length
-    } catch {
-      total += Math.ceil(text.length / 4)
+    if (text) {
+      try {
+        total += encode(text).length
+      } catch {
+        total += Math.ceil(text.length / 4)
+      }
     }
+    total += estimateMultimodalContentTokens(message?.content, modelInput)
   }
   // small per-message overhead
   total += messages.length * 4
@@ -827,40 +1094,51 @@ async function requestSummaryOnce({
     throw new Error('compact_model_missing')
   }
 
-  const response = await createChatCompletion({
-    baseUrl: provider?.url || provider?.baseUrl || '',
-    apiKey: provider?.api_key || provider?.apiKey || '',
-    model: modelName,
-    apiType: apiType || provider?.apiType || 'chat_completions',
-    headers: provider?.headers || {},
-    retryCount: Number.isInteger(provider?.retryCount) ? provider.retryCount : 3,
-    messages: sanitizedMessages,
-    stream,
-    signal
-  })
+  const timeoutContext = createCompactionTimeoutContext(signal)
+  try {
+    const response = await createChatCompletion({
+      baseUrl: provider?.url || provider?.baseUrl || '',
+      apiKey: provider?.api_key || provider?.apiKey || '',
+      model: modelName,
+      apiType: apiType || provider?.apiType || 'chat_completions',
+      headers: provider?.headers || {},
+      retryCount: Number.isInteger(provider?.retryCount) ? provider.retryCount : 3,
+      messages: sanitizedMessages,
+      stream,
+      signal: timeoutContext.signal
+    })
+    timeoutContext.touch()
 
-  if (response && typeof response[Symbol.asyncIterator] === 'function') {
-    let text = ''
-    for await (const part of response) {
-      throwIfAborted(signal)
-      const delta = part?.choices?.[0]?.delta
-      if (typeof delta?.content === 'string') {
-        text += delta.content
-      } else if (Array.isArray(delta?.content)) {
-        text += delta.content
-          .filter((item) => item?.type === 'text')
-          .map((item) => String(item.text || ''))
-          .join('')
-      } else if (typeof part?.delta === 'string') {
-        text += part.delta
-      } else if (typeof part?.output_text === 'string') {
-        text += part.output_text
+    if (response && typeof response[Symbol.asyncIterator] === 'function') {
+      let text = ''
+      for await (const part of response) {
+        timeoutContext.touch()
+        throwIfAborted(timeoutContext.signal)
+        const delta = part?.choices?.[0]?.delta
+        if (typeof delta?.content === 'string') {
+          text += delta.content
+        } else if (Array.isArray(delta?.content)) {
+          text += delta.content
+            .filter((item) => item?.type === 'text')
+            .map((item) => String(item.text || ''))
+            .join('')
+        } else if (typeof part?.delta === 'string') {
+          text += part.delta
+        } else if (typeof part?.output_text === 'string') {
+          text += part.output_text
+        }
       }
+      return text.trim()
     }
-    return text.trim()
-  }
 
-  return extractAssistantTextFromCompletion(response, apiType || provider?.apiType || 'chat_completions')
+    return extractAssistantTextFromCompletion(response, apiType || provider?.apiType || 'chat_completions')
+  } catch (error) {
+    const timeoutCode = timeoutContext.getTimeoutCode()
+    if (timeoutCode) throw new Error(timeoutCode)
+    throw error
+  } finally {
+    timeoutContext.cleanup()
+  }
 }
 
 /**
@@ -948,7 +1226,7 @@ async function runConversationCompaction({
   }
 
   const summarySource = flattenForSummary(sourceMessages)
-  const localTokens = estimateMessagesTokens(summarySource)
+  const localTokens = estimateMessagesTokens(summarySource, { modelInput: modelValue })
   report('estimate_usage', {
     percent: 25,
     message: '估算上下文用量…',
@@ -1012,7 +1290,8 @@ async function runConversationCompaction({
       createdAt: Date.now(),
       collapsed: true,
       expanded: false,
-      archivedMessages: deepClone(sourceMessages),
+      // SQLite canonical messages remain the recovery source. Do not clone the covered prefix
+      // into this runtime IPC result: it can contain large attachment data URLs and is unused by new-session restore.
       timestamp: new Date().toLocaleString('sv-SE')
     },
     modelConfig,
@@ -1055,11 +1334,14 @@ module.exports = {
   pruneCompactCacheByEnabledModels,
   resolveModelContextLength,
   estimateMessagesTokens,
+  estimateVisualImageTokens,
   estimateTextTokens,
   resolveEffectiveTokenUsage,
   buildCompactedHistory,
   runConversationCompaction,
   shouldAutoCompact,
+  selectCompactionCut,
+  createCompactionTimeoutContext,
   COMPACT_DEFAULTS,
   normalizeModelKey,
   DEFAULT_CONTEXT_LENGTH,

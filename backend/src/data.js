@@ -1,7 +1,22 @@
 const { webFrame, nativeImage } = require('electron');
 const crypto = require('crypto');
+const {
+  setCompatibleFeatureDescription,
+  getCompatibleFeatureDescription,
+  createCompatibleWindowOptions,
+} = require('./utoolsRuntime.js');
 
 const windowMap = new Map();
+const windowRpcCapabilityMap = new Map();
+
+const {
+  getCurrentTaskDevice,
+  reconcileTaskDeviceStates,
+  removeTaskAppliedDevice,
+  serializeTasksForSharedStorage,
+  setCurrentTaskDeviceEnabled,
+} = require('./task_devices.js');
+
 const feature_suffix = "anywhere助手^_^"
 
 function getLazyRuntime() {
@@ -274,7 +289,7 @@ function splitConfigForStorage(fullConfig) {
     promptsPart: prompts,
     providersPart: providers,
     mcpServersPart: mcpServers,
-    tasksPart: tasks || {},
+    tasksPart: serializeTasksForSharedStorage(tasks),
     localConfigPart: localConfigPart
   };
 }
@@ -381,6 +396,17 @@ async function getConfig() {
   fullConfigData.config.prompts = promptsDoc ? promptsDoc.data : defaultConfig.config.prompts;
   fullConfigData.config.providers = providersDoc ? providersDoc.data : defaultConfig.config.providers;
   fullConfigData.config.tasks = tasksDoc ? tasksDoc.data : (defaultConfig.config.tasks || {});
+
+  const taskDeviceReconcile = reconcileTaskDeviceStates(fullConfigData.config.tasks);
+  const sharedTasks = serializeTasksForSharedStorage(fullConfigData.config.tasks);
+  if (taskDeviceReconcile.changed || JSON.stringify(tasksDoc?.data || {}) !== JSON.stringify(sharedTasks)) {
+    const tasksDocForWrite = await utools.db.promises.get("tasks");
+    await utools.db.promises.put({
+      _id: "tasks",
+      data: sharedTasks,
+      _rev: tasksDocForWrite ? tasksDocForWrite._rev : undefined
+    });
+  }
 
   // 注入本地路径 (再次确保安全性)
   const currentLocalData = (localDoc && localDoc.data) ? localDoc.data : {};
@@ -535,7 +561,7 @@ function checkConfig(config) {
       flag = true;
   }
 
-  // --- 4. Prompts (快捷助手) 检查 ---
+  // --- 4. Prompts (智能体) 检查 ---
   if (config.prompts) {
     if (config.prompts['__DEFAULT__']) {
       delete config.prompts['__DEFAULT__'];
@@ -556,9 +582,9 @@ function checkConfig(config) {
       const p = config.prompts[key];
 
       // 4.1 结构有效性检查
-      // model 允许为空：表示快捷助手不绑定专属模型，运行时走默认模型/首个可用模型兜底。
+      // model 允许为空：表示智能体不绑定专属模型，运行时走默认模型/首个可用模型兜底。
       // 注意：前端清空 el-select 时可能得到 undefined，完整配置保存经过 JSON.stringify 后会丢失该字段；
-      // 这里必须归一化而不是删除整个快捷助手，避免重启插件后快捷助手消失。
+      // 这里必须归一化而不是删除整个智能体，避免重启插件后智能体消失。
       if (!p || typeof p !== 'object' || '0' in p || !p.type || p.prompt === undefined) {
         delete config.prompts[key];
         flag = true;
@@ -863,6 +889,7 @@ async function updateConfigWithoutFeatures(newConfig) {
   await putChecked(localId, localConfigPart);
 
   const fullConfigForFrontend = JSON.parse(JSON.stringify(newConfig.config));
+  reconcileTaskDeviceStates(fullConfigForFrontend.tasks);
   for (const windowInstance of windowMap.values()) {
     if (!windowInstance.isDestroyed()) {
       windowInstance.webContents.send('config-updated', fullConfigForFrontend);
@@ -891,13 +918,12 @@ function updateConfig(newConfig) {
       const functionCmdCode = key + feature_suffix;
 
       // 更新或添加匹配指令
-      const expectedMatchFeature = {
+      const expectedMatchFeature = setCompatibleFeatureDescription({
         code: featureCode,
-        explain: key,
         mainHide: true,
         cmds: [],
         icon: prompt.icon || ""
-      };
+      }, key);
       if (prompt.type === "general") {
         expectedMatchFeature.cmds.push({ type: "over", label: key, "maxLength": 99999999999 });
         expectedMatchFeature.cmds.push({ type: "img", label: key });
@@ -923,13 +949,12 @@ function updateConfig(newConfig) {
 
       // 更新或添加功能指令（仅限窗口模式和快速展示模式）
       if (prompt.showMode === "window") {
-        utools.setFeature({
+        utools.setFeature(setCompatibleFeatureDescription({
           code: functionCmdCode,
-          explain: key,
           mainHide: true,
           cmds: [key],
           icon: prompt.icon || ""
-        });
+        }, key));
       } else {
         if (featuresMap.has(functionCmdCode)) {
           utools.removeFeature(functionCmdCode);
@@ -951,7 +976,7 @@ function updateConfig(newConfig) {
       continue;
     }
 
-    const promptKey = feature.explain;
+    const promptKey = getCompatibleFeatureDescription(feature);
     if (!enabledPromptKeys.has(promptKey) ||
       (currentPrompts[promptKey] && (currentPrompts[promptKey].showMode !== "window") && code.endsWith(feature_suffix))
     ) {
@@ -967,8 +992,31 @@ function getUser() {
   return { avatar: "user.png" };
 }
 
+function resolveConfiguredPromptConfig(config, promptCode) {
+  return config?.prompts?.[promptCode]
+    || config?.prompts?.AI
+    || defaultConfig.config.prompts.AI
+    || {};
+}
+
+
+function resolveWindowPromptConfig(config, promptCode, msg = null) {
+  const configuredPrompt = resolveConfiguredPromptConfig(config, promptCode);
+  const sessionPrompt = msg?.conversation?.sessionData?.currentPromptConfig;
+  if (!sessionPrompt || typeof sessionPrompt !== 'object' || Array.isArray(sessionPrompt)) {
+    return configuredPrompt;
+  }
+
+  return {
+    ...configuredPrompt,
+    ...sessionPrompt
+  };
+}
+
+
 function getPosition(config, promptCode, msg = null) {
-  const promptConfig = config.prompts[promptCode];
+  const promptConfig = resolveWindowPromptConfig(config, promptCode, msg);
+  const configuredPrompt = resolveConfiguredPromptConfig(config, promptCode);
   const OVERFLOW_ALLOWANCE = 10;
 
   // 强制转换为 Number，防止 undefined 或 null 导致 NaN
@@ -1008,10 +1056,12 @@ function getPosition(config, promptCode, msg = null) {
   }
   // --- 3. 普通唤起 -> 依据设置 (固定位置 或 跟随鼠标) ---
   else {
-    const hasFixedPosition = config.fix_position && promptConfig && promptConfig.position_x != null && promptConfig.position_y != null;
+    const hasFixedPosition = config.fix_position
+      && configuredPrompt.position_x != null
+      && configuredPrompt.position_y != null;
 
     if (hasFixedPosition) {
-      let set_position = { x: Number(promptConfig.position_x), y: Number(promptConfig.position_y) };
+      let set_position = { x: Number(configuredPrompt.position_x), y: Number(configuredPrompt.position_y) };
       currentDisplay = utools.getDisplayNearestPoint(set_position) || primaryDisplay;
       windowX = Math.floor(set_position.x);
       windowY = Math.floor(set_position.y);
@@ -1169,14 +1219,17 @@ async function openWindow(config, msg) {
     y = newY;
   }
 
-  const promptConfig = config.prompts[promptCode];
-  const isAlwaysOnTop = promptConfig?.isAlwaysOnTop ?? true;
+  const promptConfig = resolveWindowPromptConfig(config, promptCode, msg);
+  const isAlwaysOnTop = promptConfig?.isAlwaysOnTop ?? config?.isAlwaysOnTop_global ?? true;
   let channel = "window";
   const backgroundColor = config.isDarkMode ? `rgba(33, 33, 33, 1)` : 'rgba(255, 255, 253, 1)';
 
   // 为窗口生成唯一ID并添加到消息中
   const senderId = crypto.randomUUID();
   msg.senderId = senderId;
+  const conversationRpcCapability = crypto.randomBytes(32).toString('hex');
+  msg.conversationRpcCapability = conversationRpcCapability;
+  windowRpcCapabilityMap.set(senderId, conversationRpcCapability);
   msg.isAlwaysOnTop = isAlwaysOnTop;
 
   setTimeout(() => {
@@ -1184,6 +1237,7 @@ async function openWindow(config, msg) {
       for (const [s_id, win_instance] of windowMap.entries()) {
         if (win_instance.isDestroyed()) {
           windowMap.delete(s_id);
+          windowRpcCapabilityMap.delete(s_id);
           utools.removeFeature(`append_to_${s_id}`);
         }
       }
@@ -1199,7 +1253,7 @@ async function openWindow(config, msg) {
       let maxIdx = -1;
       features.forEach(f => {
         if (f.code.startsWith('append_to_')) {
-          const match = f.explain.match(nameRegex);
+          const match = getCompatibleFeatureDescription(f).match(nameRegex);
           if (match) {
             if (match[1]) {
               maxIdx = Math.max(maxIdx, parseInt(match[1], 10)); // 匹配到 "-x"
@@ -1216,9 +1270,8 @@ async function openWindow(config, msg) {
       }
 
       // 2. 动态注册专属“追问”特征指令
-      utools.setFeature({
+      utools.setFeature(setCompatibleFeatureDescription({
         code: `append_to_${senderId}`,
-        explain: displayName,
         icon: promptConfig?.icon || "logo.png",
         mainHide: true,
         cmds: [
@@ -1226,13 +1279,13 @@ async function openWindow(config, msg) {
           { type: "img", label: displayName },
           { type: "files", label: displayName},
         ]
-      });
+      }, displayName));
     } catch (e) {
       console.error("Async feature registration failed:", e);
     }
   }, 500);
 
-  const windowOptions = {
+  const windowOptions = createCompatibleWindowOptions({
     show: false,
     backgroundColor: backgroundColor,
     title: "Anywhere",
@@ -1246,9 +1299,8 @@ async function openWindow(config, msg) {
     hasShadow: true,
     webPreferences: {
       preload: "./window_preload.js",
-      devTools: utools.isDev()
     },
-  };
+  }, { devTools: utools.isDev() });
   const entryPath = config.isDarkMode ? "./window/index.html?dark=1" : "./window/index.html";
 
   return new Promise((resolve) => {
@@ -1286,6 +1338,7 @@ async function openWindow(config, msg) {
         setTimeout(releaseQueue, 1500);
       });
     }).catch((err) => {
+      windowRpcCapabilityMap.delete(senderId);
       console.error("Window creation queue error:", err);
       resolve(senderId);
     });
@@ -1343,6 +1396,42 @@ async function openConferenceWindow(config) {
   });
 }
 
+function applyConversationWindowState(senderId, state = {}) {
+  const win = windowMap.get(String(senderId || ''));
+  if (!win || win.isDestroyed()) {
+    return { ok: false, reason: 'window_not_found' };
+  }
+
+  const currentBounds = win.getBounds();
+  const requestedPoint = {
+    x: currentBounds.x,
+    y: currentBounds.y
+  };
+  const display = utools.getDisplayNearestPoint(requestedPoint) || utools.getPrimaryDisplay();
+  const area = display?.workArea || display?.bounds || currentBounds;
+  const rawWidth = Number(state.window_width);
+  const rawHeight = Number(state.window_height);
+  const width = Math.min(area.width, Math.max(1, Number.isFinite(rawWidth) && rawWidth > 0 ? Math.round(rawWidth) : currentBounds.width));
+  const height = Math.min(area.height, Math.max(1, Number.isFinite(rawHeight) && rawHeight > 0 ? Math.round(rawHeight) : currentBounds.height));
+  const x = Math.min(Math.max(requestedPoint.x, area.x), area.x + area.width - width);
+  const y = Math.min(Math.max(requestedPoint.y, area.y), area.y + area.height - height);
+
+  win.setBounds({ x, y, width, height });
+
+  const alwaysOnTop = typeof state.isAlwaysOnTop === 'boolean'
+    ? state.isAlwaysOnTop
+    : win.isAlwaysOnTop();
+  win.setAlwaysOnTop(alwaysOnTop);
+  win.webContents.send('always-on-top-changed', alwaysOnTop);
+
+  return {
+    ok: true,
+    bounds: { x, y, width, height },
+    isAlwaysOnTop: alwaysOnTop
+  };
+}
+
+
 async function coderedirect(label, payload) {
   utools.redirect(label, payload);
 }
@@ -1352,8 +1441,8 @@ function setZoomFactor(factor) {
 }
 
 /**
- * 保存单个快捷助手的窗口设置，直接操作 "prompts" 文档
- * @param {string} promptKey - 快捷助手的 key
+ * 保存单个智能体的窗口设置，直接操作 "prompts" 文档
+ * @param {string} promptKey - 智能体的 key
  * @param {object} settings - 要保存的窗口设置
  * @returns {Promise<{success: boolean, message?: string}>}
  */
@@ -1369,11 +1458,11 @@ async function savePromptWindowSettings(promptKey, settings) {
 
     const promptsData = promptsDoc.data;
     if (!promptsData[promptKey]) {
-      // 如果快捷助手不存在，则无法更新。这是一个错误情况。
+      // 如果智能体不存在，则无法更新。这是一个错误情况。
       return { success: false, message: `Prompt with key '${promptKey}' not found in document` };
     }
 
-    // 将新的设置合并到现有的快捷助手配置中
+    // 将新的设置合并到现有的智能体配置中
     promptsData[promptKey] = {
       ...promptsData[promptKey],
       ...settings
@@ -1428,7 +1517,7 @@ async function openFastInputWindow(config, msg) {
   const code = msg.code;
   const promptConfig = config.prompts[code];
 
-  // 解析模型配置：快捷助手 model 允许为空，空值回退到默认助手模型/首个可用模型。
+  // 解析模型配置：智能体 model 允许为空，空值回退到默认助手模型/首个可用模型。
   let apiUrl = config.providers["0"]?.url; // 默认 fallback
   let apiKey = config.providers["0"]?.api_key;
   let apiType = config.providers["0"]?.apiType || 'chat_completions'; // 默认 API 类型
@@ -1540,7 +1629,7 @@ async function openFastInputWindow(config, msg) {
   const senderId = crypto.randomUUID();
   msg.senderId = senderId;
 
-  const windowOptions = {
+  const windowOptions = createCompatibleWindowOptions({
     show: true,
     width: width,
     height: height,
@@ -1556,9 +1645,8 @@ async function openFastInputWindow(config, msg) {
     skipTaskbar: true,
     webPreferences: {
       preload: "./fast_window_preload.js",
-      devTools: utools.isDev()
     }
-  };
+  }, { devTools: utools.isDev() });
 
   const entryPath = "./fast_window/fast_input.html";
 
@@ -1576,6 +1664,7 @@ async function openFastInputWindow(config, msg) {
         streamBuffer.length = 0;
       }
       if (utools.isDev()) {
+        try { fastWindow.webContents.openDevTools({ mode: "detach" }); } catch {}
         console.log(`[Timer] Fast window opened`);
       }
     }
@@ -1585,7 +1674,7 @@ async function openFastInputWindow(config, msg) {
 async function openAppendSelectorWindow(features, payload, type) {
   const listData = features.map(f => ({
     senderId: f.code.replace('append_to_', ''),
-    name: f.explain.replace('追问 ', ''),
+    name: getCompatibleFeatureDescription(f).replace('追问 ', ''),
     icon: f.icon
   })).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
 
@@ -1614,7 +1703,7 @@ async function openAppendSelectorWindow(features, payload, type) {
   if (x + winWidth > display.x + display.width) x = display.x + display.width - winWidth;
   if (y + winHeight > display.y + display.height) y = display.y + display.height - winHeight;
 
-  const selectorWin = utools.createBrowserWindow('./fast_window/append_selector.html', {
+  const selectorWin = utools.createBrowserWindow('./fast_window/append_selector.html', createCompatibleWindowOptions({
     show: true,
     width: winWidth,
     height: winHeight,
@@ -1631,7 +1720,7 @@ async function openAppendSelectorWindow(features, payload, type) {
     webPreferences: {
       preload: "./fast_window_preload.js",
     }
-  }, () => {
+  }, { devTools: utools.isDev() }), () => {
 
     if (utools.isDev()) {
       const windowShownTime = performance.now();
@@ -1933,6 +2022,38 @@ function broadcastEvent(channel, payload) {
   }
 }
 
+function getTaskDeviceIdentity() {
+  return getCurrentTaskDevice();
+}
+
+async function setTaskDeviceEnabled(taskId = '', enabled = false) {
+  const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+  if (!normalizedTaskId) throw new Error('task_id_required');
+
+  const configResult = await getConfig();
+  const config = configResult?.config || {};
+  const task = config?.tasks?.[normalizedTaskId];
+  if (!task || typeof task !== 'object') throw new Error('task_not_found');
+
+  setCurrentTaskDeviceEnabled(task, enabled === true);
+  if (task.enabled) task.lastRunTime = Date.now();
+  return await updateConfigWithoutFeatures({ config });
+}
+
+async function removeTaskAppliedDeviceForCurrentConfig(taskId = '', device = {}) {
+  const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+  if (!normalizedTaskId) throw new Error('task_id_required');
+
+  const configResult = await getConfig();
+  const config = configResult?.config || {};
+  const task = config?.tasks?.[normalizedTaskId];
+  if (!task || typeof task !== 'object') throw new Error('task_not_found');
+
+  removeTaskAppliedDevice(task, device);
+  return await updateConfigWithoutFeatures({ config });
+}
+
+
 async function addTaskHistory(taskId, logEntry) {
   let doc = await utools.db.promises.get("tasks");
   if (doc && doc.data && doc.data[taskId]) {
@@ -1984,15 +2105,20 @@ module.exports = {
   updateConfig,
   saveSetting,
   updateConfigWithoutFeatures,
+  getTaskDeviceIdentity,
+  setTaskDeviceEnabled,
+  removeTaskAppliedDeviceForCurrentConfig,
   savePromptWindowSettings,
   getUser,
   copyText,
   openWindow,
+  applyConversationWindowState,
   coderedirect,
   setZoomFactor,
   feature_suffix,
   defaultConfig,
   windowMap,
+  windowRpcCapabilityMap,
   saveFastInputWindowPosition,
   openFastInputWindow,
   openAppendSelectorWindow,
